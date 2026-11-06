@@ -117,6 +117,20 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   kstride = std::max(opt.max_ctx, kPoolBlocks * 8);
   kstride = (kstride + attn::kScoreAlign - 1) / attn::kScoreAlign * attn::kScoreAlign;
 
+  try {
+    glp = detail::glp_from_env();
+  } catch (const std::exception& e) {
+    die("glp: %s", e.what());
+  }
+  if (glp.on) {
+    int n = 0;
+    for (int L = 0; L < kLayers; ++L) n += glp.layer[L];
+    glp_dir = dalloc<float>((size_t)kLayers * kDim);
+    glp_alpha = dalloc<float>(1);
+    CUDA_CHECK(cudaMemcpy(glp_dir, glp.dir.data(), sizeof(float) * glp.dir.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(glp_alpha, &glp.alpha, sizeof(float), cudaMemcpyHostToDevice));
+    if (rank == 0) std::printf("glp: steering on: alpha %g, %d layers, hook residual_stream_post_layer\n", glp.alpha, n);
+  }
   x = dalloc<bf16>((size_t)R * kHcDim);
   mid = dalloc<bf16>((size_t)R * kHcDim);
   y = dalloc<bf16>((size_t)R * kDim);
@@ -201,6 +215,14 @@ Model::Impl::~Impl() {
   for (auto& g : graphs) cudaGraphExecDestroy(g.second);
   cudaStreamDestroy(sa);
   cudaStreamDestroy(sb);
+}
+
+// GLP: project layer L's direction off the streams its write was just folded into (x) and, when the next
+// sublayer's collapsed input is already made (yraw), make it again from the projected streams. No
+// launch, no read and no change to the step when steering is off or L carries no direction.
+void Model::Impl::steer_layer(int L, int R, const float* pre, bf16* yraw) {
+  if (!glp.on || !glp.layer[L]) return;
+  ops::glp_steer(U(x), R, glp_dir + (size_t)L * kDim, glp_alpha, pre, yraw ? U(yraw) : nullptr, st);
 }
 
 void Model::Impl::dump(Sink* sink, int L, const char* name, int pos0, int R, const void* dev, size_t row_bytes) {
@@ -744,6 +766,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
   ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+  steer_layer(L, R, next_pm, yraw);  // GLP: the layer's streams, projected; off by default
   if (dumps) {
     dump(sink, L, "ffn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "route_idx", pos0, R, ridx, kTopK * 4);
