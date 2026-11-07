@@ -31,6 +31,7 @@ fn usage() -> ! {
       --table-file PATH         the session table, saved here at a stop and taken back at the next
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
+      --session-cache-tokens N   retained history token budget, default 16777216 (not active KV)
       --table-days N            sessions unused for longer are not kept: 7
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
@@ -138,6 +139,11 @@ fn serve(args: &[String]) {
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
     };
+    let session_tokens = parse_opt(args, "--session-cache-tokens", 16usize << 20);
+    if session_tokens == 0 {
+        eprintln!("--session-cache-tokens must be positive");
+        std::process::exit(2);
+    }
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
@@ -145,7 +151,7 @@ fn serve(args: &[String]) {
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
     runtime().block_on(async move {
         let engine = dsfront::engine::EngineClient::start(socket.into());
-        let app = App::new(cfg, tok, engine);
+        let app = App::new_with_session_capacity(cfg, tok, engine, session_tokens);
         if let Some(t) = &table {
             eprintln!("{}", app.load_sessions(t, table_age_s));
         }
