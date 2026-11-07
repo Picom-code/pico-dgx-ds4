@@ -62,9 +62,16 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient) -> Arc<App> {
+        Self::new_with_session_capacity(cfg, tok, engine, 16 << 20)
+    }
+
+    /// Configured retained-history budget, independent of active inference slots.
+    pub fn new_with_session_capacity(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient, session_tokens: usize) -> Arc<App> {
+        assert!(session_tokens > 0, "session token budget must be positive");
+        eprintln!("session table: retained-token budget {session_tokens}, sessions 256");
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, session_tokens)), think_end_id, counter: AtomicU64::new(0) })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -564,6 +571,11 @@ impl Gen {
                         self.flush(out);
                     }
                     self.parser.finish(out);
+                    if let Some(e) = self.parser.protocol_error() {
+                        self.app.sessions.lock().unwrap().abandon(self.session_id);
+                        self.app.engine.release(self.session_id);
+                        return Some(Err(format!("malformed model output protocol: {e}")));
+                    }
                     let finish = if self.parser.tool_calls_seen() > 0 {
                         Finish::ToolCalls
                     } else if let Some(f) = self.stopped {

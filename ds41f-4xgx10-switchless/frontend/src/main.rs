@@ -29,6 +29,7 @@ fn usage() -> ! {
       --table-file PATH         the session table, saved here at a stop and taken back at the next
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
+      --session-cache-tokens N   retained history token budget, default 16777216 (not active KV)
       --table-days N            sessions unused for longer are not kept: 7
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
@@ -118,6 +119,11 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
     };
+    let session_tokens = parse_opt(args, "--session-cache-tokens", 16usize << 20);
+    if session_tokens == 0 {
+        eprintln!("--session-cache-tokens must be positive");
+        std::process::exit(2);
+    }
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
     let table_age_s = (parse_opt(args, "--table-days", 7f64) * 86400.0) as u64;
@@ -125,7 +131,7 @@ fn serve(args: &[String]) {
     let socket = opt(args, "--engine-socket").unwrap_or_else(|| dsfront::protocol::DEFAULT_SOCKET.into());
     runtime().block_on(async move {
         let engine = dsfront::engine::EngineClient::start(socket.into());
-        let app = App::new(cfg, tok, engine);
+        let app = App::new_with_session_capacity(cfg, tok, engine, session_tokens);
         if let Some(t) = &table {
             eprintln!("{}", app.load_sessions(t, table_age_s));
         }
