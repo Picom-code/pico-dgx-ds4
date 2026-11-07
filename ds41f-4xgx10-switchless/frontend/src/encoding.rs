@@ -1117,7 +1117,7 @@ pub enum Delta {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Phase { Reasoning, Content, Calls, Invoke, Failed, Done }
+enum Phase { Reasoning, Content, Calls, Name, Param, AfterParam, Failed, Done }
 
 const DSML_OPEN: &str = "<｜DSML｜";
 const DSML_CLOSE: &str = "</｜DSML｜";
@@ -1130,6 +1130,7 @@ pub struct StreamParser {
     buf: String,
     calls: usize,
     name: String,
+    args: Vec<(String,String,String)>,
     tools: bool,
     error: Option<&'static str>,
     pub saw_eos: bool,
@@ -1145,24 +1146,13 @@ fn clean_protocol(s: &str) -> String {
         let Some((p, m)) = found else { out.push_str(rest); break };
         out.push_str(&rest[..p]); rest = &rest[p..];
         let end = if m == THINK_START || m == THINK_END { Some(m.len()) }
-            else { rest.find('>').map(|p| p + 1) };
+            else if let Some(p)=rest.find('>') {
+                if rest[..p].ends_with('｜') || rest[..p].ends_with('|') { Some(p+1) }
+                else { out.push_str(&rest[..p+1]);rest=&rest[p+1..];continue }
+            } else { None };
         match end { Some(n) => rest = &rest[n..], None => break }
     }
     out
-}
-
-/// Parse quoted tag attributes without changing argument values or guessing missing syntax.
-fn wire_attrs(mut s: &str) -> Option<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    loop {
-        s = s.trim(); if s.is_empty() { return Some(out) }
-        let p = s.find('=')?; let key = s[..p].trim();
-        if key.is_empty() || key.chars().any(char::is_whitespace) { return None }
-        s = s[p+1..].trim_start().strip_prefix('"')?;
-        let e = s.find('"')?;
-        if out.iter().any(|(k, _)| k == key) { return None }
-        out.push((key.to_string(), s[..e].to_string())); s = &s[e+1..];
-    }
 }
 
 /// Find a DSML tag, tolerating both released tag-name spellings. Returned offsets are
@@ -1177,32 +1167,23 @@ fn closing(s: &str, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn parse_wire_args(mut s: &str) -> Option<String> {
-    let mut args = Vec::new();
-    loop {
-        s = s.trim_start(); if s.is_empty() { break }
-        // A complete redundant closing tag between complete parameters is framing noise.
-        // Do not skip opening tags, free text, partial values, or duplicate parameters.
-        if s.starts_with("</") { let e = s.find('>')?; s = &s[e+1..]; continue }
-        s = s.strip_prefix(DSML_OPEN)?;
-        let e = s.find('>')?; let header = s[..e].trim();
-        let attrs = wire_attrs(header.strip_prefix("parameter")?)?;
-        let name = &attrs.iter().find(|x| x.0 == "name")?.1;
-        let flag = &attrs.iter().find(|x| x.0 == "string")?.1;
-        if attrs.len() != 2 || !matches!(flag.as_str(), "true" | "false") || args.iter().any(|(n, _, _)| n == name) { return None }
-        s = &s[e+1..]; let (a, b) = closing(s, "parameter")?;
-        let value = clean_protocol(&s[..a]);
-        if flag == "false" { serde_json::from_str::<Value>(&value).ok()?; }
-        args.push((name.clone(), value, flag.clone())); s = &s[b..];
+fn opening(s: &str, name: &str) -> Option<(usize,usize)> {
+    let mut from=0;
+    while let Some(p)=s[from..].find(DSML_OPEN) {
+        let start=from+p;let tail=&s[start+DSML_OPEN.len()..];let t=tail.trim_start();
+        if t.starts_with(name) && t[name.len()..].chars().next().map_or(false,|c| c.is_whitespace() || c=='>') {
+            return Some((start,start+DSML_OPEN.len()+tail.len()-t.len()+name.len()))
+        }
+        from=start+DSML_OPEN.len();
     }
-    Some(decode_dsml_to_arguments(&args))
+    None
 }
 
 impl StreamParser {
     pub fn new(mode: ThinkingMode) -> Self { Self::with_tools(mode, true) }
     pub fn with_tools(mode: ThinkingMode, tools: bool) -> Self {
         Self { phase: if mode == ThinkingMode::Thinking { Phase::Reasoning } else { Phase::Content },
-            buf: String::new(), calls: 0, name: String::new(), tools, error: None, saw_eos: false }
+            buf: String::new(), calls: 0, name: String::new(), args: Vec::new(), tools, error: None, saw_eos: false }
     }
     pub fn tool_calls_seen(&self) -> usize { self.calls }
     pub fn protocol_error(&self) -> Option<&'static str> { self.error }
@@ -1212,13 +1193,17 @@ impl StreamParser {
     }
     pub fn finish(&mut self, out: &mut Vec<Delta>) {
         self.advance(out, true);
-        if self.phase == Phase::Invoke { self.fail("incomplete tool invocation") }
+        if matches!(self.phase, Phase::Name | Phase::Param | Phase::AfterParam) { self.fail("incomplete tool invocation") }
         self.buf.clear(); self.phase = Phase::Done;
     }
     fn fail(&mut self, message: &'static str) { self.error = Some(message); self.buf.clear(); self.phase = Phase::Failed; }
     fn consume(&mut self, n: usize) { self.buf.drain(..n); }
     fn text(&self, s: String, out: &mut Vec<Delta>) {
         if !s.is_empty() { out.push(if self.phase == Phase::Reasoning { Delta::Reasoning(s) } else { Delta::Content(s) }); }
+    }
+    fn emit_call(&mut self,out:&mut Vec<Delta>) {
+        if clean_protocol(&self.name)!=self.name { self.fail("reserved token in tool name");return }
+        out.push(Delta::ToolCall(self.calls,std::mem::take(&mut self.name),decode_dsml_to_arguments(&self.args)));self.calls+=1;self.args.clear();
     }
     fn holdback(s: &str, markers: &[&str]) -> usize {
         markers.iter().flat_map(|m| (1..m.len().min(s.len()+1)).rev().filter(|&k| s.is_char_boundary(s.len()-k) && m.starts_with(&s[s.len()-k..]))).max().unwrap_or(0)
@@ -1261,11 +1246,9 @@ impl StreamParser {
                             if !self.tools { self.fail("tool protocol without declared tools"); return }
                             self.consume(e+1); self.phase = Phase::Calls; continue
                         }
-                        if let Some(attrs) = tag.strip_prefix("invoke").and_then(wire_attrs) {
-                            if !self.tools { self.fail("tool protocol without declared tools"); return }
-                            if attrs.len() == 1 && attrs[0].0 == "name" && !attrs[0].1.is_empty() {
-                                self.name = attrs[0].1.clone(); self.consume(e+1); self.phase = Phase::Invoke; continue
-                            }
+                        if let Some((0,end))=opening(&self.buf,"invoke") {
+                            if !self.tools { self.fail("tool protocol without declared tools");return }
+                            self.consume(end);self.phase=Phase::Name;continue
                         }
                         self.fail("unrecognized tool protocol tag"); return
                     }
@@ -1283,26 +1266,53 @@ impl StreamParser {
                         if at_end { self.fail("incomplete closing tool tag") } return
                     }
                     if self.buf.starts_with(DSML_OPEN) {
-                        let Some(e) = self.buf.find('>') else { if at_end { self.fail("incomplete tool tag") } return };
-                        let tag = self.buf[DSML_OPEN.len()..e].trim();
-                        let attrs = tag.strip_prefix("invoke").and_then(wire_attrs);
-                        if let Some(a) = attrs.filter(|a| a.len()==1 && a[0].0=="name" && !a[0].1.is_empty()) {
-                            self.name=a[0].1.clone(); self.consume(e+1); self.phase=Phase::Invoke; continue
-                        }
+                        if let Some((0,end))=opening(&self.buf,"invoke") { self.consume(end);self.phase=Phase::Name;continue }
+                        if !self.buf.contains('>') && !at_end { return }
                         self.fail("invalid tool invocation header"); return
                     }
                     // Wait for split markers; never return malformed protocol as content.
                     if !at_end && [DSML_OPEN, DSML_CLOSE, EOS].iter().any(|m| m.starts_with(&self.buf)) { return }
                     self.fail("invalid tool block framing"); return
                 }
-                Phase::Invoke => {
-                    let Some((p, end)) = closing(&self.buf, "invoke") else {
-                        if at_end { self.fail("incomplete tool invocation") } return
+                Phase::Name => {
+                    let param = opening(&self.buf, "parameter");
+                    let end = closing(&self.buf, "invoke");
+                    let next = match (param, end) {
+                        (Some(a), Some(b)) if a.0 < b.0 => Some((a.0,a.1,false)),
+                        (_,Some(b)) => Some((b.0,b.1,true)),
+                        (Some(a),None) => Some((a.0,a.1,false)),
+                        _ => None,
                     };
-                    let Some(args) = parse_wire_args(&self.buf[..p]) else { self.fail("invalid tool arguments"); return };
-                    if clean_protocol(&self.name) != self.name { self.fail("reserved token in tool name"); return }
-                    out.push(Delta::ToolCall(self.calls, std::mem::take(&mut self.name), args)); self.calls+=1;
-                    self.consume(end); self.phase=Phase::Calls;
+                    let Some((p, consumed, done)) = next else { if at_end { self.fail("incomplete tool invocation") } return };
+                    let header = self.buf[..p].trim();
+                    let Some(name) = header.strip_prefix("name=\"").and_then(|h| h.strip_suffix("\">")) else { self.fail("invalid tool invocation header"); return };
+                    self.name = name.to_string(); self.args.clear(); self.consume(consumed);
+                    if done { self.emit_call(out); if self.error.is_some() { return } self.phase=Phase::Calls; } else { self.phase=Phase::Param; }
+                }
+                Phase::Param => {
+                    let stops = ["/｜DSML｜ parameter", "/｜DSML｜parameter"];
+                    let hit = stops.iter().filter_map(|m| self.buf.find(m).map(|p| (p,*m))).min_by_key(|x|x.0);
+                    let Some((p,m)) = hit else { if at_end { self.fail("incomplete tool parameter") } return };
+                    let tail = p+m.len();
+                    let Some(extra) = self.buf[tail..].find('>') else { if at_end { self.fail("incomplete parameter close") } return };
+                    let segment = format!(" {}", self.buf[..p].trim_start());
+                    let Some((name,flag,value)) = match_param(&segment) else { self.fail("invalid tool parameter"); return };
+                    if self.args.iter().any(|(n,_,_)| n==&name) { self.fail("duplicate tool parameter"); return }
+                    let value=clean_protocol(&value);
+                    if flag=="false" && serde_json::from_str::<Value>(&value).is_err() { self.fail("invalid JSON tool parameter"); return }
+                    self.args.push((name,value,flag));self.consume(tail+extra+1);self.phase=Phase::AfterParam;
+                }
+                Phase::AfterParam => {
+                    let n=self.buf.len()-self.buf.trim_start().len();self.consume(n);
+                    if self.buf.is_empty() { if at_end { self.fail("incomplete tool invocation") } return }
+                    if let Some((0,end))=closing(&self.buf,"invoke") { self.consume(end);self.emit_call(out);if self.error.is_some() { return }self.phase=Phase::Calls;continue }
+                    if let Some((0,end))=opening(&self.buf,"parameter") { self.consume(end);self.phase=Phase::Param;continue }
+                    if self.buf.starts_with("</") {
+                        let Some(end)=self.buf.find('>') else { if at_end { self.fail("incomplete closing tag") } return };
+                        self.consume(end+1);continue
+                    }
+                    if !at_end && [DSML_OPEN,DSML_CLOSE].iter().any(|m| m.starts_with(&self.buf) || self.buf.starts_with(m)) { return }
+                    self.fail("invalid parameter framing");return
                 }
                 Phase::Failed | Phase::Done => { self.buf.clear(); return }
             }
@@ -1478,6 +1488,20 @@ mod tests {
     #[test]
     fn wire_plain_text_identity() {
         for text in ["hello\n\n", "x < 5", "x <", "こんにちは\n", "compact JSON: {\"a\":1}"] { for w in 1..=text.chars().count() { let (_,c,_,e)=wire_run(text,w,false);assert_eq!(c,text);assert!(e.is_none()); } }
+    }
+
+    #[test]
+    fn wire_quoted_names_and_literal_close_in_value() {
+        let text=WIRE_CALL.replace("name=\"cmd\"", "name=\"a\"b\"").replace(">pwd<", ">x</｜DSML｜ invoke>y<<");
+        for w in 1..=text.chars().count() {
+            let (_,_,calls,e)=wire_run(&text,w,true);assert!(e.is_none());
+            assert_eq!(calls[0].1,"{\"a\\\"b\": \"x</｜DSML｜ invoke>y<\"}");
+        }
+    }
+    #[test]
+    fn wire_nested_protocol_in_tool_name_rejected() {
+        let text=WIRE_CALL.replace("exec_command", "read\">\n\n\n<｜DSML｜ invoke name=\"a b");
+        for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert!(calls.is_empty());assert_eq!(e,Some("reserved token in tool name")); }
     }
 
 }
