@@ -22,7 +22,8 @@ fn usage() -> ! {
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
-                                ids (N.out.json; debugging and bench traces)
+                                ids and exact pre-parser bytes (N.out.json/.bin; also DSFRONT_DUMP_DIR)
+      --protocol-error-dir DIR  opt-in private raw bytes and token ids on parser errors only;\n                                also DSFRONT_PROTOCOL_ERROR_DIR (off by default, may contain sensitive text)
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
@@ -116,7 +117,10 @@ fn serve(args: &[String]) {
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
-        dump_dir: opt(args, "--dump-dir").map(Into::into),
+        dump_dir: opt(args, "--dump-dir").map(Into::into)
+            .or_else(|| std::env::var_os("DSFRONT_DUMP_DIR").map(Into::into)),
+        protocol_error_dir: opt(args, "--protocol-error-dir").map(Into::into)
+            .or_else(|| std::env::var_os("DSFRONT_PROTOCOL_ERROR_DIR").map(Into::into)),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
     };
     let session_tokens = parse_opt(args, "--session-cache-tokens", 16usize << 20);

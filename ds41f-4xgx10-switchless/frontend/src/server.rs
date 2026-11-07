@@ -45,6 +45,8 @@ pub struct ServerConfig {
     /// Write each request, its prompt and its ids here, and at its end the output's ids (debugging and
     /// bench traces; holds conversation text).
     pub dump_dir: Option<std::path::PathBuf>,
+    /// Opt-in private raw generation evidence on protocol errors only; never sent to clients.
+    pub protocol_error_dir: Option<std::path::PathBuf>,
     /// How long a request waits while the engine is down (the ring lent, or a restart) before it is
     /// answered 503 with Retry-After.
     pub hold: Duration,
@@ -481,6 +483,40 @@ impl Usage {
     }
 }
 
+/// Capture token bytes before decoding/stopping/parsing. Call only for an opt-in protocol-error
+/// diagnostic. No prompts, authorization headers or raw bytes are put in ordinary logs or SSE.
+/// Every error gets a new private directory, so process restarts cannot overwrite prior evidence.
+fn capture_protocol_error(
+    base: &std::path::Path, req_id: u64, session_id: u64, ids: &[u32], kept: usize,
+    raw: &[u8], error: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(base)?;
+    let meta = std::fs::symlink_metadata(base)?;
+    if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "protocol error directory must be a private real directory (0700)"));
+    }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let dir = base.join(format!("{}-{req_id:06}-{stamp}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let mut bytes = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(dir.join("generation.bin"))?;
+    bytes.write_all(raw)?;
+    bytes.sync_all()?;
+    let record = json!({"schema_version": 1, "req_id": req_id, "session_id": session_id,
+        "protocol_error": error, "token_ids": ids, "kept_tokens": kept,
+        "generated_tokens": ids.len(), "raw_file": "generation.bin", "raw_bytes": raw.len(),
+        "raw_utf8": std::str::from_utf8(raw).ok(),
+        "capture_point": "concatenated tokenizer token_bytes of every engine output id, before parser/stop filtering"});
+    let mut index = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(dir.join("record.json"))?;
+    index.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
+    index.sync_all()?;
+    Ok(dir)
+}
+
 /// One request in flight on the engine: decodes, stops, guards and parses its token stream.
 struct Gen {
     app: Arc<App>,
@@ -572,6 +608,13 @@ impl Gen {
                     }
                     self.parser.finish(out);
                     if let Some(e) = self.parser.protocol_error() {
+                        if let Some(base) = &self.app.cfg.protocol_error_dir {
+                            let raw: Vec<u8> = self.ids.iter().flat_map(|&id| self.app.tok.token_bytes(id).iter().copied()).collect();
+                            match capture_protocol_error(base, self.req_id, self.session_id, &self.ids, self.kept, &raw, e) {
+                                Ok(path) => eprintln!("req {}: protocol error evidence saved to {}", self.req_id, path.display()),
+                                Err(err) => eprintln!("req {}: protocol error evidence capture FAILED: {err}", self.req_id),
+                            }
+                        }
                         self.app.sessions.lock().unwrap().abandon(self.session_id);
                         self.app.engine.release(self.session_id);
                         return Some(Err(format!("malformed model output protocol: {e}")));
@@ -596,6 +639,15 @@ impl Gen {
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
                     if let Some(dir) = &self.app.cfg.dump_dir {
+                        // Debug-only exact pre-parser output for successful parses too: a trial can
+                        // diagnose a content leak even if its parser did not report an error.
+                        let raw: Vec<u8> = self.ids.iter().flat_map(|&id| self.app.tok.token_bytes(id).iter().copied()).collect();
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let bytes = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                            .open(dir.join(format!("{:06}.out.bin", self.req_id)))
+                            .and_then(|mut f| { f.write_all(&raw)?; f.sync_all() });
+                        if let Err(e) = bytes { eprintln!("dump raw output: {e}"); }
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
                             "usage": usage.json(), "ttft_s": ttft, "total_s": total});
@@ -909,8 +961,45 @@ mod tests {
             loop_guard: None,
             tokenize_threads: 1,
             dump_dir: None,
+            protocol_error_dir: None,
             hold: Duration::from_secs(600),
         }
+    }
+
+    #[test]
+    fn protocol_error_capture_is_exact_private_and_non_overwriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("dsfront-capture-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let raw = b"prose <\xef\xbd\x9cDSML\xef\xbd\x9c parameter>\xff</think>";
+        let ids = [41, 42, 43];
+        let a = capture_protocol_error(&base, 7, 8, &ids, 2, raw, "invalid tool parameter").unwrap();
+        let b = capture_protocol_error(&base, 7, 8, &ids, 2, raw, "invalid tool parameter").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(a.join("generation.bin")).unwrap(), raw);
+        let record: Value = serde_json::from_slice(&std::fs::read(a.join("record.json")).unwrap()).unwrap();
+        assert_eq!(record["token_ids"], json!(ids));
+        assert_eq!(record["kept_tokens"], 2);
+        assert_eq!(record["raw_bytes"], raw.len());
+        assert!(record["raw_utf8"].is_null()); // Never use lossy UTF-8 as the authoritative bytes.
+        for path in [&base, &a, &b] { assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700); }
+        for name in ["generation.bin", "record.json"] { assert_eq!(std::fs::metadata(a.join(name)).unwrap().permissions().mode() & 0o777, 0o600); }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn protocol_error_capture_refuses_public_or_symlink_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("dsfront-capture-mode-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(capture_protocol_error(&base, 1, 1, &[], 0, b"secret", "error").is_err());
+        let link = base.with_extension("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(capture_protocol_error(&link, 1, 1, &[], 0, b"secret", "error").is_err());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(base).unwrap();
     }
 
     #[test]
