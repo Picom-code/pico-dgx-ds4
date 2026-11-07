@@ -12,6 +12,10 @@ target_link_libraries(coll_tests dsmodel)
 add_executable(glp_test tests/glp_test.cpp glp.cpp)
 target_include_directories(glp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Host-only recorded-Owen v1 fold/reduction-order regression (real direction file argument).
+add_executable(glp_math_test tests/glp_math_test.cpp glp.cpp)
+target_include_directories(glp_math_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # B3: the batch spec step's layout and verdicts (spec_batch.h) against a host reference; host only, no GPU
 add_executable(spec_batch_test tests/spec_batch_test.cu)
 target_include_directories(spec_batch_test PRIVATE ${CMAKE_SOURCE_DIR})

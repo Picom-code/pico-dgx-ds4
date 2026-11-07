@@ -495,9 +495,14 @@ void Model::Impl::ffn_p(int L, int M) {
   if (glp.on && glp.layer[L]) {
     // GLP: the layer's streams (hc_post only), the projection, then the next sublayer's input and mixes
     // from the projected streams (the same three pieces the single boundary makes of the unsteered row).
-    boundary_p(n, p.sub, p.mid, p.f_post, p.f_comb, p.pm, p.x, -1, 0, nullptr, nullptr, nullptr);
-    ops::glp_steer(U(p.x), n, glp_dir + (size_t)L * kDim, glp_alpha, nL < 0 ? p.pm : nullptr,
-                   nL < 0 ? U(p.yraw) : nullptr, st);
+    if (glp.alpha == 0.f) {  // zero-effect control keeps Pico's original fold
+      boundary_p(n, p.sub, p.mid, p.f_post, p.f_comb, p.pm, p.x, -1, 0, nullptr, nullptr, nullptr);
+      ops::glp_steer(U(p.x), n, glp_dir + (size_t)L * kDim, glp_alpha, nL < 0 ? p.pm : nullptr,
+                     nL < 0 ? U(p.yraw) : nullptr, st);
+    } else {
+      ops::glp_fold_steer(U(p.x), n, glp_dir + (size_t)L * kDim, glp_alpha, U(p.sub), U(p.mid),
+                          p.f_post, p.f_comb, nL < 0 ? p.pm : nullptr, nL < 0 ? U(p.yraw) : nullptr, st);
+    }
     if (nL >= 0) boundary_p(n, nullptr, p.x, nullptr, nullptr, p.pm, nullptr, nL, 0, p.a_pre, p.a_post, p.a_comb);
   } else {
     boundary_p(n, p.sub, p.mid, p.f_post, p.f_comb, p.pm, L + 1 < kLayers ? p.x : nullptr, nL, 0, p.a_pre, p.a_post,
