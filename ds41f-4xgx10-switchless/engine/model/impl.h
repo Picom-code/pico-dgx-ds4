@@ -18,6 +18,7 @@
 #include "comm/collectives.h"
 #include "common/check.h"
 #include "kernels/dsk.h"
+#include "model/glp.h"
 #include "model/model.h"
 #include "model/ops.h"
 
@@ -120,6 +121,12 @@ struct Model::Impl {
   comm::DevChannel ch2{};  // --wave-probe
   bool has_ch2 = false;
   bool bound = false;
+
+  // GLP steering (glp.h): off unless WEIGHTLESS_STEER_PATH was set. On, layer L's streams are projected
+  // off dir[L] at the boundary that ends layer L, in both the decode/verify step and a prefill chunk.
+  detail::GlpCfg glp;
+  float *glp_dir = nullptr, *glp_alpha = nullptr;
+  void steer_layer(int L, int R, const float* pre, bf16* yraw);
 
   // weights
   detail::LayerW lw[kLayers];
