@@ -8,6 +8,7 @@
 #include "comm/ring_dev.cuh"
 #include "common/check.h"
 #include "model/ops.h"
+#include "model/sample_rng.h"
 #include "model/spec_batch.h"
 
 namespace model::ops {
@@ -49,7 +50,7 @@ __device__ __forceinline__ uint64_t mix64(uint64_t x) {
   x ^= x >> 32;
   return x;
 }
-__device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
+__device__ __forceinline__ float unit(uint64_t h) { return sample_unit(h); }
 
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
 
