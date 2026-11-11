@@ -37,7 +37,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--model", default="/model")
 p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=18950)
-p.add_argument("--max-images", type=int, default=16)
+p.add_argument("--max-images", type=int, default=100)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
 a = p.parse_args()

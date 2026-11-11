@@ -110,7 +110,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(app)
 }
 
@@ -740,7 +740,9 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     let Some(addr) = app.cfg.vision_addr.clone() else {
         return Err(bad("image, audio and video input are not supported".into()));
     };
-    let enc = crate::vision::encode(&addr, &p.images, Duration::from_secs(90)).await.map_err(|e| {
+    // Each URL fetch can take 20 s; allow a full 100-image request to finish encoding.
+    let image_timeout = Duration::from_secs(90 + 20 * p.images.len().saturating_sub(1) as u64);
+    let enc = crate::vision::encode(&addr, &p.images, image_timeout).await.map_err(|e| {
         if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
     })?;
     let ids = {
@@ -1011,6 +1013,18 @@ mod tests {
         ] {
             assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
         }
+    }
+
+    #[test]
+    fn image_count_boundary() {
+        let mut cfg = cfg();
+        cfg.vision_addr = Some("127.0.0.1:18950".into());
+        let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
+        let mut r = json!({"messages": [{"role": "user", "content": "hi"}]});
+        r["messages"][0]["content"] = json!(vec![image.clone(); 100]);
+        assert_eq!(prepare(&cfg, &r).unwrap().images.len(), 100);
+        r["messages"][0]["content"] = json!(vec![image; 101]);
+        assert_eq!(prepare(&cfg, &r).err().unwrap(), "at most 100 images per request");
     }
 
     #[test]

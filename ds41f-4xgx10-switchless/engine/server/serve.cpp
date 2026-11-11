@@ -80,7 +80,8 @@
 namespace srv {
 namespace {
 
-constexpr uint32_t kMaxFrame = 192u << 20;  // a SUBMIT with images carries ~10.5 MB per 1024-token image
+// Image rows plus room for a 1M-token prompt and framing; matches frontend/src/protocol.rs.
+constexpr uint32_t kMaxFrame = fe::kMaxImages * fe::kMaxImageRows * fe::kImageDim * 2u + (8u << 20);
 constexpr int kIoCpu = 12;
 
 std::atomic<bool> g_stop{false};
@@ -273,11 +274,14 @@ class Io {
       if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
         uint32_t ni = 0;
         std::memcpy(&ni, p.data() + base, 4);
-        if (ni < 1 || ni > 64 || p.size() < base + 4 + ni * sizeof(fe::ImageSpan)) return false;
+        if (ni < 1 || ni > fe::kMaxImages || p.size() < base + 4 + ni * sizeof(fe::ImageSpan)) return false;
         r.spans.resize(ni);
         std::memcpy(r.spans.data(), p.data() + base + 4, ni * sizeof(fe::ImageSpan));
         size_t rows = 0;
-        for (const auto& s : r.spans) rows += s.rows;
+        for (const auto& s : r.spans) {
+          if (s.rows < 3 || s.rows > fe::kMaxImageRows) return false;
+          rows += s.rows;
+        }
         const size_t off = base + 4 + ni * sizeof(fe::ImageSpan);
         if (p.size() != off + rows * fe::kImageDim * 2) return false;
         r.img.resize(rows * fe::kImageDim);

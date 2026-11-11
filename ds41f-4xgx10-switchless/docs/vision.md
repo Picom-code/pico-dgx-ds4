@@ -84,15 +84,31 @@ across ranks) and the slot layout are unchanged. Workers are untouched.
 
 ## Running it
 
+Each chat-completions request accepts up to **100 images across all messages**, including prior
+turns. Image URLs and base64 data URLs are supported. The JSON body limit is 256 MiB; image tokens
+and text must together fit the context window. Images are encoded sequentially. The encoder and
+engine frame limits include room for all 100 images' embedding rows. Large image batches take
+longer than single-image requests; the encoder timeout scales with image count to allow URL fetches.
+
 ```
 docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g -e VISION_PRELOAD=1 \
   -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
-  /app/vision_encoder.py --host 127.0.0.1 --port 18950
+  /app/vision_encoder.py --host 127.0.0.1 --port 18950 --max-images 100
 dsfront serve ... --vision-addr 127.0.0.1:18950
 ```
 
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
 (correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
+
+For a running vision-enabled endpoint, the 100-image smoke test generates numbered OCR cards
+locally (Pillow and a TrueType font required), checks the first and last image of the full batch,
+verifies that 101 images and broken image bytes return 400, and checks text afterwards:
+
+```bash
+python3 tools/vision/smoke_100.py http://127.0.0.1:PORT/v1/chat/completions --key-file ~/api-key --output vision-100.json
+```
+
+Omit `--key-file` for an unauthenticated test server; `--font PATH` selects another font.
 
 ## Not done (v1)
 

@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 /// `<｜deepseek_image｜>`: the placeholder the chat encoding writes, and the id of every span position.
 pub const IMAGE_TOKEN_ID: u32 = 129264;
 pub const IMAGE_DIM: usize = 5120;
-pub const MAX_IMAGES: usize = 16;
+pub const MAX_IMAGES: usize = 100;
+pub const MAX_IMAGE_ROWS: usize = 1100;
 
 #[derive(Debug, Clone)]
 pub struct Encoded {
@@ -44,7 +45,7 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
         let mut n8 = [0u8; 8];
         s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
         let n = u64::from_le_bytes(n8) as usize;
-        if n > (MAX_IMAGES * 1100 * IMAGE_DIM * 2) {
+        if n > (MAX_IMAGES * MAX_IMAGE_ROWS * IMAGE_DIM * 2) {
             return Err("image encoder: reply too large".to_string());
         }
         let mut data = vec![0u8; n];
@@ -65,7 +66,7 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
     let mut hashes = Vec::new();
     for i in imgs {
         let r = i.get("rows").and_then(Value::as_u64).ok_or("image encoder: rows")?;
-        if !(3..=1100).contains(&r) {
+        if !(3..=MAX_IMAGE_ROWS as u64).contains(&r) {
             return Err("image encoder: bad span".into());
         }
         rows.push(r as u32);
