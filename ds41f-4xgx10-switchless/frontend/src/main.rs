@@ -18,7 +18,8 @@ fn usage() -> ! {
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
                                 or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
                                 kept across a turn's tool calls)
-      --thinking                thinking on when a request does not say (default off)
+      --thinking                thinking on when a request does not say (the default)
+      --no-thinking             default to chat mode; requests can override it with reasoning_effort
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
@@ -112,7 +113,7 @@ fn serve(args: &[String]) {
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
         encoding: encoding_opt(args),
-        default_thinking: args.iter().any(|a| a == "--thinking"),
+        default_thinking: !args.iter().any(|a| a == "--no-thinking"),
         default_temperature: parse_opt(args, "--temperature", 1.0f32),
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },

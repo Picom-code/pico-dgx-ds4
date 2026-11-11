@@ -226,35 +226,42 @@ fn num_i64(v: &Value) -> Option<i64> {
     s.parse().ok()
 }
 
-/// The reasoning-effort budget: the kit's table (low 50, high and xhigh 75, max 100), integers 1-100
-/// as they are, OpenAI fractions in [0, 1] times 100; anything else is the default.
-pub fn effort_budget(v: Option<&Value>, default: i64) -> i64 {
+/// API effort names mapped to the publisher's 1-100 prompt hint. Zero selects chat mode.
+/// These hints guide reasoning; they do not impose a reasoning-token limit.
+const EFFORT_LEVELS: &[(&str, i64)] = &[
+    ("none", 0), ("minimal", 1), ("low", 25), ("medium", 50),
+    ("high", 75), ("xhigh", 85), ("ultra", 95), ("max", 100),
+];
+
+fn invalid_effort(v: &Value) -> String {
+    format!("invalid reasoning_effort {v}; allowed values: none, minimal, low, medium, high, xhigh, ultra, max")
+}
+
+fn named_effort(v: &Value) -> Result<i64, String> {
+    EFFORT_LEVELS.iter().find(|(name, _)| v.as_str() == Some(*name))
+        .map(|(_, budget)| *budget).ok_or_else(|| invalid_effort(v))
+}
+
+/// Template/reasoning aliases also retain the existing numeric budget extension.
+/// The top-level API field accepts only the documented effort names.
+pub fn effort_budget(v: Option<&Value>, default: i64) -> Result<i64, String> {
     match v {
-        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
-            "low" => 50,
-            "high" | "xhigh" => 75,
-            "max" => 100,
-            t => t.parse::<f64>().ok().map_or(default, |f| effort_budget(Some(&json!(f)), default)),
-        },
+        None | Some(Value::Null) => Ok(default),
+        Some(v @ Value::String(_)) => named_effort(v),
         Some(n @ Value::Number(_)) => {
             let s = n.as_number().unwrap().to_string();
             let f = num_f64(n).unwrap_or(f64::NAN);
-            if !s.contains(['.', 'e', 'E']) {
-                let i = f as i64;
-                if (1..=100).contains(&i) {
-                    i
-                } else {
-                    default
-                }
-            } else if (0.0..=1.0).contains(&f) {
-                ((f * 100.0).round() as i64).clamp(1, 100)
+            if !s.contains(['.', 'e', 'E']) && (1.0..=100.0).contains(&f) {
+                Ok(f as i64)
+            } else if s.contains(['.', 'e', 'E']) && (0.0..=1.0).contains(&f) {
+                Ok(((f * 100.0).round() as i64).clamp(1, 100))
             } else if (1.0..=100.0).contains(&f) {
-                f.round() as i64
+                Ok(f.round() as i64)
             } else {
-                default
+                Err(invalid_effort(n))
             }
         }
-        _ => default,
+        Some(v) => Err(invalid_effort(v)),
     }
 }
 
@@ -371,27 +378,34 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         messages[0].as_object_mut().unwrap().insert("tools".into(), Value::Array(tools.clone()));
     }
 
-    // thinking and effort
+    // Validate every supplied effort, including fields shadowed by higher-priority aliases.
     let ctk = r.get("chat_template_kwargs").and_then(Value::as_object);
     let reasoning = r.get("reasoning").and_then(Value::as_object);
     let top_effort = r.get("reasoning_effort").filter(|v| !v.is_null());
-    let thinking = if let Some(v) = ctk.and_then(|c| c.get("thinking")).filter(|v| !v.is_null()) {
+    let top_budget = top_effort.map(named_effort).transpose()?;
+    let template_effort = ctk.and_then(|c| c.get("reasoning_effort")).filter(|v| !v.is_null());
+    let nested_effort = reasoning.and_then(|c| c.get("effort")).filter(|v| !v.is_null());
+    let nested_reasoning_effort = reasoning.and_then(|c| c.get("reasoning_effort")).filter(|v| !v.is_null());
+    for effort in [template_effort, nested_effort, nested_reasoning_effort].into_iter().flatten() {
+        effort_budget(Some(effort), cfg.default_effort)?;
+    }
+    let effort_src = top_effort.or(template_effort).or(nested_effort).or(nested_reasoning_effort);
+    let effort = effort_budget(effort_src, cfg.default_effort)?;
+    let thinking = if let Some(budget) = top_budget {
+        budget != 0 // The API's explicit effort takes precedence over template aliases.
+    } else if effort == 0 {
+        false
+    } else if let Some(v) = ctk.and_then(|c| c.get("thinking")).filter(|v| !v.is_null()) {
         truthy(Some(v))
     } else if let Some(v) = ctk.and_then(|c| c.get("enable_thinking")).filter(|v| !v.is_null()) {
         truthy(Some(v))
-    } else if let Some(e) = top_effort.or_else(|| reasoning.and_then(|x| x.get("effort")).filter(|v| !v.is_null())) {
-        e.as_str() != Some("none")
     } else if let Some(v) = reasoning.and_then(|x| x.get("enabled")).filter(|v| !v.is_null()) {
         truthy(Some(v))
     } else {
-        cfg.default_thinking
+        effort_src.is_some() || cfg.default_thinking
     };
-    let effort_src = ctk
-        .and_then(|c| c.get("reasoning_effort"))
-        .filter(|v| !v.is_null())
-        .or(top_effort)
-        .or_else(|| reasoning.and_then(|x| x.get("effort").or_else(|| x.get("reasoning_effort"))).filter(|v| !v.is_null()));
-    let budget = json!(effort_budget(effort_src, cfg.default_effort));
+    // The encoder accepts 1-100 even in chat mode, where it omits the effort prefix.
+    let budget = json!(if effort == 0 { cfg.default_effort } else { effort });
     let mode = if thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat };
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
@@ -983,7 +997,7 @@ mod tests {
             max_tokens_cap: 32768,
             default_effort: 75,
             encoding: Encoding::V41,
-            default_thinking: false,
+            default_thinking: true,
             default_temperature: 1.0,
             default_top_p: 0.95,
             loop_guard: None,
@@ -996,21 +1010,88 @@ mod tests {
 
     #[test]
     fn efforts() {
-        for (v, want) in [
-            (json!("low"), 50),
-            (json!("high"), 75),
-            (json!("xhigh"), 75),
-            (json!("max"), 100),
-            (json!("medium"), 75),
-            (json!(30), 30),
-            (json!(0), 75),
-            (json!(0.5), 50),
-            (json!(80.0), 80),
-            (json!("40"), 40),
-            (json!(true), 75),
-        ] {
-            assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
+        for &(name, budget) in EFFORT_LEVELS {
+            assert_eq!(effort_budget(Some(&json!(name)), 75).unwrap(), budget);
         }
+        for (v, want) in [(json!(30), 30), (json!(0.5), 50), (json!(80.0), 80)] {
+            assert_eq!(effort_budget(Some(&v), 75).unwrap(), want);
+        }
+        for v in [json!("banana"), json!("40"), json!(true), json!(0), json!(101)] {
+            assert!(effort_budget(Some(&v), 75).is_err(), "{v}");
+        }
+    }
+
+    fn request() -> Value {
+        json!({"messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[test]
+    fn default_thinking_and_named_efforts() {
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            let mut cfg = cfg();
+            cfg.encoding = encoding;
+            let p = prepare(&cfg, &request()).unwrap();
+            assert_eq!(p.mode, ThinkingMode::Thinking);
+            assert!(p.prompt.contains("Reasoning Effort: 75 "));
+            assert!(p.prompt.ends_with("<think>"));
+            for &(name, budget) in EFFORT_LEVELS {
+                let mut r = request();
+                r["reasoning_effort"] = json!(name);
+                let p = prepare(&cfg, &r).unwrap();
+                if name == "none" {
+                    assert_eq!(p.mode, ThinkingMode::Chat);
+                    assert!(!p.prompt.contains("Reasoning Effort:"));
+                    assert!(!p.prompt.ends_with("<think>"));
+                } else {
+                    assert_eq!(p.mode, ThinkingMode::Thinking);
+                    assert!(p.prompt.contains(&format!("Reasoning Effort: {budget} ")), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effort_validation_and_precedence() {
+        for bad in [json!("banana"), json!("HIGH"), json!(""), json!(true), json!(75), json!([]), json!({})] {
+            let mut r = request();
+            r["reasoning_effort"] = bad;
+            r["chat_template_kwargs"] = json!({"thinking": false});
+            let error = prepare(&cfg(), &r).err().expect("invalid API effort must fail even with thinking off");
+            assert!(error.contains("allowed values: none, minimal, low, medium, high, xhigh, ultra, max"));
+        }
+        let mut r = request();
+        r["reasoning_effort"] = json!("none");
+        r["chat_template_kwargs"] = json!({"thinking": true, "reasoning_effort": "max"});
+        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Chat);
+        r["reasoning_effort"] = json!("minimal");
+        r["chat_template_kwargs"] = json!({"thinking": false});
+        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Thinking);
+        r["chat_template_kwargs"] = json!({"reasoning_effort": "banana"});
+        assert!(prepare(&cfg(), &r).is_err());
+    }
+
+    #[test]
+    fn thinking_aliases_remain_supported() {
+        for alias in [
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"thinking": true, "reasoning_effort": "none"}}),
+            json!({"reasoning": {"enabled": false}}),
+            json!({"reasoning": {"effort": "none"}}),
+            json!({"reasoning": {"reasoning_effort": "none"}}),
+        ] {
+            let mut r = request();
+            r.as_object_mut().unwrap().extend(alias.as_object().unwrap().clone());
+            assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Chat, "{r}");
+        }
+        let mut r = request();
+        r["reasoning_effort"] = Value::Null;
+        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Thinking);
+        let mut cfg = cfg();
+        cfg.default_thinking = false;
+        assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Chat);
+        r["reasoning"] = json!({"effort": "low"});
+        assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
     }
 
     #[test]

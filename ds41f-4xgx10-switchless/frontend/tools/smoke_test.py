@@ -110,7 +110,23 @@ def main():
     s, b = request("POST", "/v1/chat/completions", {"messages": [SYSTEM, {"role": "user", "content": "Hello there"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
-    check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off")
+    check(bool(b["choices"][0]["message"].get("reasoning_content")), "thinking is on by default")
+
+    s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}],
+                   "reasoning_effort": "none", "chat_template_kwargs": {"thinking": True}})
+    check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+          and not b["choices"][0]["message"].get("reasoning_content"), "none disables thinking despite a conflicting template flag")
+
+    allowed = "none, minimal, low, medium, high, xhigh, ultra, max"
+    for streaming in (False, True):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": "banana", "stream": streaming})
+        check(s == 400 and allowed in b.get("error", {}).get("message", ""),
+              f"invalid effort returns 400 and lists allowed values (stream={streaming})")
+    for effort in allowed.split(", ")[1:]:
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), f"{effort} enables thinking")
 
     # thinking, streamed, pi-style kwargs
     body = {"messages": [SYSTEM, {"role": "user", "content": "Think first"}], "max_completion_tokens": 200,
@@ -169,7 +185,7 @@ def main():
 
     def pi(when, msg):
         return {"messages": [{"role": "system", "content": f"{sysp}Current date and time: Monday, October 12, 2026 at {when}"},
-                             {"role": "user", "content": msg}], "max_tokens": 8}
+                             {"role": "user", "content": msg}], "max_tokens": 8, "reasoning_effort": "none"}
 
     s1, b1 = request("POST", "/v1/chat/completions", pi("09:14:08 AM", "fix the build"))
     s2, b2 = request("POST", "/v1/chat/completions", pi("09:15:31 AM", "write the tests"))

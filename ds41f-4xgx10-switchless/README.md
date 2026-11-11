@@ -233,8 +233,14 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 **7. Use it.** dsfront serves OpenAI's chat completions (`POST /v1/chat/completions`, streamed with
 `"stream": true`, `tools` answered by `tool_calls`), `GET /v1/models` and `GET /health`, under the name
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default; a request's `model` is ignored).
-Thinking is off unless asked for, by `"chat_template_kwargs": {"thinking": true}` or `"reasoning_effort"`
-(`"low"`, `"high"`, `"max"`); the reasoning comes back in `reasoning_content`. Sampling defaults to
+Thinking is on by default; `"reasoning_effort": "none"` switches it off. Allowed effort names are
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max`; other values return HTTP 400
+with that list. The enabled levels map to the model's numeric effort hints 1, 25, 50, 75, 85, 95,
+and 100 respectively (default 75). These guide how thoroughly it reasons, rather than imposing a
+reasoning-token limit. Reasoning comes back in `reasoning_content`. The top-level effort overrides
+`chat_template_kwargs` and `reasoning` aliases; explicit `thinking: false` remains supported when no
+top-level effort is given. Numeric budgets remain available through those aliases. `--no-thinking`
+changes the server default. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put
