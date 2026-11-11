@@ -84,19 +84,75 @@ across ranks) and the slot layout are unchanged. Workers are untouched.
 
 ## Running it
 
+Each chat-completions request accepts up to **100 images across all messages**, including prior
+turns. Image URLs and base64 data URLs are supported. The JSON body limit is 256 MiB; image tokens
+and text must together fit the context window. Images are encoded sequentially. The encoder and
+engine frame limits include room for all 100 images' embedding rows. Large image batches take
+longer than single-image requests; the encoder timeout scales with image count to allow URL fetches.
+
 ```
 docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g -e VISION_PRELOAD=1 \
   -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
-  /app/vision_encoder.py --host 127.0.0.1 --port 18950
+  /app/vision_encoder.py --host 127.0.0.1 --port 18950 --max-images 100
 dsfront serve ... --vision-addr 127.0.0.1:18950
 ```
 
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
 (correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
 
+For a running vision-enabled endpoint, the 100-image smoke test generates numbered OCR cards
+locally (Pillow and a TrueType font required), checks the first and last image of the full batch,
+verifies that 101 images and broken image bytes return 400, and checks text afterwards:
+
+```bash
+python3 tools/vision/smoke_100.py http://127.0.0.1:PORT/v1/chat/completions --key-file ~/api-key --output vision-100.json
+```
+
+Omit `--key-file` for an unauthenticated test server; `--font PATH` selects another font.
+
+## Video input
+
+Chat-completions requests also accept `video_url` content parts. Public HTTP(S) URLs and base64
+data URLs work, for example:
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,...", "max_frames": 32}},
+  {"type": "text", "text": "Describe what happens in this clip, in order."}
+]}]}
+```
+
+The encoder needs PyAV (`av`) as well as the image dependencies. It samples up to 32 frames per clip
+by default, uniformly from the start through the end; `max_frames` accepts integers from 1 to 100.
+For several clips, the available frame budget is divided between them. Video frames and still
+images together share the 100-image limit across all messages. Each frame is resized to fit within
+768x768 pixels and is inserted as an image with its timestamp and the clip duration, preserving
+its place in the conversation. Frame extraction runs in a separate process with a 60-second timeout.
+Clips are limited to 128 MiB; the HTTP JSON limit remains 256 MiB. Nested media protocols are disabled,
+and video URLs use the same public-address-only fetch rules as images.
+
+This is visual video analysis through the existing vision tower. Audio tracks are ignored. Streaming
+and non-streaming chat requests both work; video decoding happens before generation starts.
+
+CPU-only decoder tests (PyAV and Pillow required):
+
+```bash
+python3 -m unittest discover -s tools/vision -p test_video_frames.py -v
+```
+
+For a running endpoint, test a local clip with streaming and non-streaming requests, bad inputs,
+the shared frame budget, then ordinary image and text requests:
+
+```bash
+python3 tools/vision/smoke_video.py http://127.0.0.1:PORT/v1/chat/completions clip.mp4 --key-file ~/api-key --output video-results.json
+```
+
+With a clip showing known codes in successive scenes, add `--expected 1111 2222 3333` to assert
+their order. The live smoke script needs Pillow; generating or decoding clips on the client is not required.
+
 ## Not done (v1)
 
 - No prefix reuse for image turns (each image request prefills its whole prompt).
 - Images are encoded one at a time on one GPU; no batching across requests.
-- `input_image` (Responses API), video and audio parts are refused.
+- `input_image` (Responses API) and audio parts are refused.
 

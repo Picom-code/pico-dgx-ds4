@@ -23,9 +23,12 @@ import os
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -37,8 +40,10 @@ p = argparse.ArgumentParser()
 p.add_argument("--model", default="/model")
 p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=18950)
-p.add_argument("--max-images", type=int, default=16)
+p.add_argument("--max-images", type=int, default=100)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
+p.add_argument("--max-video-bytes", type=int, default=128 << 20)
+p.add_argument("--video-timeout-s", type=float, default=60)
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
 a = p.parse_args()
 
@@ -74,6 +79,7 @@ assert args.vision_n_layers > 0
 
 _model = None
 _lock = threading.Lock()
+_video_lock = threading.Lock()
 _last = time.time()
 
 
@@ -122,8 +128,9 @@ def _public(host):
             raise ValueError("image URL host %s is not a public address" % host)
 
 
-def fetch(record):
+def fetch(record, max_bytes=None):
     """Image bytes from a record (image_processor.load_image_bytes, with a size cap for URLs)."""
+    limit = a.max_bytes if max_bytes is None else max_bytes
     url = record.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
         from urllib.parse import urlsplit
@@ -136,16 +143,55 @@ def fetch(record):
 
         _public(urlsplit(url).hostname or "")
         with build_opener(Redir).open(Request(url, headers={"User-Agent": "dsgx10-vision/1"}), timeout=20) as r:
-            b = r.read(a.max_bytes + 1)
-        if len(b) > a.max_bytes:
-            raise ValueError("image larger than %d bytes" % a.max_bytes)
+            b = r.read(limit + 1)
+        if len(b) > limit:
+            raise ValueError("media larger than %d bytes" % limit)
         return b
     if isinstance(url, str) and url and not url.startswith("data:"):
         raise ValueError("image url must be a data: URL or http(s)")  # no local paths over the API
     src = record.get("source")
     if isinstance(src, dict) and src.get("url") and not src.get("data"):
-        return fetch({"url": src["url"]})
-    return ip.load_image_bytes(record)
+        return fetch({"url": src["url"]}, limit)
+    raw = ip.load_image_bytes(record)
+    if len(raw) > limit:
+        raise ValueError("media larger than %d bytes" % limit)
+    return raw
+
+
+def decode_videos(req):
+    videos = req.get("videos")
+    budget = req.get("frame_budget", a.max_images)
+    if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= a.max_images:
+        raise ValueError("invalid video frame budget")
+    if not isinstance(videos, list) or not 1 <= len(videos) <= budget:
+        raise ValueError("not enough frame budget for the videos")
+    results = []
+    with _video_lock:
+        for record in videos:
+            count = record.get("max_frames", 32)
+            if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= a.max_images:
+                raise ValueError("max_frames must be an integer between 1 and %d" % a.max_images)
+            count = min(count, budget // len(videos))
+            raw = fetch(record, a.max_video_bytes)
+            with tempfile.TemporaryDirectory(prefix="vision-video-") as tmp:
+                clip = Path(tmp) / "clip"
+                clip.write_bytes(raw)
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(Path(__file__).with_name("video_frames.py")), str(clip), "--max-frames", str(count)],
+                        capture_output=True, timeout=a.video_timeout_s, check=False,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    raise ValueError("video decoding timed out") from e
+            try:
+                decoded = json.loads(result.stdout)
+            except (ValueError, UnicodeError) as e:
+                raise ValueError("video decoder failed") from e
+            if result.returncode or not decoded.get("ok"):
+                raise ValueError("cannot decode video: " + decoded.get("error", "decoder failed"))
+            results.append({"duration": decoded["duration"], "frames": decoded["frames"]})
+            log(f"video {len(raw)} B, {decoded['duration']:.3f} s -> {len(decoded['frames'])} timestamped frames")
+    return results
 
 
 @torch.inference_mode()
@@ -213,8 +259,12 @@ class H(socketserver.BaseRequestHandler):
             if n > (256 << 20):
                 return
             try:
-                imgs, data = handle(json.loads(recv_exact(s, n)))
-                hdr = {"ok": True, "images": imgs}
+                req = json.loads(recv_exact(s, n))
+                if "videos" in req:
+                    hdr, data = {"ok": True, "videos": decode_videos(req)}, b""
+                else:
+                    imgs, data = handle(req)
+                    hdr = {"ok": True, "images": imgs}
             except Exception as e:  # noqa: BLE001  (the error goes back to the client as a 400)
                 log("error:", repr(e))
                 hdr, data = {"ok": False, "error": str(e)[:500]}, b""

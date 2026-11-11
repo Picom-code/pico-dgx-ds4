@@ -6,8 +6,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const VERSION: u32 = 1;
 pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
-/// Larger frames are a protocol error (a 1M-token prompt is 4 MB).
-pub const MAX_FRAME: usize = 64 << 20;
+/// Up to 100 image spans, plus room for a 1M-token prompt and framing.
+pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
 
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;

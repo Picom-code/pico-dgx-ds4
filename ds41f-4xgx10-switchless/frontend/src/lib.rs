@@ -11,3 +11,4 @@ pub mod server;
 pub mod session;
 pub mod tokenizer;
 pub mod vision;
+pub mod video;

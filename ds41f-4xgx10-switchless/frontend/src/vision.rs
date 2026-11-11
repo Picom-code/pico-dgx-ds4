@@ -15,7 +15,8 @@ use tokio::net::TcpStream;
 /// `<｜deepseek_image｜>`: the placeholder the chat encoding writes, and the id of every span position.
 pub const IMAGE_TOKEN_ID: u32 = 129264;
 pub const IMAGE_DIM: usize = 5120;
-pub const MAX_IMAGES: usize = 16;
+pub const MAX_IMAGES: usize = 100;
+pub const MAX_IMAGE_ROWS: usize = 1100;
 
 #[derive(Debug, Clone)]
 pub struct Encoded {
@@ -27,24 +28,28 @@ pub struct Encoded {
     pub ms: f64,
 }
 
-pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<Encoded, String> {
-    if records.len() > MAX_IMAGES {
-        return Err(format!("at most {MAX_IMAGES} images per request"));
+/// A loopback encoder RPC. Video expansion returns frame records in the JSON header, no binary data.
+pub(crate) async fn exchange(addr: &str, body: &Value, timeout: Duration, max_data: usize) -> Result<(Value, Vec<u8>), String> {
+    let body = body.to_string().into_bytes();
+    if body.len() > 256 << 20 {
+        return Err("media request exceeds 256 MiB".into());
     }
-    let t0 = Instant::now();
     let fut = async {
         let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
-        let body = json!({ "images": records }).to_string().into_bytes();
         s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
         s.write_all(&body).await.map_err(|e| e.to_string())?;
         let mut n4 = [0u8; 4];
         s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
-        let mut h = vec![0u8; u32::from_le_bytes(n4) as usize];
+        let header_len = u32::from_le_bytes(n4) as usize;
+        if header_len > 128 << 20 {
+            return Err("image encoder: JSON reply too large".into());
+        }
+        let mut h = vec![0u8; header_len];
         s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
         let mut n8 = [0u8; 8];
         s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
         let n = u64::from_le_bytes(n8) as usize;
-        if n > (MAX_IMAGES * 1100 * IMAGE_DIM * 2) {
+        if n > max_data {
             return Err("image encoder: reply too large".to_string());
         }
         let mut data = vec![0u8; n];
@@ -52,7 +57,16 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
         let h: Value = serde_json::from_slice(&h).map_err(|e| format!("image encoder: {e}"))?;
         Ok::<_, String>((h, data))
     };
-    let (h, data) = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())??;
+    tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())?
+}
+
+pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<Encoded, String> {
+    if records.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per request"));
+    }
+    let t0 = Instant::now();
+    let max_data = MAX_IMAGES * MAX_IMAGE_ROWS * IMAGE_DIM * 2;
+    let (h, data) = exchange(addr, &json!({"images": records}), timeout, max_data).await?;
     if h.get("ok").and_then(Value::as_bool) != Some(true) {
         let e = h.get("error").and_then(Value::as_str).unwrap_or("unknown error");
         return Err(format!("cannot read the image: {e}"));
@@ -65,7 +79,7 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
     let mut hashes = Vec::new();
     for i in imgs {
         let r = i.get("rows").and_then(Value::as_u64).ok_or("image encoder: rows")?;
-        if !(3..=1100).contains(&r) {
+        if !(3..=MAX_IMAGE_ROWS as u64).contains(&r) {
             return Err("image encoder: bad span".into());
         }
         rows.push(r as u32);
