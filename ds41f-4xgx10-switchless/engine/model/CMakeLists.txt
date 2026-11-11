@@ -16,3 +16,7 @@ option(DSGB10_NVTX "NVTX ranges in the model and the server, for nsys" OFF)
 if(DSGB10_NVTX)
   target_compile_definitions(dsmodel PUBLIC DSGB10_NVTX)
 endif()
+
+# Host-only exhaustive open-interval and Gumbel endpoint regression.
+add_executable(sample_rng_test tests/sample_rng_test.cpp)
+target_include_directories(sample_rng_test PRIVATE ${CMAKE_SOURCE_DIR})
