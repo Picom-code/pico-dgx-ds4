@@ -15,6 +15,7 @@ use crate::session::SessionTable;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::Json;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -169,15 +170,23 @@ fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
+/// JSON, not text: the image the recipe runs in (DeepSeek-v4.1-Flash-DGX-Sparks/Dockerfile) bakes in
+/// `HEALTHCHECK CMD python3 -S /opt/dsv41/boot.py health`, and that probe parses this body as JSON.
+/// Nothing in this repo ever read the text - the bench scripts and tools check the status code only.
 async fn health(State(app): State<Arc<App>>) -> Response {
-    if app.gate.held() {
-        let msg = format!("the ring is lent to a development job: requests wait up to {} s\n", app.gate.hold_limit().as_secs());
-        (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+    let (code, body) = if app.gate.held() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"status": "held",
+                   "detail": format!("the ring is lent to a development job: requests wait up to {} s",
+                                     app.gate.hold_limit().as_secs())}),
+        )
     } else if app.engine.info().is_some() {
-        (StatusCode::OK, "ok\n").into_response()
+        (StatusCode::OK, json!({"status": "ok"}))
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
-    }
+        (StatusCode::SERVICE_UNAVAILABLE, json!({"status": "no_engine", "detail": "engine not connected"}))
+    };
+    (code, Json(body)).into_response()
 }
 
 async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
