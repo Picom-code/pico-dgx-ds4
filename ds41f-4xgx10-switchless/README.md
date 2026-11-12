@@ -252,7 +252,10 @@ thoroughly the model reasons, rather than imposing a reasoning-token limit. Reas
 there, else the top-level one, else `reasoning`'s; an effort inside `chat_template_kwargs` alone does
 not switch thinking on. A request that sends only fields and values the server took before these
 changes is answered as before (same mode, same effort), with one exception: a request that carried both
-an on-switch and an off-switch now always gets the off-switch. Sampling defaults to
+an on-switch and an off-switch now always gets the off-switch. A stream carries each tool call in one
+chunk, once the call is complete; with `--stream-tool-args` (in `DSGB10_FRONT_ARGS`) it carries the
+call's name when that has parsed and then its arguments as they arrive, as OpenAI streams them, and a
+call that is cut off or does not parse leaves its client with unfinished arguments. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put
