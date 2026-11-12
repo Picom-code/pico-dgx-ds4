@@ -26,6 +26,7 @@ import struct
 import sys
 import threading
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -40,6 +41,7 @@ p.add_argument("--port", type=int, default=18950)
 p.add_argument("--max-images", type=int, default=16)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
+p.add_argument("--cache-mb", type=int, default=1024)      # span rows kept per image hash; 0: off
 a = p.parse_args()
 
 sys.path.insert(0, os.path.join(a.model, "inference"))
@@ -75,6 +77,13 @@ assert args.vision_n_layers > 0
 _model = None
 _lock = threading.Lock()
 _last = time.time()
+
+# Span rows by image content: the ViT is the expensive part (~0.3-1.2 s per image) and the prompt
+# cache never covers it, so an image encoded once is served from here when it comes back - a
+# transcript re-sent every turn would otherwise re-encode the same figures again and again. Keyed
+# on the same sha256 the reply carries as "hash", ordered by use, evicted oldest-first.
+_cache = OrderedDict()
+_cache_bytes = 0
 
 
 def log(*x):
@@ -175,19 +184,38 @@ def handle(req):
     recs = req.get("images") or []
     if not recs or len(recs) > a.max_images:
         raise ValueError("between 1 and %d images per request" % a.max_images)
+    global _cache_bytes
     out, blobs = [], []
     with _lock:
         for r in recs:
-            t0 = time.time()
             raw = fetch(r)
+            key = hashlib.sha256(raw).digest()
+            hit = _cache.get(key)
+            if hit is not None:
+                _cache.move_to_end(key)
+                blobs.append(hit["blob"])
+                out.append({"rows": hit["rows"], "hash": hit["hash"], "grid": hit["grid"], "ms": 0.0,
+                            "bytes": len(raw), "cached": True})
+                log(f"image {len(raw)} B -> {hit['grid'][2]}x{hit['grid'][3]} tokens ({hit['rows']} rows) cached "
+                    f"[{len(_cache)} images, {_cache_bytes / 2**20:.0f} MiB]")
+                continue
+            t0 = time.time()
             span, g = encode(raw)
             torch.cuda.synchronize()
             ms = 1e3 * (time.time() - t0)
-            blobs.append(span.view(torch.int16).cpu().numpy().tobytes())
+            blob = span.view(torch.int16).cpu().numpy().tobytes()
+            blobs.append(blob)
             h = hashlib.sha256(raw).digest()
             out.append({"rows": span.shape[0], "hash": int.from_bytes(h[:8], "little"), "grid": g, "ms": round(ms, 1),
                         "bytes": len(raw)})
             log(f"image {len(raw)} B -> {g[2]}x{g[3]} tokens ({span.shape[0]} rows) in {ms:.0f} ms")
+            if a.cache_mb > 0 and key not in _cache:
+                _cache[key] = {"rows": span.shape[0], "hash": int.from_bytes(h[:8], "little"), "grid": g,
+                               "blob": blob}
+                _cache_bytes += len(blob)
+                while _cache_bytes > (a.cache_mb << 20) and len(_cache) > 1:
+                    _, evicted = _cache.popitem(last=False)
+                    _cache_bytes -= len(evicted["blob"])
     return out, b"".join(blobs)
 
 
@@ -244,5 +272,6 @@ if __name__ == "__main__":
         load()
     threading.Thread(target=unloader, daemon=True).start()
     srv = S((a.host, a.port), H)
-    log(f"listening on {a.host}:{a.port}")
+    log(f"listening on {a.host}:{a.port}; image cache {a.cache_mb} MiB" if a.cache_mb > 0
+        else f"listening on {a.host}:{a.port}; image cache off")
     srv.serve_forever()
