@@ -10,6 +10,7 @@
 //! text, so its file is ours alone: mode 0600 in a directory of mode 0700, written whole or not at all.
 
 use crate::tokenizer::Tokenizer;
+use crate::vision::MAX_IMAGES;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -27,6 +28,11 @@ struct Session {
     ids: Vec<u32>,
     /// ends[i] = byte length of the text of ids[..=i]
     ends: Vec<usize>,
+    /// Vision: the image spans in `ids` — (first id, rows, hash of the image's bytes), in prompt
+    /// order. A session without images has none, and then the text prefix alone decides its reuse.
+    /// Two images of one size spell the same ids, so the ids cannot tell them apart: the hashes are
+    /// what makes a shared prefix trustworthy.
+    spans: Vec<(u32, u32, u64)>,
     prompt_len: usize,
     busy: bool,
     last_used: u64,
@@ -49,6 +55,12 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// A session that starts from nothing: the first request of a conversation, or one whose text
+    /// matched a session but whose images did not.
+    fn new(session_id: u64) -> Plan {
+        Plan { session_id, base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }
+    }
+
     /// Where the request starts, for the log (no text, no ids): a continuation of a session, a
     /// fork of one (the engine starts from it if it holds it), or a new session that names none.
     pub fn describe(&self, prompt_bytes: usize) -> String {
@@ -89,7 +101,66 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-const TABLE_MAGIC: &[u8; 8] = b"DSFT0001";
+const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
+
+/// The byte end of every id, and the whole length, with each image span charged once: `ids` spells
+/// `text` only with ONE placeholder per span, so a span's ids share the end byte of the placeholder
+/// they stand for. That keeps `ends` non-decreasing and keeps a cut from ever landing inside a span.
+fn ends_of(ids: &[u32], spans: &[(u32, u32, u64)], tok: &Tokenizer) -> (Vec<usize>, usize) {
+    let mut ends = Vec::with_capacity(ids.len());
+    let (mut at, mut k) = (0usize, 0usize);
+    for (i, &id) in ids.iter().enumerate() {
+        if let Some(&(start, rows, _)) = spans.get(k) {
+            if (i as u32) >= start && (i as u32) < start + rows {
+                if i as u32 + 1 == start + rows {
+                    at += tok.token_bytes(id).len();
+                    k += 1;
+                }
+                ends.push(at);
+                continue;
+            }
+        }
+        at += tok.token_bytes(id).len();
+        ends.push(at);
+    }
+    (ends, at)
+}
+
+/// Do `ids` and `spans` spell `text`? The same check `ends_of` rests on, made explicit: every span
+/// stands for exactly one placeholder.
+fn spells(ids: &[u32], spans: &[(u32, u32, u64)], tok: &Tokenizer, text: &[u8]) -> bool {
+    let (mut at, mut i, mut k) = (0usize, 0usize, 0usize);
+    while i < ids.len() {
+        if let Some(&(start, rows, _)) = spans.get(k) {
+            if i as u32 == start {
+                let b = tok.token_bytes(ids[i]);
+                if text.get(at..at + b.len()) != Some(b) {
+                    return false;
+                }
+                at += b.len();
+                i += rows as usize;
+                k += 1;
+                continue;
+            }
+        }
+        let b = tok.token_bytes(ids[i]);
+        if text.get(at..at + b.len()) != Some(b) {
+            return false;
+        }
+        at += b.len();
+        i += 1;
+    }
+    at == text.len()
+}
+
+/// Are the images inside a reused prefix the same images? `have` are the session's spans, `spans` the
+/// new request's, `reused` how many ids are taken from the session. Only the session's spans that end
+/// inside the prefix matter: the ones past it are not reused.
+fn spans_agree(have: &[(u32, u32, u64)], spans: &[(u32, u32, u64)], reused: usize) -> bool {
+    have.iter()
+        .filter(|&&(start, rows, _)| start as usize + rows as usize <= reused)
+        .all(|&(start, rows, hash)| spans.iter().any(|&(s, r, h)| s == start && r == rows && h == hash))
+}
 
 fn fnv(b: &[u8]) -> u64 {
     b.iter().fold(1469598103934665603u64, |h, &x| (h ^ x as u64).wrapping_mul(1099511628211))
@@ -157,6 +228,12 @@ impl SessionTable {
             body.extend((s.ids.len() as u64).to_le_bytes());
             for &x in &s.ids {
                 body.extend(x.to_le_bytes());
+            }
+            body.extend((s.spans.len() as u64).to_le_bytes());
+            for &(start, rows, hash) in &s.spans {
+                body.extend(start.to_le_bytes());
+                body.extend(rows.to_le_bytes());
+                body.extend(hash.to_le_bytes());
             }
         }
         let mut f = TABLE_MAGIC.to_vec();
@@ -229,21 +306,34 @@ impl SessionTable {
             let n_ids = r.u64()? as usize;
             let raw = r.take(n_ids.checked_mul(4).ok_or("a bad count")?)?;
             let ids: Vec<u32> = raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let n_spans = r.u64()? as usize;
+            let mut spans = Vec::with_capacity(n_spans.min(MAX_IMAGES));
+            for _ in 0..n_spans {
+                let start = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
+                let rows = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
+                spans.push((start, rows, r.u64()?));
+            }
             let Ok(text) = std::str::from_utf8(text) else { continue };
             let vocab = tok.vocab_size() as u32;
             if id == 0 || now.saturating_sub(t_used) > max_age_s || prompt_len > text.len() || ids.iter().any(|&x| x >= vocab) {
                 continue;
             }
-            let mut ends = Vec::with_capacity(ids.len());
-            let mut at = 0;
-            for &x in &ids {
-                at += tok.token_bytes(x).len();
-                ends.push(at);
+            // spans in order, not overlapping, each inside the ids
+            let fits = spans.iter().try_fold(0u32, |end, &(start, rows, _)| {
+                if start < end || rows < 3 || start as usize + rows as usize > ids.len() {
+                    None
+                } else {
+                    Some(start + rows)
+                }
+            });
+            if fits.is_none() {
+                continue;
             }
-            if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
+            let (ends, at) = ends_of(&ids, &spans, tok);
+            if at != text.len() || !spells(&ids, &spans, tok, text.as_bytes()) {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            got.insert(id, Session { text: text.to_string(), ids, ends, spans, prompt_len, busy: false, last_used, t_used });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -265,6 +355,24 @@ impl SessionTable {
     /// Choose the session and the token ids for a prompt. The chosen session is busy until
     /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
     pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
+        self.plan_inner(text, tok, threads, None)
+    }
+
+    /// The same for a prompt with images (docs/vision.md): `ids` is the prompt with every placeholder
+    /// expanded into its span, and `spans` names those spans — (first id, rows, hash of the image's
+    /// bytes). A prefix is reused only when the images inside it are the same images, because the ids
+    /// of two images of one size are identical and the text table cannot tell them apart on its own.
+    pub fn plan_images(&mut self, text: &str, tok: &Tokenizer, spans: &[(u32, u32, u64)], ids: &[u32]) -> (Plan, Vec<u64>) {
+        self.plan_inner(text, tok, 1, Some((spans, ids)))
+    }
+
+    fn plan_inner(
+        &mut self,
+        text: &str,
+        tok: &Tokenizer,
+        threads: usize,
+        images: Option<(&[(u32, u32, u64)], &[u32])>,
+    ) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
@@ -275,7 +383,7 @@ impl SessionTable {
         }
         let best = top.filter(|&(_, n)| n >= MIN_SHARED);
         let (mut plan, cut) = match best {
-            None => (Plan { session_id: self.new_id(), base_session_id: 0, reused: 0, ids: Vec::new(), matched: 0, shared: 0, common: 0 }, 0),
+            None => (Plan::new(self.new_id()), 0),
             Some((sid, mut shared)) => {
                 while !text.is_char_boundary(shared) {
                     shared -= 1;
@@ -290,23 +398,37 @@ impl SessionTable {
                     }
                     for p in [a, e] {
                         if p <= shared && p > cut.0 {
-                            if let Ok(k) = s.ends.binary_search(&p) {
-                                cut = (p, k + 1);
+                            // The LAST id that ends at p: a span's ids share one end byte, so a cut
+                            // inside a span matches no id and the span stays whole.
+                            let k = s.ends.partition_point(|&x| x <= p);
+                            if k > 0 && s.ends[k - 1] == p {
+                                cut = (p, k);
                             }
                         }
                     }
                 }
-                let ids = s.ids[..cut.1].to_vec();
-                let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
-                let plan = if in_place {
-                    Plan { session_id: sid, base_session_id: 0, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
-                } else {
-                    Plan { session_id: self.new_id(), base_session_id: sid, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
+                let reusable = match images {
+                    None => true,
+                    Some((spans, ids)) => {
+                        cut.1 <= ids.len() && ids[..cut.1] == s.ids[..cut.1] && spans_agree(&s.spans, spans, cut.1)
+                    }
                 };
-                (plan, cut.0)
+                if !reusable {
+                    // The text agrees but an image inside it is another image: the state there is
+                    // not this prompt's to reuse, so it starts from nothing.
+                    (Plan::new(self.new_id()), 0)
+                } else {
+                    let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
+                    let ids = s.ids[..cut.1].to_vec();
+                    let (session_id, base_session_id) = if in_place { (sid, 0) } else { (self.new_id(), sid) };
+                    (Plan { session_id, base_session_id, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }, cut.0)
+                }
             }
         };
-        plan.ids.extend(tok.encode_parallel(&text[cut..], threads));
+        match images {
+            None => plan.ids.extend(tok.encode_parallel(&text[cut..], threads)),
+            Some((_, ids)) => plan.ids.extend_from_slice(&ids[plan.reused..]),
+        }
         if let Some((sid, n)) = top {
             plan.matched = sid;
             plan.shared = n;
@@ -318,6 +440,7 @@ impl SessionTable {
             text: String::new(),
             ids: Vec::new(),
             ends: Vec::new(),
+            spans: Vec::new(),
             prompt_len: 0,
             busy: false,
             last_used: clock,
@@ -332,6 +455,19 @@ impl SessionTable {
 
     /// Record what the session holds after a request: the prompt and the generated ids.
     pub fn finish(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer) {
+        self.finish_images(session_id, prompt_text, prompt_ids, &[], generated, tok);
+    }
+
+    /// The same for a prompt with images: `spans` are its image spans in `prompt_ids`.
+    pub fn finish_images(
+        &mut self,
+        session_id: u64,
+        prompt_text: &str,
+        prompt_ids: &[u32],
+        spans: &[(u32, u32, u64)],
+        generated: &[u32],
+        tok: &Tokenizer,
+    ) {
         let Some(s) = self.sessions.get_mut(&session_id) else { return };
         let gen_bytes = tok.decode_bytes(generated);
         let mut text = prompt_text.to_string();
@@ -341,16 +477,12 @@ impl SessionTable {
             text.push_str(g);
             ids.extend_from_slice(generated);
         }
-        let mut ends = Vec::with_capacity(ids.len());
-        let mut at = 0;
-        for &id in &ids {
-            at += tok.token_bytes(id).len();
-            ends.push(at);
-        }
+        let (ends, at) = ends_of(&ids, spans, tok);
         debug_assert_eq!(at, text.len());
         s.text = text;
         s.ids = ids;
         s.ends = ends;
+        s.spans = spans.to_vec();
         s.prompt_len = prompt_text.len();
         s.busy = false;
     }
@@ -513,6 +645,91 @@ mod tests {
         assert!(SessionTable::new(8, 1 << 20).load(&path, &tok, 3600).unwrap_err().starts_with("saved"));
         t.sessions.get_mut(&plan.session_id).unwrap().t_used = 1;
         assert_eq!(t.save(&path, 3600), Ok(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A prompt with `n` image placeholders, expanded into spans of `rows[k]` ids with `hashes[k]`.
+    fn with_images(tok: &Tokenizer, text: &str, rows: &[u32], hashes: &[u64]) -> (Vec<u32>, Vec<(u32, u32, u64)>) {
+        let (mut ids, mut spans, mut k) = (Vec::new(), Vec::new(), 0);
+        for id in tok.encode(text) {
+            if id == crate::vision::IMAGE_TOKEN_ID {
+                spans.push((ids.len() as u32, rows[k], hashes[k]));
+                ids.extend(std::iter::repeat(id).take(rows[k] as usize));
+                k += 1;
+            } else {
+                ids.push(id);
+            }
+        }
+        assert_eq!(k, rows.len(), "one placeholder per image");
+        (ids, spans)
+    }
+
+    #[test]
+    fn an_image_turn_reuses_its_prefix() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = format!("<｜System｜>You answer about screenshots.<｜User｜>what is this?{}<｜Assistant｜>", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids1, spans1) = with_images(&tok, &p1, &[5], &[7]);
+        let (plan, _) = t.plan_images(&p1, &tok, &spans1, &ids1);
+        assert_eq!(plan.reused, 0);
+        assert_eq!(plan.base_session_id, 0);
+        assert_eq!(plan.ids, ids1, "a cold request sends the prompt as it is");
+        let gen = tok.encode("A screenshot.");
+        t.finish_images(plan.session_id, &p1, &plan.ids, &spans1, &gen, &tok);
+        // the next turn: the same image, the same text up to the new question
+        let p2 = format!("{p1}A screenshot.<｜User｜>and this?</think>");
+        let (ids2, spans2) = with_images(&tok, &p2, &[5], &[7]);
+        let (plan2, _) = t.plan_images(&p2, &tok, &spans2, &ids2);
+        assert_eq!(plan2.session_id, plan.session_id, "in place, not a new session");
+        assert_eq!(plan2.ids, ids2, "the ids are a cold run's");
+        let (start, rows, _) = spans1[0];
+        let span_end = (start + rows) as usize;
+        assert!(plan2.reused >= span_end, "the image is inside the reused prefix: {} of {span_end}", plan2.reused);
+        assert_eq!(plan2.ids[..plan2.reused], ids1[..plan2.reused], "the reused ids are the session's own");
+    }
+
+    #[test]
+    fn another_image_is_not_this_sessions_prefix() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = format!("<｜System｜>You answer about screenshots.</think>what is this?{}", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids1, spans1) = with_images(&tok, &p1, &[5], &[7]);
+        let (plan, _) = t.plan_images(&p1, &tok, &spans1, &ids1);
+        t.finish_images(plan.session_id, &p1, &plan.ids, &spans1, &tok.encode("A screenshot."), &tok);
+        // the same words, the same span size, a different image: the ids are identical, the KV is not
+        let p2 = format!("{p1}A screenshot.</think>and this?");
+        let (ids2, spans2) = with_images(&tok, &p2, &[5], &[8]);
+        let (same_ids, _) = with_images(&tok, &p2, &[5], &[7]);
+        assert_eq!(same_ids, ids2, "two images of one size spell identical ids");
+        let (plan2, _) = t.plan_images(&p2, &tok, &spans2, &ids2);
+        assert_ne!(plan2.session_id, plan.session_id);
+        assert_eq!(plan2.reused, 0, "nothing is reused past another image");
+        assert_eq!(plan2.base_session_id, 0);
+        assert_eq!(plan2.ids, ids2);
+    }
+
+    #[test]
+    fn a_saved_table_keeps_its_images() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let dir = std::env::temp_dir().join(format!("dsfront-image-table-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("front.table");
+        let mut t = SessionTable::new(8, 1 << 20);
+        let p1 = format!("<｜System｜>You answer about screenshots.</think>what is this?{}", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids1, spans1) = with_images(&tok, &p1, &[5], &[7]);
+        let (plan, _) = t.plan_images(&p1, &tok, &spans1, &ids1);
+        let gen = tok.encode("A screenshot.");
+        t.finish_images(plan.session_id, &p1, &plan.ids, &spans1, &gen, &tok);
+        assert_eq!(t.save(&path, 3600), Ok(1));
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Ok(1), "a session with images loads back");
+        let p2 = format!("{p1}A screenshot.</think>and this?");
+        let (ids2, spans2) = with_images(&tok, &p2, &[5], &[7]);
+        let (plan2, _) = u.plan_images(&p2, &tok, &spans2, &ids2);
+        assert_eq!(plan2.session_id, plan.session_id);
+        assert_eq!(plan2.reused, plan.ids.len() + gen.len());
+        assert_eq!(plan2.ids, ids2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

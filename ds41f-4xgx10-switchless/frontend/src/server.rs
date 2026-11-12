@@ -9,7 +9,7 @@ use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Enco
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
-use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
+use crate::protocol::{DoneReason, Submit, FLAG_IMAGES, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
 use crate::session::SessionTable;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
@@ -496,6 +496,9 @@ struct Gen {
     session_id: u64,
     prompt_text: String,
     prompt_ids: Vec<u32>,
+    /// Vision: the prompt's image spans (empty for a text request) — what the session table matches a
+    /// reuse on, and what `finish_images` records.
+    spans: Vec<(u32, u32, u64)>,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
@@ -592,7 +595,7 @@ impl Gen {
                         Some(te) if self.parser_was_thinking() => kept.iter().position(|&x| x == te).unwrap_or(kept.len()),
                         _ => 0,
                     };
-                    self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+                    self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.spans, &self.ids, &self.app.tok);
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
@@ -644,7 +647,7 @@ impl Drop for Gen {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
             self.app.engine.cancel(self.req_id);
-            self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+            self.app.sessions.lock().unwrap().finish_images(self.session_id, &self.prompt_text, &self.prompt_ids, &self.spans, &self.ids, &self.app.tok);
         }
     }
 }
@@ -716,6 +719,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
         prompt_ids: plan.ids,
+        spans: Vec::new(),
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
@@ -732,9 +736,12 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     })
 }
 
-/// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
-/// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
-/// never sees, so text requests' prefix reuse is untouched.
+/// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded
+/// into their spans, and then the same prefix reuse a text request gets. The images are part of the
+/// prompt's identity: a span of the same size with another image spells the same ids, so a session is
+/// reused only when the hashes of the images inside the shared prefix are the same (session.rs,
+/// `plan_images`). A reused prefix is already in the engine's state; the spans it does not cover are
+/// injected as before.
 async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
     let Some(addr) = app.cfg.vision_addr.clone() else {
@@ -750,47 +757,71 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
     let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
-    let ctx = info.max_context as usize;
-    if ids.len() >= ctx {
-        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
+    let spans: Vec<(u32, u32, u64)> =
+        starts.iter().zip(&enc.rows).zip(&enc.hashes).map(|((&s, &r), &h)| (s, r, h)).collect();
+    let (plan, released) = {
+        let app2 = app.clone();
+        let text = p.prompt.clone();
+        let want = spans.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut t = app2.sessions.lock().unwrap();
+            t.plan_images(&text, &app2.tok, &want, &ids)
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
+    };
+    for s in released {
+        app.engine.release(s);
     }
-    let max_new = (p.max_tokens as usize).min(ctx - ids.len()) as u32;
+    let ctx = info.max_context as usize;
+    if plan.ids.len() >= ctx {
+        app.sessions.lock().unwrap().abandon(plan.session_id);
+        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", plan.ids.len())));
+    }
+    let max_new = (p.max_tokens as usize).min(ctx - plan.ids.len()) as u32;
     let mut stop_ids = p.stop_ids.clone();
     if !p.ignore_eos {
         stop_ids.push(info.eos_id);
     }
-    let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
     let submit = Submit {
         req_id: 0,
-        session_id,
-        base_session_id: 0,
+        session_id: plan.session_id,
+        base_session_id: plan.base_session_id,
         seed: p.seed.unwrap_or(0),
         temperature: p.temperature,
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP | FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
         n_top_logprobs: 0,
-        prefix_hint: 0,
+        prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
-        prompt: ids.clone(),
+        prompt: plan.ids.clone(),
         images: Some(crate::vision::payload(&starts, &enc)),
     };
-    let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
+    let (req_id, rx) = match app.engine.submit(submit) {
+        Ok(x) => x,
+        Err(e) => {
+            app.sessions.lock().unwrap().abandon(plan.session_id);
+            return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e));
+        }
+    };
     eprintln!(
-        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; session {session_id} (not kept)",
+        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; plan: {}",
         enc.rows.len(),
         enc.rows.iter().sum::<u32>(),
         enc.ms,
-        ids.len()
+        plan.ids.len(),
+        plan.describe(p.prompt.len())
     );
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
         req_id,
-        session_id,
+        session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
-        prompt_ids: ids,
+        prompt_ids: plan.ids,
+        spans,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
