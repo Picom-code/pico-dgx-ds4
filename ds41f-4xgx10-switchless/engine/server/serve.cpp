@@ -1056,7 +1056,7 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
-      if (!f.rq.spans.empty()) images(f.rq);
+      if (!f.rq.spans.empty()) images(f.rq, q);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
@@ -1157,22 +1157,44 @@ class Server {
     return true;
   }
 
-  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
-  void images(const Request& rq) {
+  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow. A span that
+  // ends at or before q is already in the slot's state - the plan reused it - so its rows are neither sent
+  // nor injected: a turn that re-sends the figures of its transcript then costs no ring traffic at all
+  // (73 MB, ~1.5 s for ten images before this). The rows of the rest go out as one block, in span order.
+  void images(const Request& rq, int q) {
+    std::vector<size_t> keep;
+    std::vector<size_t> offs(rq.spans.size());  // each span's rows' offset in rq.img
+    size_t acc = 0, rows = 0;
+    for (size_t i = 0; i < rq.spans.size(); ++i) {
+      const fe::ImageSpan& sp = rq.spans[i];
+      offs[i] = acc, acc += sp.rows;
+      if ((int)(sp.start + sp.rows) > q) keep.push_back(i), rows += sp.rows;
+    }
+    if (keep.empty()) {
+      std::printf("serve: req %llu images: %zu spans, all within the reused %d tokens, nothing to send\n",
+                  (unsigned long long)rq.h.req_id, rq.spans.size(), q);
+      return;
+    }
     const double t0 = now_s();
     Cmd c{};
     c.op = kCmdImages;
-    c.n = (int)rq.spans.size();
+    c.n = (int)keep.size();
     issue(c);
-    std::vector<int32_t> lh(2 * rq.spans.size());
-    for (size_t i = 0; i < rq.spans.size(); ++i)
-      lh[i] = (int32_t)rq.spans[i].start, lh[rq.spans.size() + i] = (int32_t)(rq.spans[i].start + rq.spans[i].rows);
+    std::vector<int32_t> lh(2 * keep.size());
+    std::vector<uint16_t> buf;
+    buf.reserve(rows * fe::kImageDim);
+    for (size_t k = 0; k < keep.size(); ++k) {
+      const fe::ImageSpan& sp = rq.spans[keep[k]];
+      lh[k] = (int32_t)sp.start, lh[keep.size() + k] = (int32_t)(sp.start + sp.rows);
+      const uint16_t* a = rq.img.data() + offs[keep[k]] * fe::kImageDim;
+      buf.insert(buf.end(), a, a + (size_t)sp.rows * fe::kImageDim);
+    }
     bcast_payload(ring_, lh.data(), lh.size() * 4, 0);
-    std::vector<uint16_t> rows(rq.img);
-    bcast_payload(ring_, rows.data(), rows.size() * 2, 0);
-    m_.set_images(c.n, lh.data(), lh.data() + c.n, rows.data());
-    std::printf("serve: req %llu images: %d spans, %zu rows, sent to every rank in %.1f ms\n",
-                (unsigned long long)rq.h.req_id, c.n, rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
+    bcast_payload(ring_, buf.data(), buf.size() * 2, 0);
+    m_.set_images(c.n, lh.data(), lh.data() + c.n, buf.data());
+    std::printf("serve: req %llu images: %d of %zu spans, %zu rows, sent to every rank in %.1f ms\n",
+                (unsigned long long)rq.h.req_id, c.n, rq.spans.size(), buf.size() / fe::kImageDim,
+                1e3 * (now_s() - t0));
   }
 
   bool ended(Flight& f, uint32_t why) {

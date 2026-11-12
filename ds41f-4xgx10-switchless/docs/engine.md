@@ -861,7 +861,8 @@ What it does:
   and the ranks and the front-end inherit that. (run4.sh does not, so the runs above start rank 0 at
   −1000.)
 - **The front-end** starts at once, before the supervisor takes the ring, and answers `/health` with
-  503 until the engine connects. It reconnects to a restarted engine by itself; requests in flight
+  503 (`{"status": "no_engine"}`) until the engine connects. The body is JSON, not text: the image the
+  recipe runs in bakes in `HEALTHCHECK CMD python3 -S /opt/dsv41/boot.py health`, which parses it. It reconnects to a restarted engine by itself; requests in flight
   when the engine goes end with an error. A request that comes while the engine is down waits at
   dsfront's gate, up to `DSGB10_HOLD_S`, and then gets 503 with `Retry-After`
   ([Borrowing the ring](#borrowing-the-ring)).
@@ -999,7 +1000,8 @@ engine/server/service.sh status                   # the state (lent?), dsfront's
     every stream (a long prefill before the first token). The answer then streams as usual. Past the
     hold limit, or at dsfront's stop, the stream ends with an error event (`"code": 503`) and
     `[DONE]`. A client that goes away while it waits is counted out at once.
-  - While the gate is held, `/health` answers 503, "the ring is lent to a development job".
+  - While the gate is held, `/health` answers 503 with `{"status": "held"}` and the reason in `detail`:
+    the ring is lent to a development job.
   - When dsfront stops, it answers the requests it holds at once, with 503.
 - **Back.** When the job releases the lock, the supervisor retakes it within 2 s, releases the gate,
   and starts the engine (page cache, memory check, four ranks: about 45 s). Held requests go through
