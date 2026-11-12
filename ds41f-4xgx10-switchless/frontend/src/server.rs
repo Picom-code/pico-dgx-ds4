@@ -5,7 +5,7 @@
 //! matched to a session for prefix reuse, sent to rank 0, and the streamed ids are decoded, checked
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
-use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
+use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, ParsedMessage, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -50,6 +50,10 @@ pub struct ServerConfig {
     pub hold: Duration,
     /// vision: the image encoder's address (host:port); None: image input is refused as before
     pub vision_addr: Option<String>,
+    /// A stream's tool calls in pieces, as OpenAI streams them: a chunk with the call's id and name
+    /// when its name has parsed, then its arguments as they arrive. Off: each call in one chunk, once
+    /// it is complete (a call that fails to parse is then never seen as one; StreamParser).
+    pub stream_tool_args: bool,
 }
 
 pub struct App {
@@ -649,6 +653,12 @@ impl Drop for Gen {
     }
 }
 
+/// The request's parser. Only a stream has its tool calls in pieces: an answer sent whole has no use
+/// for the start of a call that did not parse.
+fn parser(cfg: &ServerConfig, p: &Prepared) -> StreamParser {
+    StreamParser::with_tools(p.mode, p.tools).stream_args(p.stream && cfg.stream_tool_args)
+}
+
 async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
     let unavailable = |msg: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg);
     let Some(info) = app.engine.info() else {
@@ -719,7 +729,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
-        parser: StreamParser::with_tools(p.mode, p.tools),
+        parser: parser(&app.cfg, p),
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -794,7 +804,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
-        parser: StreamParser::with_tools(p.mode, p.tools),
+        parser: parser(&app.cfg, p),
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -846,23 +856,20 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     let created = now_secs();
     let model = app.cfg.model_name.clone();
     // non-streaming
-    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+    let mut answer = ParsedMessage::default();
     let mut out = Vec::new();
     let (finish, usage) = loop {
         let end = gen.next(&mut out).await;
-        for d in out.drain(..) {
-            match d {
-                Delta::Reasoning(s) => reasoning.push_str(&s),
-                Delta::Content(s) => content.push_str(&s),
-                Delta::ToolCall(_, name, args) => calls.push(tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)),
-            }
-        }
+        out.drain(..).for_each(|d| answer.add(d));
         match end {
             None => continue,
             Some(Ok(x)) => break x,
             Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
         }
     };
+    let ParsedMessage { content, reasoning_content: reasoning, tool_calls } = answer;
+    let calls: Vec<Value> =
+        tool_calls.into_iter().map(|(name, args)| tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)).collect();
     let mut message = json!({"role": "assistant",
         "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) }});
     if p.mode == ThinkingMode::Thinking {
@@ -943,6 +950,12 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                     Delta::ToolCall(i, name, args) => {
                         json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
                     }
+                    // in pieces, as OpenAI streams a call: its id, type and name with empty arguments,
+                    // then chunks that carry its index and the next of its arguments
+                    Delta::ToolCallStart(i, name) => {
+                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, String::new())]})
+                    }
+                    Delta::ToolArgs(i, piece) => json!({"tool_calls": [{"index": i, "function": {"arguments": piece}}]}),
                 };
                 if send(chunk(delta, None)).await.is_err() {
                     return; // client gone; dropping gen cancels the request
@@ -991,6 +1004,7 @@ mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            stream_tool_args: false,
         }
     }
 

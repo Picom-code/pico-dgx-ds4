@@ -234,7 +234,10 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 `"stream": true`, `tools` answered by `tool_calls`), `GET /v1/models` and `GET /health`, under the name
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default; a request's `model` is ignored).
 Thinking is off unless asked for, by `"chat_template_kwargs": {"thinking": true}` or `"reasoning_effort"`
-(`"low"`, `"high"`, `"max"`); the reasoning comes back in `reasoning_content`. Sampling defaults to
+(`"low"`, `"high"`, `"max"`); the reasoning comes back in `reasoning_content`. A stream carries each
+tool call in one chunk, once the call is complete; with `--stream-tool-args` (in `DSGB10_FRONT_ARGS`)
+it carries the call's name when that has parsed and then its arguments as they arrive, as OpenAI streams
+them, and a call that is cut off or does not parse leaves its client with unfinished arguments. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put

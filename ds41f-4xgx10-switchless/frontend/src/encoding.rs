@@ -11,7 +11,7 @@
 //! The parse side has the reference's strict parser and `StreamParser`, an incremental version for
 //! streamed output that falls back to plain content where the strict one would raise.
 
-use crate::pyjson::{dumps as to_json, py_str, truthy};
+use crate::pyjson::{dumps as to_json, py_str, truthy, write_escaped};
 use serde_json::{json, Map, Value};
 
 pub const BOS: &str = "<｜begin▁of▁sentence｜>";
@@ -990,29 +990,35 @@ fn match_tool_name(s: &str) -> Option<String> {
     None
 }
 
-/// `^ name="(.*?)" string="(true|false)">(.*?)<$` with DOTALL.
-fn match_param(s: &str) -> Option<(String, String, String)> {
-    let rest = s.strip_prefix(" name=\"")?;
+/// `^ name="(.*?)" string="(true|false)">` of match_param's pattern: the name, the flag and where
+/// the value starts. The lazy name ends at the first `" string="` that a flag and `">` follow, which
+/// the text up to there decides: what it finds in a parameter that is still arriving stays found.
+fn match_param_head(s: &str) -> Option<(&str, &'static str, usize)> {
+    const NAME: &str = " name=\"";
+    const STRING: &str = "\" string=\"";
+    let rest = s.strip_prefix(NAME)?;
     let mut from = 0;
-    while let Some(p) = rest[from..].find("\" string=\"") {
+    while let Some(p) = rest[from..].find(STRING) {
         let name_end = from + p;
-        let after = &rest[name_end + 10..];
+        let after = &rest[name_end + STRING.len()..];
         for flag in ["true", "false"] {
-            if let Some(v) = after.strip_prefix(flag).and_then(|x| x.strip_prefix("\">")) {
-                // lazy value up to a '<' that ends the string (or precedes a final newline)
-                let mut q = 0;
-                while let Some(k) = v[q..].find('<') {
-                    let at = q + k;
-                    if at + 1 == v.len() || (at + 2 == v.len() && v.ends_with('\n')) {
-                        return Some((rest[..name_end].to_string(), flag.to_string(), v[..at].to_string()));
-                    }
-                    q = at + 1;
-                }
+            if after.strip_prefix(flag).is_some_and(|x| x.starts_with("\">")) {
+                return Some((&rest[..name_end], flag, NAME.len() + name_end + STRING.len() + flag.len() + 2));
             }
         }
         from = name_end + 1;
     }
     None
+}
+
+/// `^ name="(.*?)" string="(true|false)">(.*?)<$` with DOTALL.
+fn match_param(s: &str) -> Option<(String, String, String)> {
+    let (name, flag, at) = match_param_head(s)?;
+    // The lazy value runs up to a '<' that ends the string (or precedes a final newline). Whether
+    // there is one does not depend on where the name ended, so no later `" string="` is tried.
+    let v = &s[at..];
+    let value = v.strip_suffix('<').or_else(|| v.strip_suffix("<\n"))?;
+    Some((name.to_string(), flag.to_string(), value.to_string()))
 }
 
 /// encoding.py parse_tool_calls: (new index, last stop, [(name, arguments json)]).
@@ -1062,13 +1068,31 @@ fn parse_tool_calls(mut index: usize, text: &str) -> Result<(usize, Option<Strin
     Ok((index, stop, calls))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParsedMessage {
     pub content: String,
     pub reasoning_content: String,
     /// (name as the model wrote it, `namespace::name` under 1017 too (api_tool_name splits it),
     /// arguments as a JSON string)
     pub tool_calls: Vec<(String, String)>,
+}
+
+impl ParsedMessage {
+    /// A StreamParser's deltas, added in order, are the message: a tool call sent in pieces is put
+    /// together (its index is its place among the calls).
+    pub fn add(&mut self, d: Delta) {
+        match d {
+            Delta::Reasoning(s) => self.reasoning_content.push_str(&s),
+            Delta::Content(s) => self.content.push_str(&s),
+            Delta::ToolCall(_, name, args) => self.tool_calls.push((name, args)),
+            Delta::ToolCallStart(_, name) => self.tool_calls.push((name, String::new())),
+            Delta::ToolArgs(i, piece) => {
+                if let Some((_, args)) = self.tool_calls.get_mut(i) {
+                    args.push_str(&piece);
+                }
+            }
+        }
+    }
 }
 
 /// encoding.py parse_message_from_completion_text: the whole completion, ending with EOS. 1017's
@@ -1129,6 +1153,11 @@ pub enum Delta {
     Content(String),
     /// A complete tool call: (index, name, arguments JSON).
     ToolCall(usize, String, String),
+    /// A tool call whose arguments follow in pieces (StreamParser::stream_args): (index, name).
+    ToolCallStart(usize, String),
+    /// The next piece of that call's arguments JSON: (index, text). A call's pieces, in order, are
+    /// the arguments its ToolCall would have carried.
+    ToolArgs(usize, String),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1152,6 +1181,9 @@ const CALL_START: &str = "<｜DSML｜ invoke";
 const CALL_END: &str = "</｜DSML｜ invoke";
 const PARAM_START: &str = "<｜DSML｜ parameter";
 const PARAM_END: &str = "/｜DSML｜ parameter";
+/// What a value cannot run into: PARAM_END, where its parameter is matched, and PARAM_END with the '<'
+/// (and the newline it may precede) that match_param takes as the value's end.
+const VALUE_STOPS: [&str; 3] = [PARAM_END, "</｜DSML｜ parameter", "<\n/｜DSML｜ parameter"];
 const TC_START: &str = "\n\n<｜DSML｜ calls";
 
 /// Incremental version of parse_message_from_completion_text for streamed output. Feed decoded text
@@ -1159,6 +1191,15 @@ const TC_START: &str = "\n\n<｜DSML｜ calls";
 /// each tool call once its invoke block has parsed (with the same rules as parse_tool_calls).
 /// Where the reference parser would raise on malformed tool calls, the rest of the output is passed
 /// on as plain content instead.
+///
+/// With `stream_args` a tool call is not held until its end: its name goes out when it has parsed
+/// (ToolCallStart) and its arguments as they arrive (ToolArgs), a value's text as soon as it cannot
+/// be the start of the value's end. Reasoning and content are what they are without it, piece for
+/// piece, and so is every call that parses. A call that does not (malformed, or cut off) is still
+/// passed on as plain content, after the start and the pieces already sent, and does not count in
+/// tool_calls_seen: its client is left with a call whose arguments stop where it did. They lack at
+/// least the brace that closes them, so they are not complete JSON, unless a value the model wrote
+/// with string="false" (passed on as written, here as in a ToolCall) is not JSON and closes them.
 pub struct StreamParser {
     phase: Phase,
     /// Text not yet consumed. In the tool-call phases it starts at the current invoke (or at the `>`
@@ -1171,6 +1212,10 @@ pub struct StreamParser {
     name: String,
     args: Vec<(String, String, String)>,
     tools: bool,
+    stream_args: bool,
+    /// stream_args: how much of the parameter being read has gone out. None before its name, then
+    /// the bytes of its value.
+    value_sent: Option<usize>,
     pub saw_eos: bool,
 }
 
@@ -1196,8 +1241,16 @@ impl StreamParser {
             calls: 0,
             name: String::new(),
             args: Vec::new(),
+            stream_args: false,
+            value_sent: None,
             saw_eos: false,
         }
+    }
+
+    /// Tool calls in pieces (ToolCallStart, ToolArgs) instead of whole (ToolCall).
+    pub fn stream_args(mut self, on: bool) -> Self {
+        self.stream_args = on;
+        self
     }
 
     pub fn tool_calls_seen(&self) -> usize {
@@ -1310,10 +1363,68 @@ impl StreamParser {
     }
 
     fn emit_call(&mut self, out: &mut Vec<Delta>) {
-        let args = decode_dsml_to_arguments(&self.args);
-        out.push(Delta::ToolCall(self.calls, std::mem::take(&mut self.name), args));
+        if self.stream_args {
+            // the name and the parameters have gone out: what is left closes the object
+            out.push(Delta::ToolArgs(self.calls, if self.args.is_empty() { "{}" } else { "}" }.into()));
+            self.name.clear();
+        } else {
+            let args = decode_dsml_to_arguments(&self.args);
+            out.push(Delta::ToolCall(self.calls, std::mem::take(&mut self.name), args));
+        }
         self.args.clear();
         self.calls += 1;
+    }
+
+    /// stream_args: the next piece of the arguments JSON, as decode_dsml_to_arguments writes it, for
+    /// the parameter being read, of which `value` has arrived (all of it if `done`).
+    fn args_piece(&self, name: &str, flag: &str, value: &str, done: bool) -> String {
+        let is_str = flag == "true";
+        let mut piece = String::new();
+        let sent = match self.value_sent {
+            Some(n) => n,
+            None => {
+                piece.push_str(if self.args.is_empty() { "{" } else { ", " });
+                piece.push_str(&to_json(&Value::String(name.to_string())));
+                piece.push_str(": ");
+                if is_str {
+                    piece.push('"');
+                }
+                0
+            }
+        };
+        if is_str {
+            write_escaped(&mut piece, &value[sent..]);
+        } else {
+            piece.push_str(&value[sent..]);
+        }
+        if done && is_str {
+            piece.push('"');
+        }
+        piece
+    }
+
+    /// stream_args: send what has arrived of the parameter at `pos`, whose end has not: its name once
+    /// match_param_head has it, then its value up to what could be the start of one of VALUE_STOPS.
+    /// That is all a value's end can take, so what goes out is a prefix of the value match_param will
+    /// find, and of a parameter that will not match, nothing past where it stops.
+    fn send_arriving(&mut self, out: &mut Vec<Delta>) {
+        let Some((name, flag, at)) = match_param_head(&self.buf[self.pos..]) else {
+            return;
+        };
+        if self.args.iter().any(|(k, _, _)| k == name) {
+            return; // a repeated name: the call fails at this parameter's end
+        }
+        let value = &self.buf[self.pos + at..];
+        let value = &value[..value.len() - Self::holdback(value, &VALUE_STOPS)];
+        let (piece, sent) = (self.args_piece(name, flag, value, false), value.len());
+        self.send_args(piece, out);
+        self.value_sent = Some(sent);
+    }
+
+    fn send_args(&self, piece: String, out: &mut Vec<Delta>) {
+        if !piece.is_empty() {
+            out.push(Delta::ToolArgs(self.calls, piece));
+        }
     }
 
     fn advance(&mut self, out: &mut Vec<Delta>, at_end: bool) {
@@ -1410,6 +1521,9 @@ impl StreamParser {
                             continue;
                         };
                         self.name = name;
+                        if self.stream_args {
+                            out.push(Delta::ToolCallStart(self.calls, self.name.clone()));
+                        }
                         if s == PARAM_START {
                             self.pos = p + s.len();
                             self.scan = self.pos;
@@ -1432,12 +1546,21 @@ impl StreamParser {
                             self.fail(out);
                             continue;
                         }
+                        if self.stream_args {
+                            self.send_args(self.args_piece(&pname, &flag, &value, true), out);
+                            self.value_sent = None;
+                        }
                         self.args.push((pname, value, flag));
                         self.pos = p + s.len();
                         self.scan = self.pos;
                         self.phase = Phase::AfterParam;
                     }
-                    None => return,
+                    None => {
+                        if self.stream_args {
+                            self.send_arriving(out);
+                        }
+                        return;
+                    }
                 },
                 Phase::AfterParam => {
                     let stops = [PARAM_START, CALL_END];
@@ -1581,25 +1704,135 @@ mod tests {
         let text = "Let me look.</think>Checking.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ls\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
         let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking, Encoding::V41).unwrap();
         // feed in small pieces
-        let mut p = StreamParser::new(ThinkingMode::Thinking);
+        let (out, p) = stream(text, 3, ThinkingMode::Thinking, false);
+        let m = message(out);
+        assert_eq!(m, whole);
+        assert_eq!(m.tool_calls[0].1, "{\"path\": \"a.txt\", \"n\": 3}");
+        assert!(p.saw_eos);
+    }
+
+    /// A StreamParser's deltas for `text`, fed `n` characters at a time, and the parser at the end.
+    fn stream(text: &str, n: usize, mode: ThinkingMode, stream_args: bool) -> (Vec<Delta>, StreamParser) {
+        let mut p = StreamParser::new(mode).stream_args(stream_args);
         let mut out = Vec::new();
         let chars: Vec<char> = text.chars().collect();
-        for ch in chars.chunks(3) {
+        for ch in chars.chunks(n) {
             p.push(&ch.iter().collect::<String>(), &mut out);
         }
         p.finish(&mut out);
-        let (mut r, mut c, mut calls) = (String::new(), String::new(), Vec::new());
-        for d in out {
-            match d {
-                Delta::Reasoning(s) => r.push_str(&s),
-                Delta::Content(s) => c.push_str(&s),
-                Delta::ToolCall(_, n, a) => calls.push((n, a)),
+        (out, p)
+    }
+
+    fn message(deltas: Vec<Delta>) -> ParsedMessage {
+        let mut m = ParsedMessage::default();
+        deltas.into_iter().for_each(|d| m.add(d));
+        m
+    }
+
+    /// The reasoning and content among the deltas, piece for piece.
+    fn text_of(deltas: &[Delta]) -> Vec<Delta> {
+        deltas.iter().filter(|d| matches!(d, Delta::Reasoning(_) | Delta::Content(_))).cloned().collect()
+    }
+
+    #[test]
+    fn param_pattern() {
+        let m = |s: &str| match_param(s).map(|(name, flag, value)| format!("{name}|{flag}|{value}"));
+        assert_eq!(m(" name=\"a\" string=\"true\">x<"), Some("a|true|x".into()));
+        assert_eq!(m(" name=\"a\" string=\"false\">1<\n"), Some("a|false|1".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\">x<y<"), Some("a|true|x<y".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\"><"), Some("a|true|".into()));
+        // the lazy name ends at the first `" string="` that a flag follows
+        assert_eq!(m(" name=\"a\" string=\"no\" string=\"true\">x<"), Some("a\" string=\"no|true|x".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\">b\" string=\"false\">x<"), Some("a|true|b\" string=\"false\">x".into()));
+        for bad in [" name=\"a\" string=\"true\">x", " name=\"a\" string=\"true\">x<\n\n", "name=\"a\" string=\"true\">x<", " name=\"a\" string=\"tru"] {
+            assert_eq!(m(bad), None, "{bad:?}");
+        }
+    }
+
+    /// stream_args: a call's pieces are the call however the text arrives, the reasoning and content
+    /// are what they are without it, and a value goes out before its end has come.
+    #[test]
+    fn stream_parser_tool_calls_in_pieces() {
+        let text = concat!(
+            "Let me look.</think>Writing.\n\n<｜DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"write\">\n",
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">a \"b\"\\c.txt</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"text\" string=\"true\">if a < b && c </ d {\n\t\"é\"\n}\n</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"opts\" string=\"false\">{\"n\": 3, \"tags\": [\"<x>\"]}</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "<｜DSML｜ invoke name=\"now\">\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls><｜end▁of▁sentence｜>"
+        );
+        let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking, Encoding::V41).unwrap();
+        let write = r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c </ d {\n\t\"é\"\n}\n", "opts": {"n": 3, "tags": ["<x>"]}}"#;
+        assert_eq!(whole.tool_calls, [("write".to_string(), write.to_string()), ("now".to_string(), "{}".to_string())]);
+        for n in 1..=40 {
+            let (out, p) = stream(text, n, ThinkingMode::Thinking, true);
+            assert!(!out.iter().any(|d| matches!(d, Delta::ToolCall(..))), "{n} at a time: a whole call");
+            assert_eq!(text_of(&out), text_of(&stream(text, n, ThinkingMode::Thinking, false).0), "{n} at a time");
+            assert_eq!(message(out), whole, "{n} at a time");
+            assert_eq!(p.tool_calls_seen(), 2);
+            assert!(p.saw_eos);
+        }
+        // Up to the middle of a value: the call's name and that much of its arguments are out, and
+        // the call does not count yet.
+        let mut p = StreamParser::new(ThinkingMode::Thinking).stream_args(true);
+        let mut out = Vec::new();
+        let feed = |p: &mut StreamParser, out: &mut Vec<Delta>, s: &str| s.chars().for_each(|c| p.push(c.encode_utf8(&mut [0; 4]), out));
+        let at = text.find("&& c").unwrap() + "&& c".len();
+        feed(&mut p, &mut out, &text[..at]);
+        assert_eq!(out.iter().filter(|d| **d == Delta::ToolCallStart(0, "write".into())).count(), 1);
+        let args = |out: &[Delta]| message(out.to_vec()).tool_calls[0].1.clone();
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c"#);
+        assert_eq!(p.tool_calls_seen(), 0);
+        // what could be the start of the value's end waits for what follows it
+        feed(&mut p, &mut out, " </");
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c "#);
+        feed(&mut p, &mut out, " d");
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c </ d"#);
+    }
+
+    /// stream_args: a call that does not parse is passed on as content exactly as without it. What
+    /// was sent of it stays unfinished, and it is not counted.
+    #[test]
+    fn stream_parser_in_pieces_malformed() {
+        const END: &str = "</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
+        let call = |name: &str, rest: &str| format!("<｜DSML｜ invoke name=\"{name}\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt{rest}");
+        let good = call("stat", "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n");
+        // each with what is sent of the call's arguments: up to where it stops being one, however
+        // the text arrives
+        let bad = [
+            ("cut off in a value", String::new(), r#"{"path": "a.txt"#),
+            ("cut off in a value's end", "</｜DSML｜ param".to_string(), r#"{"path": "a.txt"#),
+            ("a value's end without its '<'", format!("/｜DSML｜ parameter>\n{END}"), r#"{"path": "a.txt"#),
+            (
+                "a repeated name",
+                format!("</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"path\" string=\"true\">b</｜DSML｜ parameter>\n{END}"),
+                r#"{"path": "a.txt""#,
+            ),
+            (
+                "text between parameters",
+                format!("</｜DSML｜ parameter>\nand <｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n{END}"),
+                r#"{"path": "a.txt""#,
+            ),
+        ];
+        for (case, rest, sent) in &bad {
+            for (before, seen) in [("", 0), (good.as_str(), 1)] {
+                let text = format!("Reading.\n\n<｜DSML｜ calls>\n{before}{}", call("read", rest));
+                for n in 1..=12 {
+                    let what = format!("{case}, after {seen} good, {n} at a time");
+                    let (whole, pw) = stream(&text, n, ThinkingMode::Chat, false);
+                    let (pieces, pp) = stream(&text, n, ThinkingMode::Chat, true);
+                    assert_eq!(text_of(&pieces), text_of(&whole), "{what}");
+                    assert_eq!((pw.tool_calls_seen(), pp.tool_calls_seen()), (seen, seen), "{what}");
+                    let (whole, pieces) = (message(whole), message(pieces));
+                    assert_eq!(pieces.tool_calls[..seen], whole.tool_calls[..], "{what}");
+                    let (name, args) = &pieces.tool_calls[seen];
+                    assert_eq!((name.as_str(), args.as_str()), ("read", *sent), "{what}");
+                    assert!(crate::pyjson::loads(args).is_none(), "{what}: {args} is complete JSON");
+                }
             }
         }
-        assert_eq!(r, whole.reasoning_content);
-        assert_eq!(c, whole.content);
-        assert_eq!(calls, whole.tool_calls);
-        assert_eq!(calls[0].1, "{\"path\": \"a.txt\", \"n\": 3}");
-        assert!(p.saw_eos);
     }
 }
