@@ -5,6 +5,8 @@
     dsfront serve --engine-socket S --api-key-file K &
     smoke_test.py http://127.0.0.1:18890 K [LOG]     # LOG: dsfront serve's stderr, for its "plan:" lines
 
+With --stream-tool-args (anywhere), as dsfront serve was started: a streamed tool call comes in pieces.
+
 Covers the OpenAI surface pi uses: models, auth, streaming and not, reasoning_content, tool calls
 and a tool-result turn (with prefix reuse reported in cached_tokens), usage, stop strings,
 max_tokens, the loop guard, bad requests, a client that disconnects, and concurrent requests.
@@ -16,8 +18,10 @@ import threading
 import time
 import urllib.parse
 
-BASE = urllib.parse.urlparse(sys.argv[1])
-KEY = open(sys.argv[2]).read().strip()
+PIECES = "--stream-tool-args" in sys.argv
+ARGS = [a for a in sys.argv[1:] if a != "--stream-tool-args"]
+BASE = urllib.parse.urlparse(ARGS[0])
+KEY = open(ARGS[1]).read().strip()
 FAILS = []
 
 
@@ -124,10 +128,18 @@ def main():
     # an agent turn: tool call, then the tool result, reusing the prefix
     msgs = [SYSTEM, {"role": "user", "content": 'Please read it. MOCK_TOOL read {"path": "notes.txt"}'}]
     body = {"messages": msgs, "tools": TOOLS, "stream_options": {"include_usage": True}, "chat_template_kwargs": {"thinking": True}}
-    o = collect(stream(body))
+    ev = stream(body)
+    o = collect(ev)
     call = o["calls"].get(0)
     check(o["finish"] == "tool_calls" and call and call["name"] == "read" and json.loads(call["arguments"]) == {"path": "notes.txt"},
           "streamed tool call with finish_reason tool_calls")
+    tcs = [tc for e in ev if e != "[DONE]" for ch in e["choices"] for tc in ch["delta"].get("tool_calls") or []]
+    if PIECES:
+        check(len(tcs) >= 3 and tcs[0].get("id") and tcs[0]["function"] == {"name": "read", "arguments": ""}
+              and all(set(tc) == {"index", "function"} and set(tc["function"]) == {"arguments"} for tc in tcs[1:]),
+              f"the tool call in pieces: its id and name, then its arguments in {len(tcs) - 1} chunks")
+    else:
+        check(len(tcs) == 1, "the tool call in one chunk")
     check(call and call["id"].startswith("call_"), "tool call has an id")
     first_prompt = o["usage"]["prompt_tokens"]
     first_total = first_prompt + o["usage"]["completion_tokens"]
@@ -177,9 +189,9 @@ def main():
     c2, p2 = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0), u.get("prompt_tokens", 0)
     check(s1 == 200 and s2 == 200 and 0.9 * p2 < c2 < p2,
           f"a conversation with another's system text but a later time reuses what comes before the time (cached {c2} of {p2})")
-    if len(sys.argv) > 3:
+    if len(ARGS) > 2:
         time.sleep(0.2)
-        plans = [l for l in open(sys.argv[3]).read().splitlines() if " plan: " in l]
+        plans = [l for l in open(ARGS[2]).read().splitlines() if " plan: " in l]
         check(len(plans) >= 2 and ", new: " in plans[-2] and ", a fork of " in plans[-1] and " ids in common" in plans[-1],
               f"the log says where each started: {plans[-2:]}")
 
