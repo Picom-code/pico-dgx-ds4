@@ -133,6 +133,7 @@ struct Link {
   ibv_mr* mr = nullptr;
   ibv_mtu mtu = IBV_MTU_4096;
   PeerInfo me{}, peer{};
+  int gid_index = -1;  // this device's index of the link's RoCE v2 GID (find_gid)
   uint32_t max_inline = 0;
   int unsignaled = 0;
 };
@@ -218,8 +219,29 @@ std::string gid_text(const uint8_t* g) {
   return s;
 }
 
-// The link's device must carry the fleet's address for it (`key`=`ip`) at the fleet's GID index: a check
-// that the fleet file describes this box, before anything waits on a neighbour.
+// The index of `want`, an IPv4-mapped address, among the device's RoCE v2 GIDs (port 1): `pref`, the
+// fleet's GID_INDEX, when that entry is it, else the first entry that is, or -1. The address is what the
+// fleet file pins; the index is the kernel's and can move (docs/ring.md), and it is only used on this
+// side (sgid_index): the peer gets the GID itself.
+int find_gid(ibv_context* ctx, int pref, const uint8_t* want, int tbl_len, ibv_gid* out) {
+  auto is = [&](int i) {
+    ibv_gid_entry e{};
+    const int rc = ibv_query_gid_ex(ctx, 1, i, &e, 0);
+    if (rc == ENODATA) return false;  // an empty entry
+    if (rc) die("comm: %s port 1: query_gid_ex(%d): %s", ibv_get_device_name(ctx->device), i, strerror(rc));
+    if (e.gid_type != IBV_GID_TYPE_ROCE_V2 || memcmp(e.gid.raw, want, 16)) return false;
+    memcpy(out->raw, e.gid.raw, 16);
+    return true;
+  };
+  if (pref < tbl_len && is(pref)) return pref;
+  for (int i = 0; i < tbl_len; i++)
+    if (i != pref && is(i)) return i;
+  return -1;
+}
+
+// The link's device must carry the fleet's address for it (`key`=`ip`) as a RoCE v2 GID, at the fleet's
+// GID index or, if that entry is something else, at another (find_gid, with a note): a check that the
+// fleet file describes this box, before anything waits on a neighbour.
 void open_link(Link& L, const char* devname, int gid_index, const std::string& ip, const std::string& key,
                const std::string& fleet_file, void* region, size_t bytes, uint32_t psn) {
   int n = 0;
@@ -257,18 +279,25 @@ void open_link(Link& L, const char* devname, int gid_index, const std::string& i
   ibv_port_attr pa{};
   if (ibv_query_port(L.ctx, 1, &pa)) die("%s: query_port", devname);
   L.mtu = pa.active_mtu;
-  ibv_gid gid;
-  if (ibv_query_gid(L.ctx, 1, gid_index, &gid)) die("%s: query_gid %d", devname, gid_index);
   uint8_t want[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
   if (inet_pton(AF_INET, ip.c_str(), want + 12) != 1)
     die("comm: %s: %s=%s is not an IPv4 address", fleet_file.c_str(), key.c_str(), ip.c_str());
-  if (memcmp(gid.raw, want, 16)) {
-    char host[256] = {0};
-    gethostname(host, sizeof host - 1);
-    die("comm: on %s, %s's GID %d is %s, but the fleet file %s has %s=%s: this box's link is not addressed as "
-        "the fleet file says, or this is not that rank's box",
-        host, devname, gid_index, gid_text(gid.raw).c_str(), fleet_file.c_str(), key.c_str(), ip.c_str());
+  ibv_gid gid;
+  L.gid_index = find_gid(L.ctx, gid_index, want, pa.gid_tbl_len, &gid);
+  char host[256] = {0};
+  gethostname(host, sizeof host - 1);
+  if (L.gid_index < 0) {
+    std::string at = "no entry";  // what GID_INDEX holds, if anything, for the message
+    ibv_gid_entry e{};
+    if (gid_index < pa.gid_tbl_len && !ibv_query_gid_ex(L.ctx, 1, gid_index, &e, 0))
+      at = gid_text(e.gid.raw) + (e.gid_type == IBV_GID_TYPE_ROCE_V2 ? " (RoCE v2)" : " (not RoCE v2)");
+    die("comm: on %s, %s port 1 has no RoCE v2 GID for %s, the fleet file %s's %s (GID_INDEX=%d holds %s; "
+        "table size %d): this box's link is not addressed as the fleet file says, or this is not that rank's box",
+        host, devname, ip.c_str(), fleet_file.c_str(), key.c_str(), gid_index, at.c_str(), pa.gid_tbl_len);
   }
+  if (L.gid_index != gid_index)
+    std::fprintf(stderr, "comm: on %s, %s's RoCE v2 GID %s (%s) is at index %d, not GID_INDEX=%d: using %d\n",
+                 host, devname, ip.c_str(), key.c_str(), L.gid_index, gid_index, L.gid_index);
   L.me.qpn = L.qp->qp_num;
   L.me.psn = psn & 0xffffff;
   L.me.rkey = L.mr->rkey;
@@ -276,7 +305,7 @@ void open_link(Link& L, const char* devname, int gid_index, const std::string& i
   memcpy(L.me.gid, gid.raw, 16);
 }
 
-void connect_link(Link& L, const char* devname, int gid_index) {
+void connect_link(Link& L, const char* devname) {
   ibv_qp_attr at{};
   at.qp_state = IBV_QPS_RTR;
   at.path_mtu = L.mtu;
@@ -286,7 +315,7 @@ void connect_link(Link& L, const char* devname, int gid_index) {
   at.min_rnr_timer = 12;
   at.ah_attr.is_global = 1;
   memcpy(at.ah_attr.grh.dgid.raw, L.peer.gid, 16);
-  at.ah_attr.grh.sgid_index = gid_index;
+  at.ah_attr.grh.sgid_index = L.gid_index;
   at.ah_attr.grh.hop_limit = 1;
   at.ah_attr.port_num = 1;
   if (ibv_modify_qp(L.qp, &at,
@@ -467,9 +496,9 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
     }
     I.bootstrap();
     for (int d = 0; d < kDomains; d++) {
-      connect_link(I.to_next[d], F.next_dev[d].c_str(), F.gid_index);
-      connect_link(I.to_prev[d], F.prev_dev[d].c_str(), F.gid_index);
-      if (I.direct) connect_link(I.to_opp[d], F.next_dev[d].c_str(), F.gid_index);
+      connect_link(I.to_next[d], F.next_dev[d].c_str());
+      connect_link(I.to_prev[d], F.prev_dev[d].c_str());
+      if (I.direct) connect_link(I.to_opp[d], F.next_dev[d].c_str());
     }
   }
   CUDA_CHECK(cudaMalloc(&I.d_seq, 2 * sizeof(unsigned long long)));
