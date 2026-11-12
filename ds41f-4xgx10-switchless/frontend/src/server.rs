@@ -52,6 +52,13 @@ pub struct ServerConfig {
     pub vision_addr: Option<String>,
 }
 
+/// Monotonic counters for /metrics (sparkDash reads them as `tensorfold:*`).
+static GEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TTFT_US_SUM: AtomicU64 = AtomicU64::new(0);
+static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub struct App {
     pub cfg: ServerConfig,
     pub tok: Arc<Tokenizer>,
@@ -108,6 +115,7 @@ impl App {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -178,6 +186,23 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
     }
+}
+
+/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
+/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    let body = format!(
+        "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
+# TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
+# TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n",
+        GEN_TOTAL.load(Ordering::Relaxed), PROMPT_TOTAL.load(Ordering::Relaxed), CACHED_TOTAL.load(Ordering::Relaxed),
+        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed)
+    );
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], body).into_response()
 }
 
 async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -525,6 +550,7 @@ impl Gen {
             match ev {
                 EngineEvent::Tokens(t) => {
                     self.first_token.get_or_insert_with(Instant::now);
+                    GEN_TOTAL.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                     for &id in &t.ids {
                         self.ids.push(id);
                         if self.stopped.is_some() {
@@ -596,6 +622,10 @@ impl Gen {
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
+                    PROMPT_TOTAL.fetch_add(usage.prompt as u64, Ordering::Relaxed);
+                    CACHED_TOTAL.fetch_add(usage.cached as u64, Ordering::Relaxed);
+                    TTFT_US_SUM.fetch_add((ttft * 1e6) as u64, Ordering::Relaxed);
+                    TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(dir) = &self.app.cfg.dump_dir {
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
