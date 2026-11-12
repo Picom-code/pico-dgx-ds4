@@ -95,13 +95,22 @@ docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=hos
 dsfront serve ... --vision-addr 127.0.0.1:18950
 ```
 
+`--cache-mb` (default 1024) keeps the span rows of every image the encoder has seen, keyed on the image's sha256 -
+the same value the reply carries as `hash`. A request that repeats an image (a transcript re-sent every turn, the same
+figure in two turns) is then served from memory: 1-4 ms per image instead of 100-400 ms, and nothing else changes,
+because the rows handed to the engine are identical byte for byte. Evicted oldest-first; `--cache-mb 0` turns it off.
+Measured with 10 images in a 73k-token transcript, which the front end re-sends on every turn: 3.5-3.8 s of ViT per
+request before, 1-4 ms after the first turn.
+
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
 (correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
 
 ## Not done (v1)
 
-- Images are encoded one at a time on one GPU; no batching across requests. The encoder is still asked for the
-  rows on every request, reused turn or not (a few hundred ms); a cache keyed on the image's hash would skip it.
+- Images are encoded one at a time on one GPU; no batching across requests. A repeated image costs neither the
+  ViT (the span-row cache above) nor ring traffic (`serve.cpp images()` sends only the spans the plan did not
+  reuse), but the front end still hands all of them to the engine over loopback: 7 139 rows in a 73k transcript
+  are 73 MB per turn, ~10 ms.
 - A reused image prefix costs the engine's session store what a text session of the same length costs, so a fleet
   of long image conversations evicts text sessions sooner.
 - `input_image` (Responses API), video and audio parts are refused.
