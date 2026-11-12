@@ -24,8 +24,12 @@ decode: untouched (no flag, no branch, same graphs)
   bf16 rounding. http(s) URLs are fetched with a size cap and only from public addresses (no SSRF into the LAN).
 - **dsfront**: with `--vision-addr HOST:PORT`, `image_url` and `image` parts are accepted (without it they are
   refused as before). The chat encoding already wrote one placeholder per image (encoding.py's rules). An image
-  request gets a session of its own that is not kept and never enters the text session table, so text prefix reuse
-  is unaffected (and image turns are not prefix-cached; v1).
+  request then gets the same prefix reuse a text request gets (frontend/src/session.rs, `plan_images`): the session
+  whose text shares the longest prefix is reused when the hashes of the images inside that prefix are the same, and
+  the session is kept (kFlagKeep) so the next turn of the conversation finds its state again. Two images of one size
+  spell the same ids, so the ids alone cannot tell them apart - the spans' hashes are the identity, and a different
+  image at a reused position starts a session from nothing. A session with images carries its spans in the text table
+  (and in its file, DSFT0002), so a planned stop keeps them too.
 - **Protocol**: `SubmitFlags::kFlagImages = 8`; after `prompt[]`: `u32 n`, `ImageSpan {u32 start, u32 rows,
   u64 hash}[n]`, then the rows. A text SUBMIT is byte-identical to before.
 - **Engine**: rank 0 checks that every span covers image ids only, broadcasts the spans and rows (`kCmdImages`,
@@ -214,7 +218,10 @@ their order. The live smoke script needs Pillow; generating or decoding clips on
 
 ## Not done (v1)
 
-- No prefix reuse for image turns (each image request prefills its whole prompt).
-- Images are encoded one at a time on one GPU; no batching across requests.
+- Images are encoded one at a time on one GPU; no batching across requests. The encoder's rows are cached by the
+  image's sha256, so a turn that re-sends an image it already sent skips the encoder, and the engine sends no rows
+  for a span that lies inside the prefix the plan reused.
+- A reused image prefix costs the engine's session store what a text session of the same length costs, so a fleet
+  of long image conversations evicts text sessions sooner.
 - `input_image` (Responses API) and audio parts are refused.
 
