@@ -1,0 +1,39 @@
+# pico-dgx-ds4
+
+> A from-scratch inference engine for NVIDIA GB10 (DGX Spark) boxes, specialised to serving DeepSeek V4.1 Flash across four GPUs over a switched fabric.
+
+Self-contained fork of blaesus/dsgx10 with its own engine, front-end, tools and docs; run by serving the engine binary on the ring with environment variables such as DSGB10_RING_DIRECT and DSGB10_OEA. Feature docs live in docs/stack5.md, docs/stack4.md, docs/vision.md, docs/c1fast.md, docs/wide64.md and CHANGES.md. Includes a vision side encoder exposed through the OpenAI image_url API.
+
+## Docs
+
+- [pico-dgx-ds4 README](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/README.md): Project overview, commit-level changes with measured numbers, the stack5 direct-ring collectives and stack4 levers.
+- [Several sessions in one decode step (design note)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/batching.md): Design note on batching multiple sessions per decode step: costs, expected gains, plan and deployed B1/B2 status with soak results.
+- [c1fast: single-stream decode (chat target 100 tok/s, our bench 9-run median, temp 0)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/c1fast.md): Removed relaxed-accept speed experiment: deployment history, method check against sparkDash, step profile and rollback commands.
+- [CED prefill: semantics, reference and measurements](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/ced.md): What CED prefill with Decoder SWA Bounded Replay means for this checkpoint: sources, semantics, reference and deviation from exact forward.
+- [drafter2: lossless single-user speed (target chat c1 100, exact output)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/drafter2.md): Lossless single-user speed work: draft-weight infrastructure, conversion tools, identity check method and deployment status.
+- [The TP=4 engine (engine/model, engine/server)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/engine.md): How the TP=4 engine runs DeepSeek-V4.1-Flash on four boxes: rank layout, step pipeline, serving, and measured decode speeds.
+- [Engram row store](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/engram.md): Engram hashing, NVMe-backed row store, read and decode latencies, prefill throughputs, and the checking tools.
+- [Experiments: an index](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/experiments.md): Index of every experiment with dates, who ran it, measurements, verdicts, and links to write-ups and code.
+- [Findings](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/findings.md): What was learned before writing the engine, about the model's shape, CED, SWA bounded replay, and serving speed.
+- [Per-rank weight files](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/layout.md): Per-rank .dsw file contents: 72.38 GiB, 1,609 tensors, formats, layouts, and how tensors are partitioned per rank.
+- [Operations](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/operations.md): The production service on rank 0:8888: build validation, start and restart commands, restart times, kit recovery.
+- [Front-end ↔ rank-0 protocol](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/protocol.md): The Unix-socket protocol between front-end and rank 0: transport, frame formats, handshake, reconnection and cancellation rules.
+- [Ring collectives (engine/comm)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/ring.md): Custom all-reduce, all-gather and reduce-scatter over ibverbs for the four-box ring, measured latencies and topology.
+- [stack4: three small single-user levers, stacked (2026-11-10)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/stack4.md): Three small speed levers: 4-bit draft head, learned verify gate, vocabulary shortlist, with measured tok/s gains.
+- [stack5: sync without relays, and two levers measured and not built (2026-11-11)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/stack5.md): Cheaper cross-rank synchronisation without relays, plus lossless FP8 coding and 4-bit drafter body measurements.
+- [Vision input (image_url / image parts)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/vision.md): Serving the vision tower for image_url requests, encoder design, tests, and unimplemented features like batching.
+- [wide64: a drafted batch step of up to 64 rows](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/wide64.md): Widening the drafted batch step to 64 rows, with timing breakdown, byte costs, and benchmark results.
+
+## Review
+
+- [Correctness review: release candidate 5 (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/correctness.md): Verification that the engine matches model.py and SGLang references on dealignai's FP8 variant, with re-test details.
+- [Pre-release review: is it correctly documented? (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/docs.md): The docs reviewer's verdict: which checkpoint the figures used, stale statements fixed, and the missing licence blocker.
+- [External review: the comparisons with other kits (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/external.md): Every external figure's source and version, precision and checkpoint comparison, whether the best GB10 claim holds.
+- [Fleet: the boxes in a file (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/fleet.md): Moving the fleet's addresses, devices and rank paths from compiled code and scripts into one runtime file.
+- [Kit review: can an outsider run it? (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/kit.md): Whether a fresh clone builds and runs on four GB10s from public docs alone; verdict, what fails.
+- [Review: the method of the comparison with the SGLang kit (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/method.md): Review of the bench.py SGLang TP=4 comparison: sources, fairness, and the gaps in its statistics.
+- [Specifics: a pass over the public documentation (2026-10-13)](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/ds41f-4xgx10-switchless/docs/review/specifics.md): Removing hardware specifics and box labels from the docs, so the boxes are just GB10s with ranks 0-3.
+
+## Optional
+
+- [Changes in pico-dgx-ds4](https://raw.githubusercontent.com/Picom-code/pico-dgx-ds4/main/CHANGES.md): Fork changes vs upstream `a92b8f4`: benchmark measurements over a 200G switch, engine args, and per-lever notes.
