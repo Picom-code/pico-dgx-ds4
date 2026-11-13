@@ -84,15 +84,43 @@ across ranks) and the slot layout are unchanged. Workers are untouched.
 
 ## Running it
 
+As a part of the service: give `service.sh start` the encoder's command, with a Python that has torch, Pillow and
+safetensors ([engine.md](engine.md#as-a-service-servicesh)):
+
 ```
-docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g -e VISION_PRELOAD=1 \
-  -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
-  /app/vision_encoder.py --host 127.0.0.1 --port 18950
-dsfront serve ... --vision-addr 127.0.0.1:18950
+DSGB10_VISION_CMD="python3 tools/vision/vision_encoder.py --model $MODEL" engine/server/service.sh start
 ```
 
+The command runs in the foreground on rank 0, from this configuration's directory. The service adds
+`--host 127.0.0.1 --port 18950` (`DSGB10_VISION_PORT`) and gives dsfront `--vision-addr`; a `--vision-addr` in
+`DSGB10_FRONT_ARGS` as well is refused at the start, as is a port that something already listens on.
+
+- **Its life is the front-end's.** It is started before the engine and loads its weights then (`VISION_PRELOAD=1`
+  unless the environment has it; 36 s and 43 s in two starts on a GB10, the checkpoint on its NVMe), while the
+  service already serves text. It stays up
+  when the engine restarts and when the ring is lent, and it is stopped with the service, after dsfront: SIGTERM to
+  its process group, SIGKILL to what is left of it 20 s later.
+- **Its exits are not the service's failures.** They are in `service.log` with the time of the next start, do not
+  count towards giving up, and it is started again after 2, 10, 60 and 300 s, then every 15 minutes: each start loads
+  a model onto rank 0's GPU, so a start that keeps failing soon becomes rare. Ten minutes up resets that.
+- **`service.sh status`** says whether it runs and whether it listens yet; its output is `logs/vision.log`.
+
+Where that Python is in a container, the command is the container's client, without `-d` and with `--init`. Without
+`--init` the encoder is the container's process 1, which ignores SIGTERM: a stop then waits its 20 s, kills the
+client, and the container goes on holding the port (measured: stopped in 2 s with it, left behind without it).
+
+```
+DSGB10_VISION_CMD="docker run --rm --init --gpus all --net=host --memory=6g -e VISION_PRELOAD \
+  -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
+  /app/vision_encoder.py"
+```
+
+By hand, as before: the encoder started apart from the service (`vision_encoder.py --host 127.0.0.1 --port 18950`, in
+a container with `-d --restart unless-stopped`, say) and `--vision-addr 127.0.0.1:18950` in `DSGB10_FRONT_ARGS`.
+
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
-(correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
+(correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control), and
+`engine/server/tests/vision_test.sh` (the service's part, with the mock engine and a stand-in for the encoder: no GPU).
 
 ## Not done (v1)
 

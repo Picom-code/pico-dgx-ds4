@@ -834,6 +834,7 @@ Settings come from the environment of `start`, which writes them to `run/setting
 | `DSGB10_KEY_FILE` | `~/dsgb10-data/dev-api-key` | the API key, read by dsfront from the file. The file must be readable by its owner only; the key is on no command line |
 | `DSGB10_ENGINE_ARGS` | `--max-ctx 262144` | the engine's arguments after `--mode serve --socket …`; the rest are serve's defaults (CED, drafts with the FP8 drafter head) |
 | `DSGB10_FRONT_ARGS`, `DSGB10_NOTE` | | more dsfront arguments; text for `ring.owner` (how long the service will hold the ring) |
+| `DSGB10_VISION_CMD`, `DSGB10_VISION_PORT` | none, `18950` | images ([vision.md](vision.md#running-it)): the vision encoder's command, run on rank 0 beside the front-end with `--host 127.0.0.1` and that port added, started again when it exits, and stopped with the service; dsfront gets its `--vision-addr`. Without the command image input is refused |
 | `DSGB10_BIN`, `DSGB10_FRONT_BIN` | `engine/build/server/dsgb10_rank`, `frontend/target/release/dsfront` | copied at start to `~/dsgb10/service/bin`, and from there to the workers once the service has the ring, so a later build does not change a running service |
 | `MIN_AVAIL_GIB` | 100 GiB | the MemAvailable every box needs before the engine starts |
 | `DSGB10_YIELD_IDLE_S` | 600 s | the ring is lent to a job that waits for it once dsfront has had no request for this long ([Borrowing the ring](#borrowing-the-ring)) |
@@ -887,7 +888,7 @@ What it does:
   table (`front.table`). The kept sessions are in the engine's spill directory on every box
   ([Kept sessions](#kept-sessions)).
   `~/dsgb10/service/logs` holds `service.log` (the supervisor: every start, exit, failure and state),
-  `rank.0.log` and `front.log`; each worker has `logs/rank.<r>.log`. Every (re)start rotates its log,
+  `rank.0.log`, `front.log` and, with the vision encoder, `vision.log`; each worker has `logs/rank.<r>.log`. Every (re)start rotates its log,
   and on rank 0 a log past 64 MiB is rotated in place, copied and truncated (the processes append).
   Five old logs are kept. Rank 0 writes three lines per request (~550 B), dsfront two.
 - **Where a turn started.** Both logs say it in counts, never text or ids, under the same request

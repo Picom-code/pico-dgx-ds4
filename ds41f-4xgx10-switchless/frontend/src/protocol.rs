@@ -238,6 +238,13 @@ impl Frame {
                 r.u32()?;
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
+                // vision: with FLAG_IMAGES the rest of the frame is the image part, as encode wrote it
+                let images = if flags & FLAG_IMAGES != 0 {
+                    let n = p.len() - r.i;
+                    Some(r.bytes(n)?.to_vec())
+                } else {
+                    None
+                };
                 Frame::Submit(Submit {
                     req_id,
                     session_id,
@@ -252,7 +259,7 @@ impl Frame {
                     prefix_hint,
                     stop_ids,
                     prompt,
-                    images: None,
+                    images,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -376,6 +383,15 @@ mod tests {
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt
         assert_eq!(u32::from_le_bytes(b[8 + 64..8 + 68].try_into().unwrap()), 3); // n_prompt at offset 64
+        // vision: the image part follows the prompt, and a reader (the mock engine) takes it back whole
+        let part = vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 7, 7];
+        let si = Submit { flags: FLAG_KEEP | FLAG_IMAGES, images: Some(part.clone()), ..s.clone() };
+        let bi = Frame::Submit(si.clone()).encode();
+        assert_eq!((bi.len(), &bi[b.len()..]), (b.len() + part.len(), &part[..]));
+        assert_eq!(Frame::decode(T_SUBMIT, &bi[8..], |_| 0).unwrap(), Frame::Submit(si));
+        // without the flag, bytes after the prompt are a protocol error, as before
+        let stray = Submit { images: Some(part), ..s.clone() };
+        assert!(Frame::decode(T_SUBMIT, &Frame::Submit(stray).encode()[8..], |_| 0).unwrap_err().contains("trailing bytes"));
         assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s));
         let d = Done {
             req_id: 1,
