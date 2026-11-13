@@ -213,7 +213,8 @@ restarts what fails. `DSGB10_ENGINE_ARGS` (`--max-ctx 262144`) takes engine flag
 (`DSGB10_ENGINE_ARGS="--max-ctx 262144 --slots 4"`): up to four sessions keep their state live and decode
 together, each with its own drafts, ~240 MB a slot ([Where it stands](#where-it-stands-2026-10-13),
 [batching.md](docs/batching.md#b3-the-build-2026-10-13)); with one slot (the default, as production runs)
-requests take turns of 64 tokens. To check it (these ran against a test port):
+requests take turns of 64 tokens. For images, `DSGB10_VISION_CMD` (the vision encoder's command) makes the encoder
+a part of the service ([vision.md](docs/vision.md#running-it)). To check it (these ran against a test port):
 
 ```bash
 (umask 077; { printf 'Authorization: Bearer '; cat ~/api-key; } > ~/api-key.header)

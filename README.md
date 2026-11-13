@@ -158,8 +158,8 @@ This is the exact build behind the numbers above (the engine source in this repo
   3  gate weights ... copy ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin to the SAME path on
                       all four boxes (e.g. ~/cfmlp_cml.bin). The engine exits at start without it.
   4  engine args .... the block below, through service.sh
-  5  images ......... optional: start tools/vision/vision_encoder.py on rank 0 and add
-                      --vision-addr 127.0.0.1:18950 to the front-end's arguments (docs/vision.md)
+  5  images ......... optional: DSGB10_VISION_CMD, the vision encoder's command, to service.sh: the
+                      encoder is then started, restarted and stopped with the service (docs/vision.md)
   6  check .......... python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions c1 27
                       python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions distinct 16
 ```
