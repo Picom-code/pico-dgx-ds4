@@ -155,6 +155,12 @@ impl Gate {
         self.st.lock().unwrap().closing = true;
     }
 
+    /// (in flight, waiting at the gate): the two gauges `/metrics` exports.
+    pub fn load(&self) -> (u32, u32) {
+        let s = self.st.lock().unwrap();
+        (s.in_flight, s.waiting)
+    }
+
     pub fn status(&self, connected: bool) -> String {
         let s = self.st.lock().unwrap();
         format!(

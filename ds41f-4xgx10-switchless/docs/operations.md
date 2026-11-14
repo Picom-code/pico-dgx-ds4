@@ -51,3 +51,45 @@ job's driver that holds a want across its parts keeps the service from taking th
 candidate 4's start waited 44 minutes so). To bring the kit back: `service.sh stop`, then
 `cd ~/ai/dsv41-4x-ring && nohup setsid ./start-tp4.sh serve > logs-tp4/serve-launch.log 2>&1 < /dev/null &`
 on rank 0 (ready in ~6 min).
+
+## The `/metrics` endpoint
+
+dsfront answers `GET /metrics` on the same addresses and port as the API, unauthenticated like
+`/health`, in the Prometheus text exposition format (`text/plain; version=0.0.4`). The series keep the
+`tensorfold:` prefix of the serve they replace, so a scraper already reading the TensorFold counters
+reads these unchanged:
+
+| series | type | what it reports |
+|---|---|---|
+| `tensorfold:requests_running` | gauge | requests in flight in the gate |
+| `tensorfold:requests_waiting` | gauge | requests waiting in the gate |
+| `tensorfold:generation_tokens_total` | counter | output tokens, added as the engine streams them |
+| `tensorfold:prompt_tokens_total` | counter | the full prompt length of each served request |
+| `tensorfold:prompt_tokens_cached_total` | counter | the part of that prompt whose KV was reused |
+| `tensorfold:time_to_first_token_seconds_sum`, `_count` | summary | time to first token over completed requests |
+| `tensorfold:request_prefill_seconds_sum`, `_count` | summary | the engine's own prefill time (prefill start -> first token) over completed requests |
+
+`prompt_tokens_cached_total` is a **subset** of `prompt_tokens_total`, not a counter beside it: it
+counts the prompt tokens whose KV was reused, and those sit inside the prompt total. A scraper derives
+the prefill rate as `prompt_tokens_total − prompt_tokens_cached_total`; if the two were a partition
+instead, that rate would come out inflated by the cache share — on a cache-heavy agent lane, by more
+than an order of magnitude. The front end adds the full prompt length to the prompt total and only the
+engine's `Done.cached_tokens` to the cached counter, clamped at the update site to the prompt it was
+handed ([protocol.md](protocol.md) defines the field), so the relation holds even if an engine ever
+reports a reuse length longer than the prompt.
+
+`generation_tokens_total` advances while a request decodes, so it includes the tokens of a request
+still in flight; the prompt, cached and TTFT series are recorded once, when the request completes.
+
+`request_prefill_seconds` is the prefill time the **engine** measured (`Done.prefill_us`, prefill started
+to first token), not TTFT: TTFT is measured from the front end and also covers the gate and the submit
+round trip, so it is the larger of the two and dividing by it understates the prefill rate. A scraper
+derives the rate as `d(prompt_tokens_total - prompt_tokens_cached_total) / d(request_prefill_seconds_sum)`
+over its window: the computed tokens divided by the time spent computing them. The prompt, cached,
+prefill and TTFT series are all recorded once per completed request, so the deltas of one window cover
+the same requests.
+
+The counters are per-process and begin at zero when dsfront starts. **A restart resets them all to
+zero, together with the session and prefix-cache state**, so a scraper should read a drop to zero as a
+restart, not as a traffic drop: they return to zero together, never one without the others. There is
+no per-slot or queue-depth gauge beyond the two request gauges.
