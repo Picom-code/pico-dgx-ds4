@@ -63,6 +63,11 @@ static PROMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static TTFT_US_SUM: AtomicU64 = AtomicU64::new(0);
 static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Prefill time as the engine measured it (`Done::prefill_us`: prefill started -> first token),
+/// over completed requests. TTFT is not that quantity (it also covers the gate and the submit round
+/// trip), so the prefill rate divides the computed tokens, `prompt - cached`, by these.
+static PREFILL_US_SUM: AtomicU64 = AtomicU64::new(0);
+static PREFILL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub struct App {
     pub cfg: ServerConfig,
@@ -193,21 +198,61 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     }
 }
 
-/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
-/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
-async fn metrics(State(app): State<Arc<App>>) -> Response {
-    let (running, waiting) = app.gate.load();
-    let body = format!(
+/// The `/metrics` body: the two gauges, the counters and the summaries, in the Prometheus text
+/// exposition format. Built from the statics alone, so a test reads the exposition without a server.
+fn metrics_body(running: u32, waiting: u32) -> String {
+    format!(
         "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
 # TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
 # TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {}\n\
 # TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
 # TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
-# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n",
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n\
+# TYPE tensorfold:request_prefill_seconds summary\ntensorfold:request_prefill_seconds_sum {}\ntensorfold:request_prefill_seconds_count {}\n",
         GEN_TOTAL.load(Ordering::Relaxed), PROMPT_TOTAL.load(Ordering::Relaxed), CACHED_TOTAL.load(Ordering::Relaxed),
-        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed)
-    );
-    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], body).into_response()
+        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed),
+        PREFILL_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, PREFILL_COUNT.load(Ordering::Relaxed)
+    )
+}
+
+/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
+/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], metrics_body(running, waiting)).into_response()
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    /// Every series a scraper reads is present and every sample is a number: a missing or misnamed
+    /// series is how a dashboard silently shows nothing.
+    #[test]
+    fn the_exposition_has_every_series() {
+        let body = metrics_body(2, 1);
+        let series = [
+            "tensorfold:requests_running 2",
+            "tensorfold:requests_waiting 1",
+            "tensorfold:generation_tokens_total ",
+            "tensorfold:prompt_tokens_total ",
+            "tensorfold:prompt_tokens_cached_total ",
+            "tensorfold:time_to_first_token_seconds_sum ",
+            "tensorfold:time_to_first_token_seconds_count ",
+            "tensorfold:request_prefill_seconds_sum ",
+            "tensorfold:request_prefill_seconds_count ",
+        ];
+        for want in series {
+            assert!(body.contains(want), "{want} missing from /metrics:\n{body}");
+        }
+        let samples: Vec<&str> = body.lines().filter(|l| l.starts_with("tensorfold:")).collect();
+        assert_eq!(samples.len(), series.len(), "/metrics:\n{body}");
+        for line in samples {
+            let (name, value) = line.rsplit_once(' ').expect("a sample line has a value");
+            assert!(value.parse::<f64>().is_ok(), "not a number: {line}");
+            assert!(name.starts_with("tensorfold:"), "unprefixed series: {line}");
+        }
+    }
 }
 
 async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -634,6 +679,8 @@ impl Gen {
                     CACHED_TOTAL.fetch_add(usage.cached as u64, Ordering::Relaxed);
                     TTFT_US_SUM.fetch_add((ttft * 1e6) as u64, Ordering::Relaxed);
                     TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PREFILL_US_SUM.fetch_add(d.prefill_us, Ordering::Relaxed);
+                    PREFILL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(dir) = &self.app.cfg.dump_dir {
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),

@@ -67,6 +67,7 @@ reads these unchanged:
 | `tensorfold:prompt_tokens_total` | counter | the full prompt length of each served request |
 | `tensorfold:prompt_tokens_cached_total` | counter | the part of that prompt whose KV was reused |
 | `tensorfold:time_to_first_token_seconds_sum`, `_count` | summary | time to first token over completed requests |
+| `tensorfold:request_prefill_seconds_sum`, `_count` | summary | the engine's own prefill time (prefill start -> first token) over completed requests |
 
 `prompt_tokens_cached_total` is a **subset** of `prompt_tokens_total`, not a counter beside it: it
 counts the prompt tokens whose KV was reused, and those sit inside the prompt total. A scraper derives
@@ -79,6 +80,14 @@ reports a reuse length longer than the prompt.
 
 `generation_tokens_total` advances while a request decodes, so it includes the tokens of a request
 still in flight; the prompt, cached and TTFT series are recorded once, when the request completes.
+
+`request_prefill_seconds` is the prefill time the **engine** measured (`Done.prefill_us`, prefill started
+to first token), not TTFT: TTFT is measured from the front end and also covers the gate and the submit
+round trip, so it is the larger of the two and dividing by it understates the prefill rate. A scraper
+derives the rate as `d(prompt_tokens_total - prompt_tokens_cached_total) / d(request_prefill_seconds_sum)`
+over its window: the computed tokens divided by the time spent computing them. The prompt, cached,
+prefill and TTFT series are all recorded once per completed request, so the deltas of one window cover
+the same requests.
 
 The counters are per-process and begin at zero when dsfront starts. **A restart resets them all to
 zero, together with the session and prefix-cache state**, so a scraper should read a drop to zero as a
