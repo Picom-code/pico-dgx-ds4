@@ -52,6 +52,23 @@ pub struct ServerConfig {
     pub vision_addr: Option<String>,
 }
 
+/// Monotonic counters for /metrics (sparkDash reads them as `tensorfold:*`).
+///
+/// `CACHED_TOTAL` counts the prompt tokens whose KV was reused, and those sit *inside*
+/// `PROMPT_TOTAL` (see `Done::cached_tokens`): sparkDash derives prefill as `prompt - cached`,
+/// so the two are a subset relation, never a partition. The clamp at the update site keeps that
+/// true even if an engine ever reports a reuse length past the prompt it was handed.
+static GEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TTFT_US_SUM: AtomicU64 = AtomicU64::new(0);
+static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Prefill time as the engine measured it (`Done::prefill_us`: prefill started -> first token),
+/// over completed requests. TTFT is not that quantity (it also covers the gate and the submit round
+/// trip), so the prefill rate divides the computed tokens, `prompt - cached`, by these.
+static PREFILL_US_SUM: AtomicU64 = AtomicU64::new(0);
+static PREFILL_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub struct App {
     pub cfg: ServerConfig,
     pub tok: Arc<Tokenizer>,
@@ -108,6 +125,7 @@ impl App {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -177,6 +195,63 @@ async fn health(State(app): State<Arc<App>>) -> Response {
         (StatusCode::OK, "ok\n").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
+    }
+}
+
+/// The `/metrics` body: the two gauges, the counters and the summaries, in the Prometheus text
+/// exposition format. Built from the statics alone, so a test reads the exposition without a server.
+fn metrics_body(running: u32, waiting: u32) -> String {
+    format!(
+        "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
+# TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
+# TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n\
+# TYPE tensorfold:request_prefill_seconds summary\ntensorfold:request_prefill_seconds_sum {}\ntensorfold:request_prefill_seconds_count {}\n",
+        GEN_TOTAL.load(Ordering::Relaxed), PROMPT_TOTAL.load(Ordering::Relaxed), CACHED_TOTAL.load(Ordering::Relaxed),
+        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed),
+        PREFILL_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, PREFILL_COUNT.load(Ordering::Relaxed)
+    )
+}
+
+/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
+/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], metrics_body(running, waiting)).into_response()
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    /// Every series a scraper reads is present and every sample is a number: a missing or misnamed
+    /// series is how a dashboard silently shows nothing.
+    #[test]
+    fn the_exposition_has_every_series() {
+        let body = metrics_body(2, 1);
+        let series = [
+            "tensorfold:requests_running 2",
+            "tensorfold:requests_waiting 1",
+            "tensorfold:generation_tokens_total ",
+            "tensorfold:prompt_tokens_total ",
+            "tensorfold:prompt_tokens_cached_total ",
+            "tensorfold:time_to_first_token_seconds_sum ",
+            "tensorfold:time_to_first_token_seconds_count ",
+            "tensorfold:request_prefill_seconds_sum ",
+            "tensorfold:request_prefill_seconds_count ",
+        ];
+        for want in series {
+            assert!(body.contains(want), "{want} missing from /metrics:\n{body}");
+        }
+        let samples: Vec<&str> = body.lines().filter(|l| l.starts_with("tensorfold:")).collect();
+        assert_eq!(samples.len(), series.len(), "/metrics:\n{body}");
+        for line in samples {
+            let (name, value) = line.rsplit_once(' ').expect("a sample line has a value");
+            assert!(value.parse::<f64>().is_ok(), "not a number: {line}");
+            assert!(name.starts_with("tensorfold:"), "unprefixed series: {line}");
+        }
     }
 }
 
@@ -525,6 +600,7 @@ impl Gen {
             match ev {
                 EngineEvent::Tokens(t) => {
                     self.first_token.get_or_insert_with(Instant::now);
+                    GEN_TOTAL.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                     for &id in &t.ids {
                         self.ids.push(id);
                         if self.stopped.is_some() {
@@ -593,9 +669,18 @@ impl Gen {
                         _ => 0,
                     };
                     self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
-                    let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
+                    // cached is the reused prefix of the prompt, not an extra counter: sparkDash
+                    // derives prefill as prompt - cached, so clamp instead of letting it exceed.
+                    let prompt = self.prompt_ids.len();
+                    let usage = Usage { prompt, cached: d.cached_tokens.min(prompt as u32), completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
+                    PROMPT_TOTAL.fetch_add(usage.prompt as u64, Ordering::Relaxed);
+                    CACHED_TOTAL.fetch_add(usage.cached as u64, Ordering::Relaxed);
+                    TTFT_US_SUM.fetch_add((ttft * 1e6) as u64, Ordering::Relaxed);
+                    TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PREFILL_US_SUM.fetch_add(d.prefill_us, Ordering::Relaxed);
+                    PREFILL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(dir) = &self.app.cfg.dump_dir {
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
