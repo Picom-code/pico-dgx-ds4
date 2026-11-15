@@ -226,20 +226,20 @@ fn num_i64(v: &Value) -> Option<i64> {
     s.parse().ok()
 }
 
-/// API effort names mapped to the publisher's 1-100 prompt hint. Zero selects chat mode.
-/// These hints guide reasoning; they do not impose a reasoning-token limit.
-const EFFORT_LEVELS: &[(&str, i64)] = &[
-    ("none", 0), ("minimal", 1), ("low", 25), ("medium", 50),
-    ("high", 75), ("xhigh", 85), ("ultra", 95), ("max", 100),
+/// API effort names mapped to the publisher's 1-100 prompt hint. Zero selects chat mode; None is the
+/// server's default effort (--effort, 75). These hints guide reasoning; they do not impose a
+/// reasoning-token limit.
+///
+/// A name this server already took keeps the value it had, so a client that sends it gets the same
+/// prompt as before: low 50, high and xhigh 75, max 100 (the publisher's tiers), and medium the
+/// default effort. `none`, `minimal` and `ultra` are the new names.
+const EFFORT_LEVELS: &[(&str, Option<i64>)] = &[
+    ("none", Some(0)), ("minimal", Some(1)), ("low", Some(50)), ("medium", None),
+    ("high", Some(75)), ("xhigh", Some(75)), ("ultra", Some(95)), ("max", Some(100)),
 ];
 
 fn invalid_effort(v: &Value) -> String {
-    format!("invalid reasoning_effort {v}; allowed values: none, minimal, low, medium, high, xhigh, ultra, max")
-}
-
-fn named_effort(v: &Value) -> Result<i64, String> {
-    EFFORT_LEVELS.iter().find(|(name, _)| v.as_str() == Some(*name))
-        .map(|(_, budget)| *budget).ok_or_else(|| invalid_effort(v))
+    format!("invalid reasoning_effort {v}; allowed values: none, minimal, low, medium, high, xhigh, ultra, max, or a number from 1 to 100")
 }
 
 /// A request's own `thinking` field, the on/off switch other OpenAI-compatible servers take:
@@ -263,12 +263,23 @@ fn thinking_switch(v: &Value) -> Result<Option<bool>, String> {
     }
 }
 
-/// Template/reasoning aliases also retain the existing numeric budget extension.
-/// The top-level API field accepts only the documented effort names.
+/// The effort a request names, wherever it names it (the top-level field or an alias): one of the
+/// names above (case and surrounding spaces do not matter, as before), an integer 1-100 as it is, an
+/// OpenAI fraction in [0, 1] times 100, or such a number in a string ("40"). Anything else is an error:
+/// a typo no longer falls back to the default silently.
 pub fn effort_budget(v: Option<&Value>, default: i64) -> Result<i64, String> {
     match v {
         None | Some(Value::Null) => Ok(default),
-        Some(v @ Value::String(_)) => named_effort(v),
+        Some(Value::String(s)) => {
+            let t = s.trim().to_ascii_lowercase();
+            if let Some((_, budget)) = EFFORT_LEVELS.iter().find(|(name, _)| *name == t) {
+                return Ok(budget.unwrap_or(default));
+            }
+            match serde_json::from_str::<Value>(&t) {
+                Ok(n @ Value::Number(_)) => effort_budget(Some(&n), default).map_err(|_| invalid_effort(v.unwrap())),
+                _ => Err(invalid_effort(v.unwrap())),
+            }
+        }
         Some(n @ Value::Number(_)) => {
             let s = n.as_number().unwrap().to_string();
             let f = num_f64(n).unwrap_or(f64::NAN);
@@ -403,7 +414,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let ctk = r.get("chat_template_kwargs").and_then(Value::as_object);
     let reasoning = r.get("reasoning").and_then(Value::as_object);
     let top_effort = r.get("reasoning_effort").filter(|v| !v.is_null());
-    let top_budget = top_effort.map(named_effort).transpose()?;
+    let top_budget = top_effort.map(|v| effort_budget(Some(v), cfg.default_effort)).transpose()?;
     let template_effort = ctk.and_then(|c| c.get("reasoning_effort")).filter(|v| !v.is_null());
     let nested_effort = reasoning.and_then(|c| c.get("effort")).filter(|v| !v.is_null());
     let nested_reasoning_effort = reasoning.and_then(|c| c.get("reasoning_effort")).filter(|v| !v.is_null());
@@ -1036,13 +1047,60 @@ mod tests {
     #[test]
     fn efforts() {
         for &(name, budget) in EFFORT_LEVELS {
-            assert_eq!(effort_budget(Some(&json!(name)), 75).unwrap(), budget);
+            assert_eq!(effort_budget(Some(&json!(name)), 75).unwrap(), budget.unwrap_or(75));
         }
         for (v, want) in [(json!(30), 30), (json!(0.5), 50), (json!(80.0), 80)] {
             assert_eq!(effort_budget(Some(&v), 75).unwrap(), want);
         }
-        for v in [json!("banana"), json!("40"), json!(true), json!(0), json!(101)] {
-            assert!(effort_budget(Some(&v), 75).is_err(), "{v}");
+        for v in [json!("banana"), json!("4o"), json!(""), json!("0"), json!("101"), json!(true), json!(0), json!(101), json!(-5), json!(1.5e3)] {
+            let e = effort_budget(Some(&v), 75).expect_err(&v.to_string());
+            assert!(e.contains(&format!("invalid reasoning_effort {v};")), "the message quotes what was sent: {e}");
+        }
+    }
+
+    /// What this server answered before the validation, for every input it took: the same budget now.
+    #[test]
+    fn efforts_keep_their_earlier_values() {
+        for (v, want) in [
+            (json!("low"), 50),
+            (json!("medium"), 75),
+            (json!("high"), 75),
+            (json!("xhigh"), 75),
+            (json!("max"), 100),
+            (json!("HIGH"), 75),
+            (json!(" Max "), 100),
+            (json!(40), 40),
+            (json!("40"), 40),
+            (json!(1), 1),
+            (json!(100), 100),
+            (json!(0.5), 50),
+            (json!(80.0), 80),
+        ] {
+            assert_eq!(effort_budget(Some(&v), 75).unwrap(), want, "{v}");
+        }
+        // medium is the server's default effort (--effort), as before
+        assert_eq!(effort_budget(Some(&json!("medium")), 60).unwrap(), 60);
+        assert_eq!(effort_budget(None, 60).unwrap(), 60);
+        // the new names
+        assert_eq!(effort_budget(Some(&json!("none")), 75).unwrap(), 0);
+        assert_eq!(effort_budget(Some(&json!("minimal")), 75).unwrap(), 1);
+        assert_eq!(effort_budget(Some(&json!("ultra")), 75).unwrap(), 95);
+        // through a request, at the top level and through the aliases, in the prompt the model sees
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            let cfg = ServerConfig { encoding, ..cfg() };
+            for (v, want) in [(json!("low"), 50), (json!("medium"), 75), (json!("xhigh"), 75), (json!(40), 40), (json!("40"), 40), (json!(0.3), 30)] {
+                for field in ["top", "template", "reasoning"] {
+                    let mut r = request();
+                    match field {
+                        "top" => r["reasoning_effort"] = v.clone(),
+                        "template" => r["chat_template_kwargs"] = json!({"reasoning_effort": v}),
+                        _ => r["reasoning"] = json!({"effort": v}),
+                    }
+                    let p = prepare(&cfg, &r).unwrap_or_else(|e| panic!("{field} {v}: {e}"));
+                    assert_eq!(p.mode, ThinkingMode::Thinking, "{field} {v}");
+                    assert!(p.prompt.contains(&format!("Reasoning Effort: {want} ")), "{field} {v}");
+                }
+            }
         }
     }
 
@@ -1097,6 +1155,7 @@ mod tests {
                     assert!(!p.prompt.contains("Reasoning Effort:"));
                     assert!(!p.prompt.ends_with("<think>"));
                 } else {
+                    let budget = budget.unwrap_or(cfg.default_effort);
                     assert_eq!(p.mode, ThinkingMode::Thinking);
                     assert!(p.prompt.contains(&format!("Reasoning Effort: {budget} ")), "{name}");
                 }
@@ -1106,7 +1165,7 @@ mod tests {
 
     #[test]
     fn effort_validation_and_precedence() {
-        for bad in [json!("banana"), json!("HIGH"), json!(""), json!(true), json!(75), json!([]), json!({})] {
+        for bad in [json!("banana"), json!("hihg"), json!(""), json!(true), json!(0), json!(101), json!([]), json!({})] {
             let mut r = request();
             r["reasoning_effort"] = bad;
             r["chat_template_kwargs"] = json!({"thinking": false});

@@ -138,6 +138,15 @@ def main():
                        "reasoning_effort": effort})
         check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), f"{effort} enables thinking")
 
+    for effort in (40, "40", "HIGH", 0.5):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), f"effort {effort!r} is still accepted")
+    for effort in (0, 101, True):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 400 and allowed in b.get("error", {}).get("message", ""), f"effort {effort!r} returns 400")
+
     # thinking, streamed, pi-style kwargs
     body = {"messages": [SYSTEM, {"role": "user", "content": "Think first"}], "max_completion_tokens": 200,
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"thinking": True, "reasoning_effort": "max"}}

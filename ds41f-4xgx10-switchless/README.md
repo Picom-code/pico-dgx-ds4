@@ -239,12 +239,16 @@ dsfront with `--thinking` (`--no-thinking` spells out the default; `"reasoning_e
 switches thinking off for one request). A request's own switch, `"thinking": {"type": "enabled"}` or
 `{"type": "disabled"}` (or a plain `true` / `false`), is honoured first and decides on or off whatever
 else the request carries; `"auto"` leaves it to the server default. Allowed effort names are
-`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max`; other values return HTTP 400
-with that list. The enabled levels map to the model's numeric effort hints 1, 25, 50, 75, 85, 95,
-and 100 respectively (default 75). These guide how thoroughly it reasons, rather than imposing a
-reasoning-token limit. Reasoning comes back in `reasoning_content`. The top-level effort overrides
-`chat_template_kwargs` and `reasoning` aliases; explicit `thinking: false` remains supported when no
-top-level effort is given. Numeric budgets remain available through those aliases. Sampling defaults to
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max` (case does not matter), or a
+number: an integer from 1 to 100 as it is, a fraction in [0, 1] times 100, also as a string (`"40"`).
+Anything else returns HTTP 400 with that list. The names stand for the model's numeric effort hints:
+`minimal` 1, `low` 50, `medium` the server's default effort (`--effort`, 75), `high` and `xhigh` 75,
+`ultra` 95, `max` 100. The names this server took before the validation (`low`, `medium`, `high`,
+`xhigh`, `max`) keep the values they had, so existing clients get the same prompt. The hints guide how
+thoroughly the model reasons, rather than imposing a reasoning-token limit. Reasoning comes back in
+`reasoning_content`. The top-level effort overrides the `chat_template_kwargs` and `reasoning`
+aliases; `chat_template_kwargs: {"thinking": false}` remains supported when no top-level effort is
+given. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put
