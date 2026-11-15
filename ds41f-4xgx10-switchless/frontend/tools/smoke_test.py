@@ -117,6 +117,16 @@ def main():
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
           and not b["choices"][0]["message"].get("reasoning_content"), "none disables thinking despite a conflicting template flag")
 
+    # the request's own thinking switch
+    hi = [{"role": "user", "content": "Hello there"}]
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "enabled"}})
+    check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), "thinking: {type: enabled} switches thinking on")
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "disabled"}, "reasoning_effort": "high"})
+    check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+          and not b["choices"][0]["message"].get("reasoning_content"), "thinking: {type: disabled} switches thinking off")
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "banana"}})
+    check(s == 400 and "enabled, disabled" in b.get("error", {}).get("message", ""), "an unknown thinking type returns 400")
+
     allowed = "none, minimal, low, medium, high, xhigh, ultra, max"
     for streaming in (False, True):
         s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],

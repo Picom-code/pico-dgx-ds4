@@ -236,7 +236,9 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 Thinking is off unless asked for: by a request (`"reasoning_effort"` with any level but `none`, or
 `"chat_template_kwargs": {"thinking": true}`), or for every request that does not say by starting
 dsfront with `--thinking` (`--no-thinking` spells out the default; `"reasoning_effort": "none"`
-switches thinking off for one request). Allowed effort names are
+switches thinking off for one request). A request's own switch, `"thinking": {"type": "enabled"}` or
+`{"type": "disabled"}` (or a plain `true` / `false`), is honoured first and decides on or off whatever
+else the request carries; `"auto"` leaves it to the server default. Allowed effort names are
 `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max`; other values return HTTP 400
 with that list. The enabled levels map to the model's numeric effort hints 1, 25, 50, 75, 85, 95,
 and 100 respectively (default 75). These guide how thoroughly it reasons, rather than imposing a
