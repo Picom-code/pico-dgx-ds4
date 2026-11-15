@@ -163,8 +163,16 @@ For several clips, the available frame budget is divided between them. Video fra
 images together share the 100-image limit across all messages. Each frame is resized to fit within
 768x768 pixels and is inserted as an image with its timestamp and the clip duration, preserving
 its place in the conversation. Frame extraction runs in a separate process with a 60-second timeout.
-Clips are limited to 128 MiB; the HTTP JSON limit remains 256 MiB. Nested media protocols are disabled,
+Clips are limited to 128 MiB (`--max-video-bytes`). A clip sent inline as base64 must also fit the
+HTTP JSON limit, 64 MiB unless `dsfront serve --max-body-mb N` raises it (about 47 MiB of video at
+the default); larger clips go by URL. Nested media protocols are disabled,
 and video URLs use the same public-address-only fetch rules as images.
+
+Video frames are images to everything after the decoder, so they count against the cap on a
+request's image tokens (`--max-image-rows`, 40,000 by default; see above) together with its still
+images. A frame is at most 768x768, about 380 tokens, so a clip alone stays under the default cap
+even at 100 frames (the 32-frame default is 7,000 to 12,000 tokens); a clip next to many large images
+may not, and is then answered 400 like any request over the cap.
 
 This is visual video analysis through the existing vision tower. Audio tracks are ignored. Streaming
 and non-streaming chat requests both work; video decoding happens before generation starts.

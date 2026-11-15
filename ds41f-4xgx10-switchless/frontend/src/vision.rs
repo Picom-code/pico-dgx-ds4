@@ -83,7 +83,8 @@ pub fn is_request_error(e: &str) -> bool {
 }
 
 fn too_many_rows(max_rows: usize, total: usize) -> String {
-    format!("at most {max_rows} image tokens per request (--max-image-rows); the images of this request take {total}")
+    // video frames are images by now (video.rs): they count like any other
+    format!("at most {max_rows} image tokens per request (--max-image-rows); the images and video frames of this request take {total}")
 }
 
 /// The rows and hash of each image from the encoder's reply header, checked against the request and the
@@ -234,7 +235,7 @@ impl EncodeRequest<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -342,7 +343,7 @@ mod tests {
         let (addr, _enc) = fake_encoder(reply_with_rows(&[994; 41]), false).await;
         let t0 = Instant::now();
         let e = encode(&addr, &records(41), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
-        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images of this request take 40754");
+        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images and video frames of this request take 40754");
         assert!(is_request_error(&e), "answered 400, not 503");
         assert!(t0.elapsed() < Duration::from_secs(5), "refused from the reply's header, without waiting for rows");
         // 40 of them are exactly 39,760: allowed

@@ -146,6 +146,41 @@ mod tests {
         assert!(replacements(&reply, 1, 1).is_err());
     }
 
+    /// A clip's frames become image parts, so they count against the cap on a request's image rows
+    /// (--max-image-rows) exactly as still images do, together with them.
+    #[tokio::test]
+    async fn video_frames_count_against_the_row_cap() {
+        use crate::vision::tests::{fake_encoder, reply_with_rows};
+        use crate::vision::{encode, is_request_error, DEFAULT_MAX_IMAGE_ROWS};
+        let t = Duration::from_secs(20);
+        // a clip of 32 frames next to 30 still images
+        let frames: Vec<Value> = (0..32).map(|i| json!({"timestamp": i as f64, "url": "data:image/jpeg;base64,AA"})).collect();
+        let (addr, enc) = fake_encoder(json!({"ok": true, "videos": [{"duration": 32.0, "frames": frames}]}), true).await;
+        let still = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
+        let mut content = vec![json!({"type": "video_url", "video_url": "https://example.com/a.mp4"})];
+        content.extend(vec![still; 30]);
+        content.push(json!({"type": "text", "text": "what happens?"}));
+        let mut r = json!({"messages": [{"role": "user", "content": content}]});
+        expand(&mut r, Some(&addr)).await.unwrap();
+        assert_eq!(enc.await.unwrap()["frame_budget"], 70, "the clip may use the images the request has not used");
+        // every frame is an image part now, in the request's order: 32 frames, then the 30 images
+        let records: Vec<Value> = r["messages"][0]["content"].as_array().unwrap().iter().filter(|p| p["type"] == "image_url").map(|p| p["image_url"].clone()).collect();
+        assert_eq!(records.len(), 62);
+        assert!(records[0]["url"].as_str().unwrap().starts_with("data:image/jpeg") && records[61]["url"].as_str().unwrap().starts_with("data:image/png"));
+        // 32 frames of 383 rows and 30 full-size images of 994 are 42,076 rows: refused, with no row read
+        let rows: Vec<u32> = [vec![383u32; 32], vec![994; 30]].concat();
+        let (addr, _enc) = fake_encoder(reply_with_rows(&rows), false).await;
+        let e = encode(&addr, &records, t, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images and video frames of this request take 42076");
+        assert!(is_request_error(&e), "answered 400");
+        // the frames alone count too: under a cap of 100 rows, 32 frames of 3 rows pass and 34 do not
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[3; 32]), true).await;
+        assert_eq!(encode(&addr, &records[..32], t, 100).await.unwrap().rows.len(), 32);
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[3; 34]), false).await;
+        let e = encode(&addr, &records[..34], t, 100).await.unwrap_err();
+        assert!(e.starts_with("at most 100 image tokens per request") && e.ends_with("take 102"), "{e}");
+    }
+
     #[tokio::test]
     async fn text_unchanged_and_video_requires_encoder() {
         let mut r = json!({"messages":[{"role":"user","content":"hello"}]});
