@@ -9,6 +9,9 @@ pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
 
+/// A SUBMIT's fields before stop_ids[] (docs/protocol.md).
+const SUBMIT_FIXED: usize = 72;
+
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
 pub const T_CANCEL: u16 = 0x03;
@@ -158,6 +161,8 @@ impl Frame {
             }
             Frame::Submit(s) => {
                 let mut w = W::new(T_SUBMIT);
+                // the whole frame at once: growing by doubling would hold up to twice an image part
+                w.0.reserve_exact(SUBMIT_FIXED + 4 * (s.stop_ids.len() + s.prompt.len()) + s.images.as_ref().map_or(0, Vec::len));
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
@@ -354,6 +359,32 @@ pub async fn read_frame<Rd: AsyncRead + Unpin>(rd: &mut Rd) -> std::io::Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submit_with_images_is_one_allocation() {
+        let img = vec![7u8; 4 + 16 + 3 * crate::vision::IMAGE_DIM * 2];
+        let s = Submit {
+            req_id: 1,
+            session_id: 2,
+            base_session_id: 0,
+            seed: 0,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_new_tokens: 8,
+            flags: FLAG_IMAGES,
+            n_top_logprobs: 0,
+            prefix_hint: 0,
+            stop_ids: vec![1, 2],
+            prompt: vec![5; 1000],
+            images: Some(img.clone()),
+        };
+        let b = Frame::Submit(s).encode();
+        let want = 8 + SUBMIT_FIXED + 4 * 2 + 4 * 1000 + img.len();
+        assert_eq!((b.len(), b.capacity()), (want, want), "sized once, not grown by doubling");
+        assert_eq!(u32::from_le_bytes(b[..4].try_into().unwrap()) as usize, want - 8);
+        assert!(b[want - img.len()..] == img[..], "the image part follows prompt[] unchanged");
+    }
 
     #[test]
     fn roundtrip_and_layout() {

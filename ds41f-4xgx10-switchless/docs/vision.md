@@ -103,7 +103,24 @@ A request over the cap is answered 400 (`at most 40000 image tokens per request 
 encoder's reply header, before the front-end reads or allocates any row and before anything reaches
 the engine; an encoder with `--max-rows` also stops encoding at the image that crosses it. Raise both
 flags together, and only with the memory to spare: budget 50 to 80 MiB of rank 0's box per 1,000 rows
-of one request (the two measurements above), times the image requests in flight.
+of one request (the two measurements above, taken before the front-end's copies of the rows were
+halved; expect less), times the image requests in flight.
+
+What a request costs in the front-end itself, as peak resident memory over idle (mock engine and a
+stand-in encoder, no GPU):
+
+| request | before | now |
+|---|---|---|
+| rows: 100 pictures of 383 rows (374 MiB of rows), peak | 1,496 MiB (4.0x) | 748 MiB (2.0x) |
+| rows: resident after the request | 375 MiB | 1 MiB |
+| body: 60 MiB with 20 inline images, peak | 716 MiB (12x) | 444 MiB (7.4x) |
+| body: while the encoder works | 476 MiB (7.9x) | 295 MiB (4.9x) |
+
+The rows are read from the encoder into the SUBMIT's image part directly and exist once more only
+while the frame is written. A body of inline images is still copied while its request is prepared
+(the bytes, the parsed JSON, the converted messages, the image records, the encoder's request), which
+is why the body limit stays at 64 MiB unless `--max-body-mb` raises it. Images given by URL cost the
+front-end nothing of this: the encoder fetches them.
 
 The encoder's request limits have CPU tests that need only torch (no model, no GPU):
 `python3 -m unittest discover -s tools/vision -p test_encoder_limits.py -v`.

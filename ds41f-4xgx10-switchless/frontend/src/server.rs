@@ -763,6 +763,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
     let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
+    let (n_images, n_rows, encoder_ms) = (enc.rows.len(), enc.rows.iter().sum::<u32>(), enc.ms);
     let ctx = info.max_context as usize;
     if ids.len() >= ctx {
         return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
@@ -787,14 +788,11 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         prefix_hint: 0,
         stop_ids: stop_ids.clone(),
         prompt: ids.clone(),
-        images: Some(crate::vision::payload(&starts, &enc)),
+        images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
     };
     let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
     eprintln!(
-        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; session {session_id} (not kept)",
-        enc.rows.len(),
-        enc.rows.iter().sum::<u32>(),
-        enc.ms,
+        "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
         ids.len()
     );
     Ok(Gen {
@@ -828,10 +826,15 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
     };
+    // A request with inline images is megabytes: each copy is freed when its last reader is done,
+    // rather than held until the answer ends. The body's bytes are not needed once parsed.
+    drop(body);
     let p = match prepare(&app.cfg, &req) {
         Ok(p) => p,
         Err(e) => return bad_request(e),
     };
+    // The parsed request is only read again by --dump-dir's record.
+    let req = if app.cfg.dump_dir.is_some() { req } else { Value::Null };
     // While the engine is down (the ring lent to a job, or a restart) a request waits at the gate. A
     // stream that has to wait starts at once and carries comments meanwhile, so that its client's
     // timeout sees bytes; refused, it ends with an error event. Anything else waits here, refused with

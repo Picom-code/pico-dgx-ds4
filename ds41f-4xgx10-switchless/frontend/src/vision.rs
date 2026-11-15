@@ -10,7 +10,7 @@
 //! encoder that knows it stops early; the reply's JSON is checked against the cap here before any of
 //! the rows are read.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -35,7 +35,10 @@ pub struct Encoded {
     /// rows per image, in prompt order
     pub rows: Vec<u32>,
     pub hashes: Vec<u64>,
-    /// every image's rows, bf16 little-endian, in order
+    /// The SUBMIT's image part, as `payload` completes it: room for the span table (u32 n and 16 bytes
+    /// per image), then every image's rows, bf16 little-endian, in order. The rows are read from the
+    /// encoder straight into their place here, so the front-end holds them once, not once as the reply
+    /// and again as the SUBMIT's part.
     pub data: Vec<u8>,
     pub ms: f64,
 }
@@ -91,9 +94,12 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration, max_rows: 
     let t0 = Instant::now();
     let fut = async {
         let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
-        let body = json!({ "images": records, "max_rows": max_rows }).to_string().into_bytes();
+        // serialised from the records where they are (no copy of them first), and freed once sent:
+        // inline images are megabytes each, and the wait for the encoder is the long part
+        let body = EncodeRequest { images: records, max_rows }.to_bytes()?;
         s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
         s.write_all(&body).await.map_err(|e| e.to_string())?;
+        drop(body);
         let mut n4 = [0u8; 4];
         s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
         let header_len = u32::from_le_bytes(n4) as usize;
@@ -111,8 +117,9 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration, max_rows: 
         if u64::from_le_bytes(n8) != (total * IMAGE_DIM * 2) as u64 {
             return Err("image encoder: the rows do not match the spans".to_string());
         }
-        let mut data = vec![0u8; total * IMAGE_DIM * 2];
-        s.read_exact(&mut data).await.map_err(|e| format!("image encoder: {e}"))?;
+        let table = span_table_len(rows.len());
+        let mut data = vec![0u8; table + total * IMAGE_DIM * 2];
+        s.read_exact(&mut data[table..]).await.map_err(|e| format!("image encoder: {e}"))?;
         Ok::<_, String>((rows, hashes, data))
     };
     let (rows, hashes, data) = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())??;
@@ -141,22 +148,61 @@ pub fn expand(ids: &[u32], rows: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String>
     Ok((out, starts))
 }
 
+/// The bytes of the SUBMIT's span table for n images: u32 n, then {u32 start, u32 rows, u64 hash} each.
+fn span_table_len(n: usize) -> usize {
+    4 + 16 * n
+}
+
 /// The SUBMIT's image part (after prompt[]): u32 n, {u32 start, u32 rows, u64 hash} per image, the rows.
-pub fn payload(starts: &[u32], e: &Encoded) -> Vec<u8> {
-    let mut v = Vec::with_capacity(4 + 16 * starts.len() + e.data.len());
-    v.extend_from_slice(&(starts.len() as u32).to_le_bytes());
+/// The rows are already in place in `e.data`; this writes the table in front of them and hands the
+/// buffer over, without copying the rows.
+pub fn payload(starts: &[u32], e: Encoded) -> Vec<u8> {
+    assert_eq!(starts.len(), e.rows.len(), "one span per image");
+    let mut v = e.data;
+    let table = &mut v[..span_table_len(starts.len())];
+    table[..4].copy_from_slice(&(starts.len() as u32).to_le_bytes());
     for i in 0..starts.len() {
-        v.extend_from_slice(&starts[i].to_le_bytes());
-        v.extend_from_slice(&e.rows[i].to_le_bytes());
-        v.extend_from_slice(&e.hashes[i].to_le_bytes());
+        let at = 4 + 16 * i;
+        table[at..at + 4].copy_from_slice(&starts[i].to_le_bytes());
+        table[at + 4..at + 8].copy_from_slice(&e.rows[i].to_le_bytes());
+        table[at + 8..at + 16].copy_from_slice(&e.hashes[i].to_le_bytes());
     }
-    v.extend_from_slice(&e.data);
     v
+}
+
+/// The encoder's request, serialised from the image records in place.
+#[derive(serde::Serialize)]
+struct EncodeRequest<'a> {
+    images: &'a [Value],
+    max_rows: usize,
+}
+
+impl EncodeRequest<'_> {
+    /// The request's JSON in a buffer of exactly its size: measured first, so that megabytes of inline
+    /// images are not also held in the slack of a buffer grown by doubling.
+    fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0 += b.len();
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut n = Count(0);
+        serde_json::to_writer(&mut n, self).map_err(|e| e.to_string())?;
+        let mut v = Vec::with_capacity(n.0);
+        serde_json::to_writer(&mut v, self).map_err(|e| e.to_string())?;
+        Ok(v)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn expands_placeholders() {
@@ -186,7 +232,7 @@ mod tests {
                 let rows: u64 = reply["images"].as_array().map_or(0, |a| a.iter().map(|i| i["rows"].as_u64().unwrap()).sum());
                 let n = rows as usize * IMAGE_DIM * 2;
                 s.write_all(&(n as u64).to_le_bytes()).await.unwrap();
-                let _ = s.write_all(&vec![0u8; n]).await;
+                let _ = s.write_all(&row_bytes(n)).await;
             } else {
                 // the client must answer from the header alone: nothing else ever comes
                 let _ = s.read(&mut [0u8; 1]).await;
@@ -194,6 +240,40 @@ mod tests {
             serde_json::from_slice(&body).unwrap()
         });
         (addr, h)
+    }
+
+    /// What the stand-in encoder sends as rows: a pattern, so that a test sees where each byte lands.
+    fn row_bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn rows_land_in_the_submit_part_without_a_copy() {
+        let rows = [3u32, 5, 4];
+        let (addr, _enc) = fake_encoder(reply_with_rows(&rows), true).await;
+        let e = encode(&addr, &records(3), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
+        let n = 12 * IMAGE_DIM * 2;
+        assert_eq!(e.data.len(), 4 + 16 * 3 + n, "room for the span table, then the rows");
+        let (at, hashes) = (e.data.as_ptr(), e.hashes.clone());
+        let part = payload(&[7, 20, 40], e);
+        assert_eq!(part.as_ptr(), at, "the same buffer: the rows are not copied");
+        // the layout the engine reads (docs/protocol.md): u32 n, {u32 start, u32 rows, u64 hash} each, the rows
+        let mut want = 3u32.to_le_bytes().to_vec();
+        for (i, (start, r)) in [7u32, 20, 40].iter().zip(rows).enumerate() {
+            want.extend_from_slice(&start.to_le_bytes());
+            want.extend_from_slice(&r.to_le_bytes());
+            want.extend_from_slice(&hashes[i].to_le_bytes());
+        }
+        want.extend_from_slice(&row_bytes(n));
+        assert!(part == want, "span table and rows as before");
+        // and the request the encoder gets is the same JSON as before, plus the cap
+        let (addr, enc) = fake_encoder(reply_with_rows(&[3]), true).await;
+        let recs = vec![json!({"url": "data:image/png;base64,QUJD", "detail": "high"})];
+        encode(&addr, &recs, T, 123).await.unwrap();
+        assert_eq!(enc.await.unwrap(), json!({"images": recs, "max_rows": 123}));
+        let bytes = EncodeRequest { images: &recs, max_rows: 123 }.to_bytes().unwrap();
+        assert_eq!(bytes, json!({"images": recs, "max_rows": 123}).to_string().into_bytes());
+        assert_eq!(bytes.capacity(), bytes.len(), "sized once");
     }
 
     pub(crate) fn reply_with_rows(rows: &[u32]) -> Value {
@@ -216,7 +296,7 @@ mod tests {
         // and end to end with the stand-in encoder (short spans, so the test moves 3 MB rather than 392)
         let (addr, enc) = fake_encoder(reply_with_rows(&[3; 100]), true).await;
         let e = encode(&addr, &records(100), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
-        assert_eq!((e.rows.len(), e.data.len()), (100, 300 * IMAGE_DIM * 2));
+        assert_eq!((e.rows.len(), e.data.len()), (100, 4 + 16 * 100 + 300 * IMAGE_DIM * 2));
         let sent = enc.await.unwrap();
         assert_eq!(sent["max_rows"], DEFAULT_MAX_IMAGE_ROWS, "the encoder is told the cap");
         assert_eq!(sent["images"].as_array().unwrap().len(), 100);
