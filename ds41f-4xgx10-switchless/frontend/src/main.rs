@@ -18,8 +18,9 @@ fn usage() -> ! {
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
                                 or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
                                 kept across a turn's tool calls)
-      --thinking                thinking on when a request does not say (the default)
-      --no-thinking             default to chat mode; requests can override it with reasoning_effort
+      --thinking                thinking on when a request does not say (default off)
+      --no-thinking             thinking off when a request does not say (the default; the later
+                                of --thinking and --no-thinking wins); requests can override it
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
@@ -113,7 +114,7 @@ fn serve(args: &[String]) {
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
         encoding: encoding_opt(args),
-        default_thinking: !args.iter().any(|a| a == "--no-thinking"),
+        default_thinking: default_thinking(args),
         default_temperature: parse_opt(args, "--temperature", 1.0f32),
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
@@ -236,6 +237,12 @@ fn mock_engine(args: &[String]) {
         eprintln!("mock engine: {e}");
         std::process::exit(1);
     }
+}
+
+/// Thinking for requests that do not say: off, unless --thinking is given. --no-thinking spells the
+/// default out; when both are given, the later one wins.
+fn default_thinking(args: &[String]) -> bool {
+    args.iter().rev().find(|a| *a == "--thinking" || *a == "--no-thinking").is_some_and(|a| a == "--thinking")
 }
 
 fn opt(args: &[String], name: &str) -> Option<String> {
@@ -474,5 +481,23 @@ fn main() {
             }
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_thinking;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn thinking_flags() {
+        assert!(!default_thinking(&args("dsfront serve")), "off unless asked for");
+        assert!(default_thinking(&args("dsfront serve --thinking")));
+        assert!(!default_thinking(&args("dsfront serve --no-thinking")));
+        assert!(!default_thinking(&args("dsfront serve --thinking --no-thinking")), "the later flag wins");
+        assert!(default_thinking(&args("dsfront serve --no-thinking --model-name m --thinking")));
     }
 }

@@ -997,7 +997,7 @@ mod tests {
             max_tokens_cap: 32768,
             default_effort: 75,
             encoding: Encoding::V41,
-            default_thinking: true,
+            default_thinking: false,
             default_temperature: 1.0,
             default_top_p: 0.95,
             loop_guard: None,
@@ -1025,10 +1025,39 @@ mod tests {
         json!({"messages": [{"role": "user", "content": "hi"}]})
     }
 
+    /// A server started with --thinking.
+    fn cfg_thinking() -> ServerConfig {
+        ServerConfig { default_thinking: true, ..cfg() }
+    }
+
+    #[test]
+    fn thinking_is_off_unless_asked() {
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            // the server default: a request with no thinking field is answered in chat mode
+            let cfg = ServerConfig { encoding, ..cfg() };
+            let p = prepare(&cfg, &request()).unwrap();
+            assert_eq!(p.mode, ThinkingMode::Chat);
+            assert!(!p.prompt.contains("Reasoning Effort:") && !p.prompt.ends_with("<think>"));
+            // a request can still ask for it
+            let mut r = request();
+            r["reasoning_effort"] = json!("high");
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
+            let mut r = request();
+            r["chat_template_kwargs"] = json!({"thinking": true});
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
+            // --thinking makes it the server-wide default, and a request can still switch it off
+            let cfg = ServerConfig { encoding, ..cfg_thinking() };
+            assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Thinking);
+            let mut r = request();
+            r["reasoning_effort"] = json!("none");
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Chat);
+        }
+    }
+
     #[test]
     fn default_thinking_and_named_efforts() {
         for encoding in [Encoding::V41, Encoding::V41_1017] {
-            let mut cfg = cfg();
+            let mut cfg = cfg_thinking();
             cfg.encoding = encoding;
             let p = prepare(&cfg, &request()).unwrap();
             assert_eq!(p.mode, ThinkingMode::Thinking);
@@ -1082,13 +1111,12 @@ mod tests {
         ] {
             let mut r = request();
             r.as_object_mut().unwrap().extend(alias.as_object().unwrap().clone());
-            assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Chat, "{r}");
+            assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Chat, "{r}");
         }
         let mut r = request();
         r["reasoning_effort"] = Value::Null;
-        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Thinking);
-        let mut cfg = cfg();
-        cfg.default_thinking = false;
+        assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Thinking);
+        let cfg = cfg();
         assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Chat);
         r["reasoning"] = json!({"effort": "low"});
         assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);

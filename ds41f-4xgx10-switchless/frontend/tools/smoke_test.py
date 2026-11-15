@@ -110,7 +110,7 @@ def main():
     s, b = request("POST", "/v1/chat/completions", {"messages": [SYSTEM, {"role": "user", "content": "Hello there"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
-    check(bool(b["choices"][0]["message"].get("reasoning_content")), "thinking is on by default")
+    check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off (the default)")
 
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}],
                    "reasoning_effort": "none", "chat_template_kwargs": {"thinking": True}})
