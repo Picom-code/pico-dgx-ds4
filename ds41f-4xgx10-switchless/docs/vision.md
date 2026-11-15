@@ -169,10 +169,17 @@ and video URLs use the same public-address-only fetch rules as images.
 This is visual video analysis through the existing vision tower. Audio tracks are ignored. Streaming
 and non-streaming chat requests both work; video decoding happens before generation starts.
 
-CPU-only decoder tests (PyAV and Pillow required):
+A clip that cannot be used is answered 400 in plain words: `cannot read the video: not a readable
+video` for anything the decoder cannot open (corrupt or truncated files, playlists, other formats),
+`the clip has no video stream`, `video url must be a data: URL or http(s)`, `video URL host H is not
+a public address`, `could not fetch the video from its URL`. The decoder's and the libraries' own
+error text goes to the encoder's log, not to the client.
+
+CPU-only decoder tests (PyAV and Pillow required; `test_video_errors.py` also needs torch, CPU only):
 
 ```bash
 python3 -m unittest discover -s tools/vision -p test_video_frames.py -v
+python3 -m unittest discover -s tools/vision -p test_video_errors.py -v
 ```
 
 For a running endpoint, test a local clip with streaming and non-streaming requests, bad inputs,

@@ -169,21 +169,41 @@ def fetch(record, max_bytes=None, kind="image"):
     return raw
 
 
+def fetch_video(record):
+    """A clip's bytes. Our own refusals (MediaError) go to the client as they are; anything a library
+    raises while fetching or unpacking (urllib's "<urlopen error [Errno -2] ...>", base64's "Incorrect
+    padding", a socket timeout) is logged and replaced by plain words."""
+    from urllib.error import HTTPError
+
+    try:
+        return fetch(record, a.max_video_bytes, "video")
+    except MediaError:
+        raise
+    except HTTPError as e:
+        raise MediaError("could not fetch the video: the server answered HTTP %d" % e.code) from e
+    except Exception as e:  # noqa: BLE001
+        log("video fetch failed:", repr(e))
+        url = record.get("url") or (record.get("source") or {}).get("url") if isinstance(record, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            raise MediaError("could not fetch the video from its URL") from e
+        raise MediaError("the video data is not valid base64") from e
+
+
 def decode_videos(req):
     videos = req.get("videos")
     budget = req.get("frame_budget", a.max_images)
     if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= a.max_images:
-        raise ValueError("invalid video frame budget")
+        raise MediaError("invalid video frame budget")
     if not isinstance(videos, list) or not 1 <= len(videos) <= budget:
-        raise ValueError("not enough frame budget for the videos")
+        raise MediaError("not enough frame budget for the videos")
     results = []
     with _video_lock:
         for record in videos:
             count = record.get("max_frames", 32)
             if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= a.max_images:
-                raise ValueError("max_frames must be an integer between 1 and %d" % a.max_images)
+                raise MediaError("max_frames must be an integer between 1 and %d" % a.max_images)
             count = min(count, budget // len(videos))
-            raw = fetch(record, a.max_video_bytes, "video")
+            raw = fetch_video(record)
             with tempfile.TemporaryDirectory(prefix="vision-video-") as tmp:
                 clip = Path(tmp) / "clip"
                 clip.write_bytes(raw)
@@ -193,13 +213,24 @@ def decode_videos(req):
                         capture_output=True, timeout=a.video_timeout_s, check=False,
                     )
                 except subprocess.TimeoutExpired as e:
-                    raise ValueError("video decoding timed out") from e
+                    raise MediaError("video decoding timed out") from e
+            # The decoder answers in plain words (video_frames.VideoError). Whatever else comes out of the
+            # subprocess (a crash, no JSON, a library's error text on stderr) is logged here and the
+            # client is told the clip is not a readable video.
+            if result.stderr.strip():
+                log("video decoder stderr:", result.stderr[-400:].decode(errors="replace").strip())
             try:
                 decoded = json.loads(result.stdout)
-            except (ValueError, UnicodeError) as e:
-                raise ValueError("video decoder failed") from e
-            if result.returncode or not decoded.get("ok"):
-                raise ValueError("cannot decode video: " + decoded.get("error", "decoder failed"))
+            except (ValueError, UnicodeError):
+                decoded = None
+            if not isinstance(decoded, dict) or result.returncode or not decoded.get("ok"):
+                said = decoded.get("error") if isinstance(decoded, dict) else None
+                if not isinstance(said, str) or not said or result.returncode not in (0, 1):
+                    log("video decoder failed: exit %s, %d B of output" % (result.returncode, len(result.stdout)))
+                    said = "not a readable video"
+                raise MediaError(said)
+            if not isinstance(decoded.get("duration"), (int, float)) or not isinstance(decoded.get("frames"), list):
+                raise MediaError("not a readable video")
             results.append({"duration": decoded["duration"], "frames": decoded["frames"]})
             log(f"video {len(raw)} B, {decoded['duration']:.3f} s -> {len(decoded['frames'])} timestamped frames")
     return results
@@ -290,7 +321,13 @@ class H(socketserver.BaseRequestHandler):
             try:
                 req = json.loads(recv_exact(s, n))
                 if "videos" in req:
-                    hdr, data = {"ok": True, "videos": decode_videos(req)}, b""
+                    try:
+                        hdr, data = {"ok": True, "videos": decode_videos(req)}, b""
+                    except MediaError:
+                        raise
+                    except Exception as e:  # noqa: BLE001  (not one of our refusals: its text stays in the log)
+                        log("video error:", repr(e))
+                        raise MediaError("the video could not be processed") from e
                 else:
                     imgs, data = handle(req)
                     hdr = {"ok": True, "images": imgs}
