@@ -85,7 +85,8 @@ across ranks) and the slot layout are unchanged. Workers are untouched.
 ## Running it
 
 Each chat-completions request accepts up to **100 images across all messages**, including prior
-turns. Image URLs and base64 data URLs are supported. The JSON body limit is 256 MiB; image tokens
+turns. Image URLs and base64 data URLs are supported. The JSON body limit is 64 MiB unless
+`dsfront serve --max-body-mb N` raises it (a larger body is answered 413); image tokens
 and text must together fit the context window. Images are encoded sequentially. The encoder and
 engine frame limits include room for all 100 images' embedding rows. Large image batches take
 longer than single-image requests; the encoder timeout scales with image count to allow URL fetches.

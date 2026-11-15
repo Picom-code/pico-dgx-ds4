@@ -53,7 +53,13 @@ pub struct ServerConfig {
     /// vision: the most rows (image tokens) the images of one request may take together
     /// (--max-image-rows); memory on rank 0's box follows rows, not the number of images
     pub max_image_rows: usize,
+    /// The largest request body taken, in bytes (--max-body-mb); a larger one is answered 413.
+    pub max_body_bytes: usize,
 }
+
+/// The default body limit: 64 MiB, which holds a 1M-token prompt several times over. Image and video
+/// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
 pub struct App {
     pub cfg: ServerConfig,
@@ -109,12 +115,14 @@ impl App {
 }
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
-        .with_state(app)
+    let max_body = app.cfg.max_body_bytes;
+    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    body_limit(routes, max_body).with_state(app)
+}
+
+/// Bodies over `max` bytes are answered 413 before a handler runs.
+fn body_limit<S: Clone + Send + Sync + 'static>(routes: Router<S>, max: usize) -> Router<S> {
+    routes.layer(axum::extract::DefaultBodyLimit::max(max))
 }
 
 fn now_secs() -> u64 {
@@ -997,6 +1005,7 @@ mod tests {
             hold: Duration::from_secs(600),
             vision_addr: None,
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -1046,5 +1055,36 @@ mod tests {
         assert!(p.prompt.ends_with("<｜User｜>hi<｜Assistant｜><think>"));
         assert_eq!((p.max_tokens, p.tools, p.mode), (32768, true, ThinkingMode::Thinking));
         assert_eq!(p.stops, vec!["x".to_string()]);
+    }
+
+    /// POST a body of `len` bytes to a route that takes its body the way the chat route does, behind
+    /// the body limit `max`: the HTTP status.
+    async fn post_status(max: usize, len: usize) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let routes: Router = body_limit(Router::new().route("/v1/chat/completions", post(|body: Bytes| async move { body.len().to_string() })), max);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let _ = s.write_all(&vec![b' '; len]).await; // the server may answer 413 and close before it is all sent
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply).await;
+        server.abort();
+        let reply = String::from_utf8_lossy(&reply);
+        reply.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("no status in {reply:?}"))
+    }
+
+    #[tokio::test]
+    async fn body_over_the_limit_is_413() {
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 64 << 20, "the default stays at 64 MiB; --max-body-mb raises it");
+        assert_eq!(cfg().max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        // a small limit, so the test moves kilobytes: at the limit passes, one byte over is refused
+        assert_eq!(post_status(4096, 4096).await, 200);
+        assert_eq!(post_status(4096, 4097).await, 413);
+        assert_eq!(post_status(4096, 1 << 20).await, 413);
+        // the limit follows the setting
+        assert_eq!(post_status(2 << 20, 1 << 20).await, 200);
     }
 }
