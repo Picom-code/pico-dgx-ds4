@@ -10,10 +10,12 @@ Every row of the span is returned (bf16, 5120 wide): the delimiters are the lear
 image_newline / image_end vectors, the IMAGE slots the aligner rows in reading order. The engine puts
 them in place of the token embeddings at the span's positions (prefill only).
 
-Protocol (TCP, 127.0.0.1 only): request  = u32 len, JSON {"images": [record, ...]}
+Protocol (TCP, 127.0.0.1 only): request  = u32 len, JSON {"images": [record, ...], "max_rows": N}
                                 reply    = u32 len, JSON {"ok", "error", "images": [{rows, hash, ...}]},
                                            u64 len, the rows of every image, bf16, in order.
 A record is what encoding.py's image blocks give: {"url": data-URL | http(s) URL} or {"data": b64}.
+"max_rows" (optional) lowers --max-rows for one request: the cap on the rows of all its images together.
+Over it the reply is {"ok": false, "code": "too_many_rows", "error"} and encoding stops at that image.
 """
 
 import argparse
@@ -38,6 +40,10 @@ p.add_argument("--model", default="/model")
 p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=18950)
 p.add_argument("--max-images", type=int, default=100)
+# The rows (image tokens) of all the images of one request together. Memory follows rows, not the number
+# of images: each row is 10 KiB here, again in the front-end and again in the engine. dsfront sends its
+# own cap (--max-image-rows, the same default) with each request; the lower of the two applies.
+p.add_argument("--max-rows", type=int, default=40000)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
 a = p.parse_args()
@@ -171,16 +177,34 @@ def _encode(raw, vit, aligner, delim):
     return span, (n_vit_h, n_vit_w, n_llm_h, n_llm_w)
 
 
+class TooManyRows(ValueError):
+    """The images of one request take more rows than the cap (the reply's code: too_many_rows)."""
+
+
+def row_limit(req):
+    """The cap on a request's rows in total: --max-rows, or the request's own max_rows when lower."""
+    limit = a.max_rows
+    asked = req.get("max_rows")
+    if isinstance(asked, int) and not isinstance(asked, bool) and asked > 0:
+        limit = min(limit, asked)
+    return limit
+
+
 def handle(req):
     recs = req.get("images") or []
     if not recs or len(recs) > a.max_images:
         raise ValueError("between 1 and %d images per request" % a.max_images)
+    limit, total = row_limit(req), 0
     out, blobs = [], []
     with _lock:
-        for r in recs:
+        for k, r in enumerate(recs, 1):
             t0 = time.time()
             raw = fetch(r)
             span, g = encode(raw)
+            total += span.shape[0]
+            if total > limit:  # stop here: nothing more is encoded or kept for this request
+                raise TooManyRows("at most %d image tokens per request; the first %d of %d images already take %d"
+                                  % (limit, k, len(recs), total))
             torch.cuda.synchronize()
             ms = 1e3 * (time.time() - t0)
             blobs.append(span.view(torch.int16).cpu().numpy().tobytes())
@@ -218,6 +242,8 @@ class H(socketserver.BaseRequestHandler):
             except Exception as e:  # noqa: BLE001  (the error goes back to the client as a 400)
                 log("error:", repr(e))
                 hdr, data = {"ok": False, "error": str(e)[:500]}, b""
+                if isinstance(e, TooManyRows):
+                    hdr["code"] = "too_many_rows"
             _last = time.time()
             j = json.dumps(hdr).encode()
             s.sendall(struct.pack("<I", len(j)) + j + struct.pack("<Q", len(data)) + data)

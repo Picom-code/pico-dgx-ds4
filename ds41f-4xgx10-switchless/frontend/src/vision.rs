@@ -6,6 +6,9 @@
 //!
 //! Wire format (TCP, loopback): request u32 len + JSON {"images": [record, ...]}; reply u32 len + JSON
 //! {"ok", "error", "images": [{"rows", "hash", "grid", "ms", "bytes"}]}, then u64 len + the rows.
+//! The request also carries "max_rows", the cap on the rows of all its images together, so that an
+//! encoder that knows it stops early; the reply's JSON is checked against the cap here before any of
+//! the rows are read.
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -15,8 +18,17 @@ use tokio::net::TcpStream;
 /// `<｜deepseek_image｜>`: the placeholder the chat encoding writes, and the id of every span position.
 pub const IMAGE_TOKEN_ID: u32 = 129264;
 pub const IMAGE_DIM: usize = 5120;
+/// The encoder's JSON reply for images is a few hundred bytes per image.
+const MAX_HEADER: usize = 16 << 20;
 pub const MAX_IMAGES: usize = 100;
 pub const MAX_IMAGE_ROWS: usize = 1100;
+/// The default cap on the rows (image tokens) of all the images of one request (--max-image-rows).
+/// Memory follows rows, not the number of images: a row is 10 KiB here (bf16 x 5120) and again in the
+/// engine, so 100 full-size images (994 rows each) are ~1 GB per copy. 40,000 rows is what 100 images
+/// of ~380 rows, or 40 full-size ones, take.
+pub const DEFAULT_MAX_IMAGE_ROWS: usize = 40_000;
+/// What the engine's frame limit has room for; --max-image-rows cannot be raised past it.
+pub const MAX_TOTAL_IMAGE_ROWS: usize = MAX_IMAGES * MAX_IMAGE_ROWS;
 
 #[derive(Debug, Clone)]
 pub struct Encoded {
@@ -28,38 +40,28 @@ pub struct Encoded {
     pub ms: f64,
 }
 
-pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<Encoded, String> {
-    if records.len() > MAX_IMAGES {
-        return Err(format!("at most {MAX_IMAGES} images per request"));
-    }
-    let t0 = Instant::now();
-    let fut = async {
-        let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
-        let body = json!({ "images": records }).to_string().into_bytes();
-        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
-        s.write_all(&body).await.map_err(|e| e.to_string())?;
-        let mut n4 = [0u8; 4];
-        s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
-        let mut h = vec![0u8; u32::from_le_bytes(n4) as usize];
-        s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
-        let mut n8 = [0u8; 8];
-        s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
-        let n = u64::from_le_bytes(n8) as usize;
-        if n > (MAX_IMAGES * MAX_IMAGE_ROWS * IMAGE_DIM * 2) {
-            return Err("image encoder: reply too large".to_string());
-        }
-        let mut data = vec![0u8; n];
-        s.read_exact(&mut data).await.map_err(|e| format!("image encoder: {e}"))?;
-        let h: Value = serde_json::from_slice(&h).map_err(|e| format!("image encoder: {e}"))?;
-        Ok::<_, String>((h, data))
-    };
-    let (h, data) = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())??;
+/// Whether an error of `encode` is the request's fault (answered 400) rather than the encoder's (503).
+pub fn is_request_error(e: &str) -> bool {
+    e.starts_with("cannot read") || e.starts_with("at most ")
+}
+
+fn too_many_rows(max_rows: usize, total: usize) -> String {
+    format!("at most {max_rows} image tokens per request (--max-image-rows); the images of this request take {total}")
+}
+
+/// The rows and hash of each image from the encoder's reply header, checked against the request and the
+/// cap on its rows in total. Nothing of the rows themselves has been read or allocated at this point.
+fn spans(h: &Value, n_records: usize, max_rows: usize) -> Result<(Vec<u32>, Vec<u64>), String> {
     if h.get("ok").and_then(Value::as_bool) != Some(true) {
         let e = h.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        // an encoder that knows the cap stops at the image that crosses it
+        if h.get("code").and_then(Value::as_str) == Some("too_many_rows") && e.starts_with("at most ") {
+            return Err(e.to_string());
+        }
         return Err(format!("cannot read the image: {e}"));
     }
     let imgs = h.get("images").and_then(Value::as_array).ok_or("image encoder: no images in its reply")?;
-    if imgs.len() != records.len() {
+    if imgs.len() != n_records {
         return Err("image encoder: wrong number of images".into());
     }
     let mut rows = Vec::new();
@@ -73,9 +75,47 @@ pub async fn encode(addr: &str, records: &[Value], timeout: Duration) -> Result<
         hashes.push(i.get("hash").and_then(Value::as_u64).unwrap_or(0));
     }
     let total: usize = rows.iter().map(|&r| r as usize).sum();
-    if data.len() != total * IMAGE_DIM * 2 {
-        return Err("image encoder: the rows do not match the spans".into());
+    if total > max_rows {
+        return Err(too_many_rows(max_rows, total));
     }
+    Ok((rows, hashes))
+}
+
+/// The images' rows from the encoder. `max_rows` caps the rows of all the images together: over it the
+/// request is refused (an error that `is_request_error`) before any row is read from the encoder.
+pub async fn encode(addr: &str, records: &[Value], timeout: Duration, max_rows: usize) -> Result<Encoded, String> {
+    if records.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per request"));
+    }
+    let max_rows = max_rows.min(MAX_TOTAL_IMAGE_ROWS);
+    let t0 = Instant::now();
+    let fut = async {
+        let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
+        let body = json!({ "images": records, "max_rows": max_rows }).to_string().into_bytes();
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
+        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        let mut n4 = [0u8; 4];
+        s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
+        let header_len = u32::from_le_bytes(n4) as usize;
+        if header_len > MAX_HEADER {
+            return Err("image encoder: JSON reply too large".to_string());
+        }
+        let mut h = vec![0u8; header_len];
+        s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
+        let h: Value = serde_json::from_slice(&h).map_err(|e| format!("image encoder: {e}"))?;
+        // the spans, and the cap on their rows, before the rows: a refused request reads and allocates none
+        let (rows, hashes) = spans(&h, records.len(), max_rows)?;
+        let total: usize = rows.iter().map(|&r| r as usize).sum();
+        let mut n8 = [0u8; 8];
+        s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
+        if u64::from_le_bytes(n8) != (total * IMAGE_DIM * 2) as u64 {
+            return Err("image encoder: the rows do not match the spans".to_string());
+        }
+        let mut data = vec![0u8; total * IMAGE_DIM * 2];
+        s.read_exact(&mut data).await.map_err(|e| format!("image encoder: {e}"))?;
+        Ok::<_, String>((rows, hashes, data))
+    };
+    let (rows, hashes, data) = tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())??;
     Ok(Encoded { rows, hashes, data, ms: t0.elapsed().as_secs_f64() * 1e3 })
 }
 
@@ -125,5 +165,112 @@ mod tests {
         assert_eq!(st, vec![2, 6]);
         assert!(ids[2..5].iter().all(|&t| t == IMAGE_TOKEN_ID) && ids[5] == 6);
         assert!(expand(&[IMAGE_TOKEN_ID], &[3, 3]).is_err());
+    }
+
+    /// A stand-in for tools/vision/vision_encoder.py: answers one request with `reply`, then the rows
+    /// of its images (zeros) when `send_rows`; otherwise it sends nothing more and keeps the connection
+    /// open. Returns its address and, when it is done, the request it was sent.
+    pub(crate) async fn fake_encoder(reply: Value, send_rows: bool) -> (String, tokio::task::JoinHandle<Value>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut n4 = [0u8; 4];
+            s.read_exact(&mut n4).await.unwrap();
+            let mut body = vec![0u8; u32::from_le_bytes(n4) as usize];
+            s.read_exact(&mut body).await.unwrap();
+            let hdr = reply.to_string().into_bytes();
+            s.write_all(&(hdr.len() as u32).to_le_bytes()).await.unwrap();
+            s.write_all(&hdr).await.unwrap();
+            if send_rows {
+                let rows: u64 = reply["images"].as_array().map_or(0, |a| a.iter().map(|i| i["rows"].as_u64().unwrap()).sum());
+                let n = rows as usize * IMAGE_DIM * 2;
+                s.write_all(&(n as u64).to_le_bytes()).await.unwrap();
+                let _ = s.write_all(&vec![0u8; n]).await;
+            } else {
+                // the client must answer from the header alone: nothing else ever comes
+                let _ = s.read(&mut [0u8; 1]).await;
+            }
+            serde_json::from_slice(&body).unwrap()
+        });
+        (addr, h)
+    }
+
+    pub(crate) fn reply_with_rows(rows: &[u32]) -> Value {
+        json!({"ok": true, "images": rows.iter().enumerate().map(|(i, r)| json!({"rows": r, "hash": i})).collect::<Vec<_>>()})
+    }
+
+    fn records(n: usize) -> Vec<Value> {
+        vec![json!({"url": "data:image/png;base64,AAAA"}); n]
+    }
+
+    const T: Duration = Duration::from_secs(20);
+
+    #[tokio::test]
+    async fn hundred_small_images_pass() {
+        // 100 images of 383 rows (a 768 x 768 picture) are 38,300 rows: under the default cap
+        let rows = vec![383u32; 100];
+        assert!(rows.iter().sum::<u32>() as usize <= DEFAULT_MAX_IMAGE_ROWS);
+        let (h, _) = spans(&reply_with_rows(&rows), 100, DEFAULT_MAX_IMAGE_ROWS).unwrap();
+        assert_eq!(h, rows);
+        // and end to end with the stand-in encoder (short spans, so the test moves 3 MB rather than 392)
+        let (addr, enc) = fake_encoder(reply_with_rows(&[3; 100]), true).await;
+        let e = encode(&addr, &records(100), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap();
+        assert_eq!((e.rows.len(), e.data.len()), (100, 300 * IMAGE_DIM * 2));
+        let sent = enc.await.unwrap();
+        assert_eq!(sent["max_rows"], DEFAULT_MAX_IMAGE_ROWS, "the encoder is told the cap");
+        assert_eq!(sent["images"].as_array().unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn rows_over_the_cap_are_refused_before_any_row_is_read() {
+        // 41 full-size images (994 rows each) are 40,754 rows: over the default cap of 40,000
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[994; 41]), false).await;
+        let t0 = Instant::now();
+        let e = encode(&addr, &records(41), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images of this request take 40754");
+        assert!(is_request_error(&e), "answered 400, not 503");
+        assert!(t0.elapsed() < Duration::from_secs(5), "refused from the reply's header, without waiting for rows");
+        // 40 of them are exactly 39,760: allowed
+        assert!(spans(&reply_with_rows(&[994; 40]), 40, DEFAULT_MAX_IMAGE_ROWS).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_a_setting() {
+        // exactly at the cap passes, one row over does not
+        assert!(spans(&reply_with_rows(&[3, 4, 5]), 3, 12).is_ok());
+        assert!(spans(&reply_with_rows(&[3, 4, 5]), 3, 11).unwrap_err().starts_with("at most 11 image tokens"));
+        // raised, 100 full-size images fit; the engine's frame limit is the ceiling whatever is asked
+        assert!(spans(&reply_with_rows(&[994; 100]), 100, MAX_TOTAL_IMAGE_ROWS).is_ok());
+        let (addr, enc) = fake_encoder(reply_with_rows(&[3]), true).await;
+        encode(&addr, &records(1), T, usize::MAX).await.unwrap();
+        assert_eq!(enc.await.unwrap()["max_rows"], MAX_TOTAL_IMAGE_ROWS);
+        assert!(MAX_TOTAL_IMAGE_ROWS * IMAGE_DIM * 2 + (8 << 20) <= crate::protocol::MAX_FRAME);
+    }
+
+    #[tokio::test]
+    async fn errors_are_sorted_into_the_requests_and_the_encoders() {
+        // an encoder that knows the cap stops early and says so: the request's fault
+        let stop = json!({"ok": false, "code": "too_many_rows", "error": "at most 40000 image tokens per request; the first 41 of 100 images already take 40754"});
+        let (addr, _enc) = fake_encoder(stop, false).await;
+        let e = encode(&addr, &records(100), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.starts_with("at most 40000 image tokens") && is_request_error(&e), "{e}");
+        // an unreadable image: the request's fault, as before
+        let (addr, _enc) = fake_encoder(json!({"ok": false, "error": "cannot identify image file"}), false).await;
+        let e = encode(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, "cannot read the image: cannot identify image file");
+        assert!(is_request_error(&e));
+        // more than 100 images never reaches the encoder
+        let e = encode("127.0.0.1:1", &records(101), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert_eq!(e, "at most 100 images per request");
+        // a broken or absent encoder is not the request's fault
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[3, 3]), true).await;
+        let e = encode(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(!is_request_error(&e), "{e}");
+        let (addr, _enc) = fake_encoder(reply_with_rows(&[2000]), true).await;
+        assert!(!is_request_error(&encode(&addr, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err()));
+        let gone = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+        let e = encode(&gone, &records(1), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
+        assert!(e.starts_with("the image encoder is not reachable") && !is_request_error(&e), "{e}");
     }
 }

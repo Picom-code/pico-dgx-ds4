@@ -50,6 +50,9 @@ pub struct ServerConfig {
     pub hold: Duration,
     /// vision: the image encoder's address (host:port); None: image input is refused as before
     pub vision_addr: Option<String>,
+    /// vision: the most rows (image tokens) the images of one request may take together
+    /// (--max-image-rows); memory on rank 0's box follows rows, not the number of images
+    pub max_image_rows: usize,
 }
 
 pub struct App {
@@ -742,8 +745,8 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     };
     // Each URL fetch can take 20 s; allow a full 100-image request to finish encoding.
     let image_timeout = Duration::from_secs(90 + 20 * p.images.len().saturating_sub(1) as u64);
-    let enc = crate::vision::encode(&addr, &p.images, image_timeout).await.map_err(|e| {
-        if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
+    let enc = crate::vision::encode(&addr, &p.images, image_timeout, app.cfg.max_image_rows).await.map_err(|e| {
+        if crate::vision::is_request_error(&e) { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
     })?;
     let ids = {
         let (app2, text) = (app.clone(), p.prompt.clone());
@@ -993,6 +996,7 @@ mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
         }
     }
 

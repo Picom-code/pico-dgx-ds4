@@ -32,6 +32,9 @@ fn usage() -> ! {
       --table-days N            sessions unused for longer are not kept: 7
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
+      --max-image-rows N        the most image tokens (embedding rows) the images of one request may
+                                take together: 40000; more is answered 400. Memory on rank 0's box
+                                follows rows, not the number of images (docs/vision.md); at most 110000
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -120,6 +123,7 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
+        max_image_rows: max_image_rows(args),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
@@ -235,6 +239,17 @@ fn mock_engine(args: &[String]) {
         eprintln!("mock engine: {e}");
         std::process::exit(1);
     }
+}
+
+/// --max-image-rows: 1 to what the engine's frame has room for (100 images of 1100 rows).
+fn max_image_rows(args: &[String]) -> usize {
+    use dsfront::vision::{DEFAULT_MAX_IMAGE_ROWS, MAX_TOTAL_IMAGE_ROWS};
+    let n = parse_opt(args, "--max-image-rows", DEFAULT_MAX_IMAGE_ROWS);
+    if !(1..=MAX_TOTAL_IMAGE_ROWS).contains(&n) {
+        eprintln!("bad value for --max-image-rows: {n} (1 to {MAX_TOTAL_IMAGE_ROWS})");
+        std::process::exit(2);
+    }
+    n
 }
 
 fn opt(args: &[String], name: &str) -> Option<String> {
