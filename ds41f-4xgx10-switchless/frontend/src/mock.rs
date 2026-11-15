@@ -145,6 +145,14 @@ async fn generate(s: Submit, cancel: Arc<AtomicBool>, tx: &mpsc::UnboundedSender
         let _ = tx.send(Frame::Done(done).encode());
         return;
     }
+    // vision: a request with images is taken when its image part is what rank 0 takes (the frame was
+    // checked when it was decoded; here, that the spans sit on the prompt's image placeholders). The
+    // rows themselves are not used: the mock's answer does not depend on them.
+    if let Err(e) = s.image_spans() {
+        done.error = format!("bad request: {e}");
+        let _ = tx.send(Frame::Done(done).encode());
+        return;
+    }
     let cached = {
         let ss = sessions.lock().unwrap();
         let hist = ss.get(&s.session_id).or_else(|| if s.base_session_id != 0 { ss.get(&s.base_session_id) } else { None });

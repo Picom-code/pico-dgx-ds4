@@ -155,6 +155,10 @@ reasoning when the prompt ends in `<think>`, a short answer that quotes the last
 tool result, and a DSML tool call when the last user message contains `MOCK_TOOL <name> <json
 arguments>`. `MOCK_LOOP` makes it repeat itself (to test the loop guard) and `MOCK_LONG <n>`
 streams n filler tokens.
+A `SUBMIT` with images (`FLAG_IMAGES`) is taken under the checks rank 0 applies to its image part
+(1 to 100 spans of 3 to 1100 rows, exactly the spans' rows after them) and with its spans on the
+prompt's image placeholders; the rows themselves do not change the scripted answer. With a stand-in
+for the image encoder this tests image requests end to end without a GPU.
 
 [`engine/common/frontend_echo_engine.cpp`](../engine/common/frontend_echo_engine.cpp) is the same
 loop on the C++ side, written against `frontend_protocol.h` alone: it answers each `SUBMIT` with the
