@@ -121,9 +121,13 @@ def load():
     return _model
 
 
-def _public(host):
+class MediaError(ValueError):
+    """A request's image or video cannot be taken; the message is ours and goes to the client as it is."""
+
+
+def _public(host, kind="image"):
     """Only public addresses are fetched (no loopback, private, link-local or reserved: no SSRF into the
-    cluster); VISION_ALLOW_PRIVATE=1 lifts it for tests."""
+    cluster); VISION_ALLOW_PRIVATE=1 lifts it for tests. `kind` names the input in the message."""
     import ipaddress
 
     if os.environ.get("VISION_ALLOW_PRIVATE", "0") == "1":
@@ -131,11 +135,12 @@ def _public(host):
     for fam, _, _, _, sa in socket.getaddrinfo(host, None):
         ip = ipaddress.ip_address(sa[0])
         if not ip.is_global or ip.is_multicast:
-            raise ValueError("image URL host %s is not a public address" % host)
+            raise MediaError("%s URL host %s is not a public address" % (kind, host))
 
 
-def fetch(record, max_bytes=None):
-    """Image bytes from a record (image_processor.load_image_bytes, with a size cap for URLs)."""
+def fetch(record, max_bytes=None, kind="image"):
+    """Image (or, for kind "video", clip) bytes from a record (image_processor.load_image_bytes, with a
+    size cap for URLs). The messages name the input by `kind`."""
     limit = a.max_bytes if max_bytes is None else max_bytes
     url = record.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
@@ -144,23 +149,23 @@ def fetch(record, max_bytes=None):
 
         class Redir(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                _public(urlsplit(newurl).hostname or "")
+                _public(urlsplit(newurl).hostname or "", kind)
                 return super().redirect_request(req, fp, code, msg, hdrs, newurl)
 
-        _public(urlsplit(url).hostname or "")
+        _public(urlsplit(url).hostname or "", kind)
         with build_opener(Redir).open(Request(url, headers={"User-Agent": "dsgx10-vision/1"}), timeout=20) as r:
             b = r.read(limit + 1)
         if len(b) > limit:
-            raise ValueError("media larger than %d bytes" % limit)
+            raise MediaError("%s larger than %d bytes" % (kind, limit))
         return b
     if isinstance(url, str) and url and not url.startswith("data:"):
-        raise ValueError("image url must be a data: URL or http(s)")  # no local paths over the API
+        raise MediaError("%s url must be a data: URL or http(s)" % kind)  # no local paths over the API
     src = record.get("source")
     if isinstance(src, dict) and src.get("url") and not src.get("data"):
-        return fetch({"url": src["url"]}, limit)
+        return fetch({"url": src["url"]}, limit, kind)
     raw = ip.load_image_bytes(record)
     if len(raw) > limit:
-        raise ValueError("media larger than %d bytes" % limit)
+        raise MediaError("%s larger than %d bytes" % (kind, limit))
     return raw
 
 
@@ -178,7 +183,7 @@ def decode_videos(req):
             if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= a.max_images:
                 raise ValueError("max_frames must be an integer between 1 and %d" % a.max_images)
             count = min(count, budget // len(videos))
-            raw = fetch(record, a.max_video_bytes)
+            raw = fetch(record, a.max_video_bytes, "video")
             with tempfile.TemporaryDirectory(prefix="vision-video-") as tmp:
                 clip = Path(tmp) / "clip"
                 clip.write_bytes(raw)
