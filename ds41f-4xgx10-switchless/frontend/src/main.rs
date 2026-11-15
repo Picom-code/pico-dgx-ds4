@@ -32,6 +32,13 @@ fn usage() -> ! {
       --table-days N            sessions unused for longer are not kept: 7
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
+      --max-body-mb N           the largest request body taken, in MiB: 64; a larger one is answered
+                                413. Raise it for requests that carry many large images or video
+                                inline; a body costs several times its size in memory while its
+                                request is prepared (docs/vision.md)
+      --max-image-rows N        the most image tokens (embedding rows) the images of one request may
+                                take together: 40000; more is answered 400. Memory on rank 0's box
+                                follows rows, not the number of images (docs/vision.md); at most 110000
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -120,6 +127,8 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
+        max_image_rows: max_image_rows(args),
+        max_body_bytes: max_body_bytes(args),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
@@ -244,6 +253,45 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 /// Every value of a repeatable option.
 fn opts(args: &[String], name: &str) -> Vec<String> {
     args.iter().enumerate().filter(|(_, a)| *a == name).filter_map(|(i, _)| args.get(i + 1).cloned()).collect()
+}
+
+/// --max-body-mb: the body limit in bytes (64 MiB unless raised).
+fn max_body_bytes(args: &[String]) -> usize {
+    let default_mb = dsfront::server::DEFAULT_MAX_BODY_BYTES >> 20;
+    let mb = parse_opt(args, "--max-body-mb", default_mb);
+    if !(1..=4096).contains(&mb) {
+        eprintln!("bad value for --max-body-mb: {mb} (1 to 4096)");
+        std::process::exit(2);
+    }
+    mb << 20
+}
+
+/// --max-image-rows: 1 to what the engine's frame has room for (100 images of 1100 rows).
+fn max_image_rows(args: &[String]) -> usize {
+    use dsfront::vision::{DEFAULT_MAX_IMAGE_ROWS, MAX_TOTAL_IMAGE_ROWS};
+    let n = parse_opt(args, "--max-image-rows", DEFAULT_MAX_IMAGE_ROWS);
+    if !(1..=MAX_TOTAL_IMAGE_ROWS).contains(&n) {
+        eprintln!("bad value for --max-image-rows: {n} (1 to {MAX_TOTAL_IMAGE_ROWS})");
+        std::process::exit(2);
+    }
+    n
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::{max_body_bytes, max_image_rows};
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn request_limits() {
+        assert_eq!(max_body_bytes(&args("dsfront serve")), 64 << 20, "the body limit is 64 MiB unless raised");
+        assert_eq!(max_body_bytes(&args("dsfront serve --max-body-mb 256")), 256 << 20);
+        assert_eq!(max_image_rows(&args("dsfront serve")), 40_000);
+        assert_eq!(max_image_rows(&args("dsfront serve --max-image-rows 99400")), 99_400);
+    }
 }
 
 fn load_tokenizer(args: &[String]) -> Tokenizer {

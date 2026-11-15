@@ -9,6 +9,9 @@ pub const DEFAULT_SOCKET: &str = "/tmp/dsgb10-engine.sock";
 /// Up to 100 image spans, plus room for a 1M-token prompt and framing.
 pub const MAX_FRAME: usize = crate::vision::MAX_IMAGES * crate::vision::MAX_IMAGE_ROWS * crate::vision::IMAGE_DIM * 2 + (8 << 20);
 
+/// A SUBMIT's fields before stop_ids[] (docs/protocol.md).
+const SUBMIT_FIXED: usize = 72;
+
 pub const T_HELLO: u16 = 0x01;
 pub const T_SUBMIT: u16 = 0x02;
 pub const T_CANCEL: u16 = 0x03;
@@ -64,6 +67,30 @@ pub struct Submit {
     pub prompt: Vec<u32>,
     /// vision: the image part after prompt[] (with FLAG_IMAGES); None for text
     pub images: Option<Vec<u8>>,
+}
+
+impl Submit {
+    /// The image part's spans, (start, rows, hash) each, checked against the prompt: every span lies
+    /// within it, on image placeholders, in order and without overlap. Empty for a text request.
+    pub fn image_spans(&self) -> Result<Vec<(u32, u32, u64)>, String> {
+        let Some(part) = &self.images else { return Ok(Vec::new()) };
+        let n = u32::from_le_bytes(part.get(..4).ok_or("image part too short")?.try_into().unwrap()) as usize;
+        let table = part.get(4..4 + 16 * n).ok_or("image part too short")?;
+        let mut spans = Vec::with_capacity(n);
+        let mut end = 0usize;
+        for t in table.chunks_exact(16) {
+            let start = u32::from_le_bytes(t[..4].try_into().unwrap());
+            let rows = u32::from_le_bytes(t[4..8].try_into().unwrap());
+            let hash = u64::from_le_bytes(t[8..].try_into().unwrap());
+            let (a, b) = (start as usize, start as usize + rows as usize);
+            if a < end || b > self.prompt.len() || self.prompt[a..b].iter().any(|&id| id != crate::vision::IMAGE_TOKEN_ID) {
+                return Err(format!("image span {start}+{rows} is not on image placeholders of the prompt"));
+            }
+            end = b;
+            spans.push((start, rows, hash));
+        }
+        Ok(spans)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +185,8 @@ impl Frame {
             }
             Frame::Submit(s) => {
                 let mut w = W::new(T_SUBMIT);
+                // the whole frame at once: growing by doubling would hold up to twice an image part
+                w.0.reserve_exact(SUBMIT_FIXED + 4 * (s.stop_ids.len() + s.prompt.len()) + s.images.as_ref().map_or(0, Vec::len));
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
@@ -238,6 +267,29 @@ impl Frame {
                 r.u32()?;
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
+                // vision: the image part, taken only when it is laid out as rank 0 requires it
+                // (engine/server/serve.cpp): u32 n, n spans, then exactly the spans' rows
+                let images = if flags & FLAG_IMAGES != 0 {
+                    let part = &r.p[r.i..];
+                    let n = r.u32()? as usize;
+                    if !(1..=crate::vision::MAX_IMAGES).contains(&n) {
+                        return Err(format!("SUBMIT with {n} images"));
+                    }
+                    let mut rows = 0usize;
+                    for _ in 0..n {
+                        r.u32()?; // start
+                        let span = r.u32()? as usize;
+                        r.u64()?; // hash
+                        if !(3..=crate::vision::MAX_IMAGE_ROWS).contains(&span) {
+                            return Err(format!("SUBMIT with an image span of {span} rows"));
+                        }
+                        rows += span;
+                    }
+                    r.bytes(rows * crate::vision::IMAGE_DIM * 2).map_err(|_| "SUBMIT: the image rows do not match the spans".to_string())?;
+                    Some(part[..part.len() - (r.p.len() - r.i)].to_vec())
+                } else {
+                    None
+                };
                 Frame::Submit(Submit {
                     req_id,
                     session_id,
@@ -252,7 +304,7 @@ impl Frame {
                     prefix_hint,
                     stop_ids,
                     prompt,
-                    images: None,
+                    images,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -354,6 +406,83 @@ pub async fn read_frame<Rd: AsyncRead + Unpin>(rd: &mut Rd) -> std::io::Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submit_with_images_is_one_allocation() {
+        let img = vec![7u8; 4 + 16 + 3 * crate::vision::IMAGE_DIM * 2];
+        let s = Submit {
+            req_id: 1,
+            session_id: 2,
+            base_session_id: 0,
+            seed: 0,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_new_tokens: 8,
+            flags: FLAG_IMAGES,
+            n_top_logprobs: 0,
+            prefix_hint: 0,
+            stop_ids: vec![1, 2],
+            prompt: vec![5; 1000],
+            images: Some(img.clone()),
+        };
+        let b = Frame::Submit(s).encode();
+        let want = 8 + SUBMIT_FIXED + 4 * 2 + 4 * 1000 + img.len();
+        assert_eq!((b.len(), b.capacity()), (want, want), "sized once, not grown by doubling");
+        assert_eq!(u32::from_le_bytes(b[..4].try_into().unwrap()) as usize, want - 8);
+        assert!(b[want - img.len()..] == img[..], "the image part follows prompt[] unchanged");
+    }
+
+    /// The mock engine takes a SUBMIT's image part under the checks rank 0 applies (serve.cpp).
+    #[test]
+    fn image_part_roundtrip_and_checks() {
+        use crate::vision::{Encoded, IMAGE_DIM, IMAGE_TOKEN_ID};
+        let rows = vec![3u32, 4];
+        let n = 7 * IMAGE_DIM * 2;
+        let mut data = vec![0u8; 4 + 16 * 2 + n];
+        data[4 + 16 * 2..].iter_mut().enumerate().for_each(|(i, b)| *b = (i % 251) as u8);
+        let part = crate::vision::payload(&[1, 5], Encoded { rows, hashes: vec![11, 22], data, ms: 0.0 });
+        let mut prompt = vec![0u32; 10];
+        prompt[1..4].fill(IMAGE_TOKEN_ID);
+        prompt[5..9].fill(IMAGE_TOKEN_ID);
+        let s = Submit {
+            req_id: 1,
+            session_id: 2,
+            base_session_id: 0,
+            seed: 0,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            max_new_tokens: 8,
+            flags: FLAG_IMAGES,
+            n_top_logprobs: 0,
+            prefix_hint: 0,
+            stop_ids: vec![1],
+            prompt,
+            images: Some(part.clone()),
+        };
+        let b = Frame::Submit(s.clone()).encode();
+        assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s.clone()));
+        assert_eq!(s.image_spans().unwrap(), vec![(1, 3, 11), (5, 4, 22)]);
+        // what rank 0 refuses, the mock refuses: a row short, a row over, no images, a span out of range
+        let with = |part: Vec<u8>| Frame::decode(T_SUBMIT, &Frame::Submit(Submit { images: Some(part), ..s.clone() }).encode()[8..], |_| 0);
+        assert!(with(part[..part.len() - 2].to_vec()).is_err());
+        assert!(with([part.clone(), vec![0, 0]].concat()).is_err());
+        let mut none = part.clone();
+        none[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(with(none).is_err());
+        let mut short = part.clone();
+        short[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(with(short).is_err());
+        // a text SUBMIT must not carry extra bytes, as before
+        let mut text = Frame::Submit(Submit { flags: 0, images: None, ..s.clone() }).encode();
+        text.extend_from_slice(&[0; 4]);
+        assert!(Frame::decode(T_SUBMIT, &text[8..], |_| 0).is_err());
+        // spans must sit on image placeholders of the prompt
+        let mut off = s.clone();
+        off.prompt[1] = 0;
+        assert!(off.image_spans().is_err());
+    }
 
     #[test]
     fn roundtrip_and_layout() {

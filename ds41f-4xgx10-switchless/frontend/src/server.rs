@@ -50,7 +50,16 @@ pub struct ServerConfig {
     pub hold: Duration,
     /// vision: the image encoder's address (host:port); None: image input is refused as before
     pub vision_addr: Option<String>,
+    /// vision: the most rows (image tokens) the images of one request may take together
+    /// (--max-image-rows); memory on rank 0's box follows rows, not the number of images
+    pub max_image_rows: usize,
+    /// The largest request body taken, in bytes (--max-body-mb); a larger one is answered 413.
+    pub max_body_bytes: usize,
 }
+
+/// The default body limit: 64 MiB, which holds a 1M-token prompt several times over. Image and video
+/// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
 pub struct App {
     pub cfg: ServerConfig,
@@ -106,12 +115,14 @@ impl App {
 }
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024))
-        .with_state(app)
+    let max_body = app.cfg.max_body_bytes;
+    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    body_limit(routes, max_body).with_state(app)
+}
+
+/// Bodies over `max` bytes are answered 413 before a handler runs.
+fn body_limit<S: Clone + Send + Sync + 'static>(routes: Router<S>, max: usize) -> Router<S> {
+    routes.layer(axum::extract::DefaultBodyLimit::max(max))
 }
 
 fn now_secs() -> u64 {
@@ -742,8 +753,8 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     };
     // Each URL fetch can take 20 s; allow a full 100-image request to finish encoding.
     let image_timeout = Duration::from_secs(90 + 20 * p.images.len().saturating_sub(1) as u64);
-    let enc = crate::vision::encode(&addr, &p.images, image_timeout).await.map_err(|e| {
-        if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
+    let enc = crate::vision::encode(&addr, &p.images, image_timeout, app.cfg.max_image_rows).await.map_err(|e| {
+        if crate::vision::is_request_error(&e) { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
     })?;
     let ids = {
         let (app2, text) = (app.clone(), p.prompt.clone());
@@ -752,6 +763,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
     let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
+    let (n_images, n_rows, encoder_ms) = (enc.rows.len(), enc.rows.iter().sum::<u32>(), enc.ms);
     let ctx = info.max_context as usize;
     if ids.len() >= ctx {
         return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
@@ -776,14 +788,11 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         prefix_hint: 0,
         stop_ids: stop_ids.clone(),
         prompt: ids.clone(),
-        images: Some(crate::vision::payload(&starts, &enc)),
+        images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
     };
     let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
     eprintln!(
-        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; session {session_id} (not kept)",
-        enc.rows.len(),
-        enc.rows.iter().sum::<u32>(),
-        enc.ms,
+        "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
         ids.len()
     );
     Ok(Gen {
@@ -817,6 +826,9 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
     };
+    // A request with inline images is megabytes: each copy is freed when its last reader is done,
+    // rather than held until the answer ends. The body's bytes are not needed once parsed.
+    drop(body);
     if let Err(e) = crate::video::expand(&mut req, app.cfg.vision_addr.as_deref()).await {
         return if e.starts_with("cannot read") { bad_request(e) } else { error(StatusCode::SERVICE_UNAVAILABLE, "server_error", e) };
     }
@@ -824,6 +836,8 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         Ok(p) => p,
         Err(e) => return bad_request(e),
     };
+    // The parsed request is only read again by --dump-dir's record.
+    let req = if app.cfg.dump_dir.is_some() { req } else { Value::Null };
     // While the engine is down (the ring lent to a job, or a restart) a request waits at the gate. A
     // stream that has to wait starts at once and carries comments meanwhile, so that its client's
     // timeout sees bytes; refused, it ends with an error event. Anything else waits here, refused with
@@ -996,6 +1010,8 @@ mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -1045,5 +1061,36 @@ mod tests {
         assert!(p.prompt.ends_with("<｜User｜>hi<｜Assistant｜><think>"));
         assert_eq!((p.max_tokens, p.tools, p.mode), (32768, true, ThinkingMode::Thinking));
         assert_eq!(p.stops, vec!["x".to_string()]);
+    }
+
+    /// POST a body of `len` bytes to a route that takes its body the way the chat route does, behind
+    /// the body limit `max`: the HTTP status.
+    async fn post_status(max: usize, len: usize) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let routes: Router = body_limit(Router::new().route("/v1/chat/completions", post(|body: Bytes| async move { body.len().to_string() })), max);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let _ = s.write_all(&vec![b' '; len]).await; // the server may answer 413 and close before it is all sent
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply).await;
+        server.abort();
+        let reply = String::from_utf8_lossy(&reply);
+        reply.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("no status in {reply:?}"))
+    }
+
+    #[tokio::test]
+    async fn body_over_the_limit_is_413() {
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 64 << 20, "the default stays at 64 MiB; --max-body-mb raises it");
+        assert_eq!(cfg().max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        // a small limit, so the test moves kilobytes: at the limit passes, one byte over is refused
+        assert_eq!(post_status(4096, 4096).await, 200);
+        assert_eq!(post_status(4096, 4097).await, 413);
+        assert_eq!(post_status(4096, 1 << 20).await, 413);
+        // the limit follows the setting
+        assert_eq!(post_status(2 << 20, 1 << 20).await, 200);
     }
 }

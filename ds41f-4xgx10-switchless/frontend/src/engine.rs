@@ -67,12 +67,15 @@ impl EngineClient {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut c = self.inner.conn.lock().unwrap();
         let wtx = c.tx.clone().ok_or("engine not connected")?;
-        c.pending.insert(s.req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
-        if wtx.send(Frame::Submit(s.clone()).encode()).is_err() {
-            c.pending.remove(&s.req_id);
+        let req_id = s.req_id;
+        c.pending.insert(req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
+        // encoded from the request itself, which is dropped with it: a request with images carries their
+        // rows (10 KiB each), and a clone here was one more copy of them
+        if wtx.send(Frame::Submit(s).encode()).is_err() {
+            c.pending.remove(&req_id);
             return Err("engine not connected".into());
         }
-        Ok((s.req_id, rx))
+        Ok((req_id, rx))
     }
 
     pub fn cancel(&self, req_id: u64) {
