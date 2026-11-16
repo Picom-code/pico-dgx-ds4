@@ -51,7 +51,10 @@ ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temper
 
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
 // wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
-// (test_kernels rows16 checks fused == unfused). DSGB10_FUSED16=1 restores the fused prologues.
+// (test_kernels rows16 checks fused == unfused) when the rmsnorm runs with the fused call's CTA
+// (dsk::norm_threads): a row's 1/rms depends on the threads summing its squares, and at rmsnorm's default (D/8:
+// 640 for attn_norm and ffn_norm, against the GEMVs' 256) a batch step of 9..16 rows computed its rows other
+// than at 8 rows or fewer. DSGB10_FUSED16=1 restores the fused prologues.
 bool unfused16() {
   static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
   return u;
@@ -587,7 +590,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemm_fp8_p(yq, ys, R, seg, 2, kDim, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
-    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st, dsk::norm_threads(c8k));  // the fused call's sums
     dsk::gemv_fp8_multi(yq, ys, R, seg, 2, kDim, c8k, st);  // c8k: the fused call's split-K, same bits
   } else {
     dsk::gemv_fp8_norm(yraw, w.attn_norm, kNormEps, R, seg, 2, kDim, c8k, st, y);
@@ -634,7 +637,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
     dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);
     dsk::gemm_fp8_p(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
-    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);  // o: scratch for the bf16 copy
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st, dsk::norm_threads(c8k));  // o: scratch for the bf16 copy
     dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
   } else {
     dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
@@ -717,7 +720,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
-    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st, dsk::norm_threads(cgate));  // the fused call's sums
     dsk::gemv_bf16(y, R, w.gate, kExperts, kDim, gl, nullptr, cgate, false, st);
   } else {
     dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
