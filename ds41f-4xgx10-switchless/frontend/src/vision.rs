@@ -30,6 +30,76 @@ pub const DEFAULT_MAX_IMAGE_ROWS: usize = 40_000;
 /// What the engine's frame limit has room for; --max-image-rows cannot be raised past it.
 pub const MAX_TOTAL_IMAGE_ROWS: usize = MAX_IMAGES * MAX_IMAGE_ROWS;
 
+/// The default for --max-image-rows-in-flight: two requests at the default request cap.
+pub const DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT: usize = 2 * DEFAULT_MAX_IMAGE_ROWS;
+
+/// The most rows `n_images` images can take, before the encoder has said what they do take:
+/// MAX_IMAGE_ROWS each, and no more than the request cap (over it the request is refused anyway).
+pub fn rows_estimate(n_images: usize, max_rows: usize) -> usize {
+    (n_images * MAX_IMAGE_ROWS).min(max_rows.min(MAX_TOTAL_IMAGE_ROWS))
+}
+
+/// The rows held by the image requests in flight, against a limit (server.rs `hold_image_rows`).
+#[derive(Debug)]
+pub struct RowsInFlight {
+    max: usize,
+    held: std::sync::Mutex<usize>,
+}
+
+/// One request's share of the rows in flight; dropping it gives the rows back.
+#[derive(Debug)]
+pub struct RowsHeld {
+    budget: std::sync::Arc<RowsInFlight>,
+    rows: std::sync::Mutex<usize>,
+}
+
+impl RowsInFlight {
+    pub fn new(max: usize) -> std::sync::Arc<RowsInFlight> {
+        std::sync::Arc::new(RowsInFlight { max, held: std::sync::Mutex::new(0) })
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    pub fn in_flight(&self) -> usize {
+        *self.held.lock().unwrap()
+    }
+
+    /// Hold `rows` if they fit under the limit with what is held already; otherwise the rows in flight.
+    pub fn reserve(self: &std::sync::Arc<Self>, rows: usize) -> Result<RowsHeld, usize> {
+        let mut held = self.held.lock().unwrap();
+        if *held + rows > self.max {
+            return Err(*held);
+        }
+        *held += rows;
+        Ok(RowsHeld { budget: self.clone(), rows: std::sync::Mutex::new(rows) })
+    }
+}
+
+impl RowsHeld {
+    pub fn rows(&self) -> usize {
+        *self.rows.lock().unwrap()
+    }
+
+    /// Hold `rows` from now on, when that is less than what is held (it never grows: growing could
+    /// pass the limit).
+    pub fn shrink_to(&self, rows: usize) {
+        let mut mine = self.rows.lock().unwrap();
+        if rows < *mine {
+            *self.budget.held.lock().unwrap() -= *mine - rows;
+            *mine = rows;
+        }
+    }
+}
+
+impl Drop for RowsHeld {
+    fn drop(&mut self) {
+        let mine = *self.rows.lock().unwrap();
+        *self.budget.held.lock().unwrap() -= mine;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Encoded {
     /// rows per image, in prompt order
@@ -285,6 +355,51 @@ mod tests {
     }
 
     const T: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn rows_in_flight() {
+        assert_eq!(DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT, 80_000);
+        // the estimate before the encoder answers: 1100 a picture, at most the request cap
+        assert_eq!(rows_estimate(1, DEFAULT_MAX_IMAGE_ROWS), 1100);
+        assert_eq!(rows_estimate(36, DEFAULT_MAX_IMAGE_ROWS), 39_600);
+        assert_eq!(rows_estimate(37, DEFAULT_MAX_IMAGE_ROWS), 40_000);
+        assert_eq!(rows_estimate(100, usize::MAX), MAX_TOTAL_IMAGE_ROWS);
+        let b = RowsInFlight::new(10);
+        let x = b.reserve(6).unwrap();
+        assert_eq!(b.reserve(5).unwrap_err(), 6, "5 more do not fit: told what is in flight, and nothing is taken");
+        let y = b.reserve(4).unwrap();
+        assert_eq!((b.in_flight(), b.reserve(1).is_err()), (10, true));
+        x.shrink_to(2);
+        assert_eq!((x.rows(), b.in_flight()), (2, 6));
+        x.shrink_to(9); // never grows
+        assert_eq!((x.rows(), b.in_flight()), (2, 6));
+        drop(y);
+        assert_eq!(b.in_flight(), 2);
+        drop(x);
+        assert_eq!(b.in_flight(), 0);
+        assert!(b.reserve(11).is_err() && b.reserve(10).is_ok());
+        // from many threads at once the limit holds and everything comes back
+        let b = RowsInFlight::new(1000);
+        let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (b, over) = (b.clone(), over.clone());
+                std::thread::spawn(move || {
+                    for i in 0..20_000 {
+                        if let Ok(h) = b.reserve(300 + i % 7) {
+                            if b.in_flight() > 1000 {
+                                over.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            h.shrink_to(100);
+                        }
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert!(!over.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(b.in_flight(), 0);
+    }
 
     #[tokio::test]
     async fn hundred_small_images_pass() {

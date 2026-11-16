@@ -39,6 +39,11 @@ fn usage() -> ! {
       --max-image-rows N        the most image tokens (embedding rows) the images of one request may
                                 take together: 40000; more is answered 400. Memory on rank 0's box
                                 follows rows, not the number of images (docs/vision.md); at most 110000
+      --max-image-rows-in-flight N
+                                the most image tokens the image requests being answered may take
+                                together: 80000 (two full requests). A request with images that does
+                                not fit is answered 429 with Retry-After: 5 at once; text requests are
+                                never counted. Not below --max-image-rows
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -129,6 +134,7 @@ fn serve(args: &[String]) {
         vision_addr: opt(args, "--vision-addr"),
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
+        max_image_rows_in_flight: max_image_rows_in_flight(args),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
@@ -277,9 +283,20 @@ fn max_image_rows(args: &[String]) -> usize {
     n
 }
 
+/// --max-image-rows-in-flight: from --max-image-rows (below it a full request could never run) up.
+fn max_image_rows_in_flight(args: &[String]) -> usize {
+    let one = max_image_rows(args);
+    let n = parse_opt(args, "--max-image-rows-in-flight", dsfront::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT.max(one));
+    if n < one {
+        eprintln!("bad value for --max-image-rows-in-flight: {n} (not below --max-image-rows, {one})");
+        std::process::exit(2);
+    }
+    n
+}
+
 #[cfg(test)]
 mod limit_tests {
-    use super::{max_body_bytes, max_image_rows};
+    use super::{max_body_bytes, max_image_rows, max_image_rows_in_flight};
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -291,6 +308,11 @@ mod limit_tests {
         assert_eq!(max_body_bytes(&args("dsfront serve --max-body-mb 256")), 256 << 20);
         assert_eq!(max_image_rows(&args("dsfront serve")), 40_000);
         assert_eq!(max_image_rows(&args("dsfront serve --max-image-rows 99400")), 99_400);
+        assert_eq!(max_image_rows_in_flight(&args("dsfront serve")), 80_000, "two full requests unless set");
+        assert_eq!(max_image_rows_in_flight(&args("dsfront serve --max-image-rows-in-flight 40000")), 40_000);
+        assert_eq!(max_image_rows_in_flight(&args("dsfront serve --max-image-rows-in-flight 200000")), 200_000);
+        // a raised request cap raises the default with it: one full request always fits
+        assert_eq!(max_image_rows_in_flight(&args("dsfront serve --max-image-rows 99400")), 99_400);
     }
 }
 

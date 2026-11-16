@@ -55,6 +55,9 @@ pub struct ServerConfig {
     pub max_image_rows: usize,
     /// The largest request body taken, in bytes (--max-body-mb); a larger one is answered 413.
     pub max_body_bytes: usize,
+    /// vision: the most rows the image requests being answered may take together
+    /// (--max-image-rows-in-flight); a request that does not fit is answered 429 with Retry-After
+    pub max_image_rows_in_flight: usize,
 }
 
 /// The default body limit: 64 MiB, which holds a 1M-token prompt several times over. Image and video
@@ -66,6 +69,8 @@ pub struct App {
     pub tok: Arc<Tokenizer>,
     pub engine: EngineClient,
     pub gate: Arc<Gate>,
+    /// vision: the rows held by the image requests in flight (text requests never touch it)
+    pub image_rows: Arc<crate::vision::RowsInFlight>,
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
@@ -75,7 +80,8 @@ impl App {
     pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient) -> Arc<App> {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
+        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -155,6 +161,47 @@ fn refused(r: Refused) -> ApiError {
     ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg)
 }
 
+/// What a request refused for the image rows in flight is told to wait before it tries again: image
+/// requests take seconds (about half a second per full-size image to encode, then the prefill).
+const IMAGE_RETRY_AFTER_S: u64 = 5;
+
+/// The limit on image work in flight (--max-image-rows-in-flight). The cap on one request's rows
+/// (--max-image-rows) bounds one request; several at once multiply it, on a box where running out of
+/// memory hangs rank 0. So a request with images takes its share of a budget of rows before anything
+/// is done for it (before the encoder, the read of the rows and the engine), and gives it back when
+/// it ends: answered, failed or abandoned by its client. What it will take is not known until the
+/// encoder has answered, so it first holds the most its images can take (1100 rows each, at most the
+/// request cap), and from the encoder's answer on what they do take.
+///
+/// A request that does not fit is refused at once: 429 with Retry-After. It is not queued, because a
+/// waiting request is its body held in memory (megabytes of inline images each) for as long as the
+/// ones ahead of it take, and that queue would need a bound and a time limit of its own; the clients'
+/// SDKs retry a 429 after Retry-After by themselves. A text request has no images and is never
+/// counted, delayed or refused here.
+fn hold_image_rows(cfg: &ServerConfig, budget: &Arc<crate::vision::RowsInFlight>, p: &mut Prepared) -> Result<(), Response> {
+    if p.images.is_empty() {
+        return Ok(());
+    }
+    let rows = crate::vision::rows_estimate(p.images.len(), cfg.max_image_rows);
+    match budget.reserve(rows) {
+        Ok(held) => {
+            p.rows_held = Some(held);
+            Ok(())
+        }
+        Err(in_flight) => {
+            eprintln!("image rows in flight: {in_flight} of {}; a request with {} images (up to {rows} rows) is answered 429", budget.max(), p.images.len());
+            let msg = format!(
+                "too much image work in flight: the image requests being answered hold {in_flight} of {} image tokens (--max-image-rows-in-flight) and this request's {} images may take up to {rows}; try again in a few seconds",
+                budget.max(),
+                p.images.len()
+            );
+            let mut resp = error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg);
+            resp.headers_mut().insert("retry-after", IMAGE_RETRY_AFTER_S.into());
+            Err(resp)
+        }
+    }
+}
+
 /// A stream that waits for the engine carries an SSE comment this often, so that a client's idle
 /// timeout sees bytes (and so does a long prefill's wait for its first token).
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
@@ -222,6 +269,9 @@ pub struct Prepared {
     pub ignore_eos: bool,
     /// vision: the image records in prompt order (encoding.py's), one per placeholder; empty for text
     pub images: Vec<Value>,
+    /// vision: this request's share of the image rows in flight (`hold_image_rows`), given back when
+    /// the request ends, however it ends; None for text
+    pub rows_held: Option<crate::vision::RowsHeld>,
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
@@ -460,6 +510,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         stop_ids,
         ignore_eos,
         images,
+        rows_held: None,
     })
 }
 
@@ -764,6 +815,10 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     };
     let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
     let (n_images, n_rows, encoder_ms) = (enc.rows.len(), enc.rows.iter().sum::<u32>(), enc.ms);
+    // the encoder has said what the images really take: hold that, not the estimate
+    if let Some(held) = &p.rows_held {
+        held.shrink_to(n_rows as usize);
+    }
     let ctx = info.max_context as usize;
     if ids.len() >= ctx {
         return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
@@ -829,10 +884,13 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     // A request with inline images is megabytes: each copy is freed when its last reader is done,
     // rather than held until the answer ends. The body's bytes are not needed once parsed.
     drop(body);
-    let p = match prepare(&app.cfg, &req) {
+    let mut p = match prepare(&app.cfg, &req) {
         Ok(p) => p,
         Err(e) => return bad_request(e),
     };
+    if let Err(refusal) = hold_image_rows(&app.cfg, &app.image_rows, &mut p) {
+        return refusal;
+    }
     // The parsed request is only read again by --dump-dir's record.
     let req = if app.cfg.dump_dir.is_some() { req } else { Value::Null };
     // While the engine is down (the ring lent to a job, or a restart) a request waits at the gate. A
@@ -1009,6 +1067,7 @@ mod tests {
             vision_addr: None,
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
         }
     }
 
@@ -1058,6 +1117,72 @@ mod tests {
         assert!(p.prompt.ends_with("<｜User｜>hi<｜Assistant｜><think>"));
         assert_eq!((p.max_tokens, p.tools, p.mode), (32768, true, ThinkingMode::Thinking));
         assert_eq!(p.stops, vec!["x".to_string()]);
+    }
+
+    fn image_request(n: usize) -> Value {
+        let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
+        json!({"messages": [{"role": "user", "content": vec![image; n]}]})
+    }
+
+    #[test]
+    fn image_rows_in_flight_are_limited() {
+        use crate::vision::{RowsInFlight, DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT, MAX_IMAGE_ROWS};
+        let mut cfg = cfg();
+        cfg.vision_addr = Some("127.0.0.1:18950".into());
+        assert_eq!(cfg.max_image_rows_in_flight, 80_000, "the default: two requests at the default request cap");
+        let budget = RowsInFlight::new(DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT);
+        // a request with images holds the most they can take: 1100 rows each, at most the request cap
+        let mut one = prepare(&cfg, &image_request(1)).unwrap();
+        hold_image_rows(&cfg, &budget, &mut one).map_err(|_| ()).unwrap();
+        assert_eq!(budget.in_flight(), MAX_IMAGE_ROWS);
+        let mut a = prepare(&cfg, &image_request(100)).unwrap();
+        hold_image_rows(&cfg, &budget, &mut a).map_err(|_| ()).unwrap();
+        assert_eq!(budget.in_flight(), MAX_IMAGE_ROWS + 40_000);
+        drop(one);
+        // two full requests fit; the third is refused at once: 429, Retry-After, and it holds nothing
+        let mut b = prepare(&cfg, &image_request(40)).unwrap();
+        hold_image_rows(&cfg, &budget, &mut b).map_err(|_| ()).unwrap();
+        assert_eq!(budget.in_flight(), 80_000);
+        for n in [1, 40, 100] {
+            let mut c = prepare(&cfg, &image_request(n)).unwrap();
+            let refusal = hold_image_rows(&cfg, &budget, &mut c).unwrap_err();
+            assert_eq!(refusal.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(refusal.headers()["retry-after"], "5");
+            assert!(c.rows_held.is_none());
+        }
+        assert_eq!(budget.in_flight(), 80_000);
+        // a text request is never counted or refused, however full the budget is
+        let mut text = prepare(&cfg, &json!({"messages": [{"role": "user", "content": "hi"}]})).unwrap();
+        assert!(hold_image_rows(&cfg, &budget, &mut text).is_ok() && text.rows_held.is_none());
+        assert_eq!(budget.in_flight(), 80_000);
+        // once the encoder has answered, a request holds what its images take, and others fit again
+        a.rows_held.as_ref().unwrap().shrink_to(38_300);
+        assert_eq!(budget.in_flight(), 78_300);
+        let mut d = prepare(&cfg, &image_request(1)).unwrap();
+        hold_image_rows(&cfg, &budget, &mut d).map_err(|_| ()).unwrap();
+        assert_eq!(budget.in_flight(), 79_400);
+        // a request that ends (answered, failed, or its client gone: the request is dropped) gives its rows back
+        drop(a);
+        drop(b);
+        drop(d);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_refusal_for_rows_in_flight_reads_as_an_api_error() {
+        let mut cfg = cfg();
+        cfg.vision_addr = Some("127.0.0.1:18950".into());
+        let budget = crate::vision::RowsInFlight::new(40_000);
+        let mut a = prepare(&cfg, &image_request(40)).unwrap();
+        hold_image_rows(&cfg, &budget, &mut a).map_err(|_| ()).unwrap();
+        let mut b = prepare(&cfg, &image_request(3)).unwrap();
+        let refusal = hold_image_rows(&cfg, &budget, &mut b).unwrap_err();
+        let body = axum::body::to_bytes(refusal.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], 429);
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("hold 40000 of 40000 image tokens (--max-image-rows-in-flight)") && msg.contains("3 images may take up to 3300"), "{msg}");
     }
 
     /// POST a body of `len` bytes to a route that takes its body the way the chat route does, behind

@@ -106,6 +106,17 @@ flags together, and only with the memory to spare: budget 50 to 80 MiB of rank 0
 of one request (the two measurements above, taken before the front-end's copies of the rows were
 halved; expect less), times the image requests in flight.
 
+Image requests in flight are limited together as well: `--max-image-rows-in-flight N` (80,000: two
+requests at the default cap; not below `--max-image-rows`). A request with images takes its share
+before anything is done for it: first the most its images can take (1,100 rows each, at most the
+request cap), then, once the encoder has answered, what they do take; it gives the share back when it
+ends, however it ends. A request that does not fit is answered at once with 429, `Retry-After: 5` and
+a message that says how much is held; it is not queued, because a queued request is its body held in
+memory while it waits (inline images are megabytes), and OpenAI-style clients retry a 429 after
+`Retry-After` by themselves. Text requests are never counted, delayed or refused by this limit. What it
+does not bound: the bodies of requests while they are being received and parsed, which is what
+`--max-body-mb` is for.
+
 What a request costs in the front-end itself, as peak resident memory over idle (mock engine and a
 stand-in encoder, no GPU):
 
