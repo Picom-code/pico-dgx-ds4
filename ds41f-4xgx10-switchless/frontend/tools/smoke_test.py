@@ -110,7 +110,49 @@ def main():
     s, b = request("POST", "/v1/chat/completions", {"messages": [SYSTEM, {"role": "user", "content": "Hello there"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
-    check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off")
+    check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off (the default)")
+
+    s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}],
+                   "reasoning_effort": "none", "chat_template_kwargs": {"thinking": True}})
+    check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+          and not b["choices"][0]["message"].get("reasoning_content"), "none disables thinking despite a conflicting template flag")
+
+    # an explicit off-switch wins over an effort, and a template effort alone does not switch thinking on
+    for extra, what in (({"reasoning_effort": "high", "chat_template_kwargs": {"thinking": False}}, "template thinking false wins over a top-level effort"),
+                        ({"chat_template_kwargs": {"reasoning_effort": 40}}, "a template effort alone leaves thinking off")):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}], **extra})
+        check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+              and not b["choices"][0]["message"].get("reasoning_content"), what)
+
+    # the request's own thinking switch
+    hi = [{"role": "user", "content": "Hello there"}]
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "enabled"}})
+    check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), "thinking: {type: enabled} switches thinking on")
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "disabled"}, "reasoning_effort": "high"})
+    check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+          and not b["choices"][0]["message"].get("reasoning_content"), "thinking: {type: disabled} switches thinking off")
+    s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "banana"}})
+    check(s == 400 and "enabled, disabled" in b.get("error", {}).get("message", ""), "an unknown thinking type returns 400")
+
+    allowed = "none, minimal, low, medium, high, xhigh, ultra, max"
+    for streaming in (False, True):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": "banana", "stream": streaming})
+        check(s == 400 and allowed in b.get("error", {}).get("message", ""),
+              f"invalid effort returns 400 and lists allowed values (stream={streaming})")
+    for effort in allowed.split(", ")[1:]:
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), f"{effort} enables thinking")
+
+    for effort in (40, "40", "HIGH", 0.5):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 200 and bool(b["choices"][0]["message"].get("reasoning_content")), f"effort {effort!r} is still accepted")
+    for effort in (0, 101, True):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                       "reasoning_effort": effort})
+        check(s == 400 and allowed in b.get("error", {}).get("message", ""), f"effort {effort!r} returns 400")
 
     # thinking, streamed, pi-style kwargs
     body = {"messages": [SYSTEM, {"role": "user", "content": "Think first"}], "max_completion_tokens": 200,
@@ -169,7 +211,7 @@ def main():
 
     def pi(when, msg):
         return {"messages": [{"role": "system", "content": f"{sysp}Current date and time: Monday, October 12, 2026 at {when}"},
-                             {"role": "user", "content": msg}], "max_tokens": 8}
+                             {"role": "user", "content": msg}], "max_tokens": 8, "reasoning_effort": "none"}
 
     s1, b1 = request("POST", "/v1/chat/completions", pi("09:14:08 AM", "fix the build"))
     s2, b2 = request("POST", "/v1/chat/completions", pi("09:15:31 AM", "write the tests"))

@@ -226,35 +226,76 @@ fn num_i64(v: &Value) -> Option<i64> {
     s.parse().ok()
 }
 
-/// The reasoning-effort budget: the kit's table (low 50, high and xhigh 75, max 100), integers 1-100
-/// as they are, OpenAI fractions in [0, 1] times 100; anything else is the default.
-pub fn effort_budget(v: Option<&Value>, default: i64) -> i64 {
-    match v {
-        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
-            "low" => 50,
-            "high" | "xhigh" => 75,
-            "max" => 100,
-            t => t.parse::<f64>().ok().map_or(default, |f| effort_budget(Some(&json!(f)), default)),
+/// API effort names mapped to the publisher's 1-100 prompt hint. Zero selects chat mode; None is the
+/// server's default effort (--effort, 75). These hints guide reasoning; they do not impose a
+/// reasoning-token limit.
+///
+/// A name this server already took keeps the value it had, so a client that sends it gets the same
+/// prompt as before: low 50, high and xhigh 75, max 100 (the publisher's tiers), and medium the
+/// default effort. `none`, `minimal` and `ultra` are the new names.
+const EFFORT_LEVELS: &[(&str, Option<i64>)] = &[
+    ("none", Some(0)), ("minimal", Some(1)), ("low", Some(50)), ("medium", None),
+    ("high", Some(75)), ("xhigh", Some(75)), ("ultra", Some(95)), ("max", Some(100)),
+];
+
+fn invalid_effort(v: &Value) -> String {
+    format!("invalid reasoning_effort {v}; allowed values: none, minimal, low, medium, high, xhigh, ultra, max, or a number from 1 to 100")
+}
+
+/// A request's own `thinking` field, the on/off switch other OpenAI-compatible servers take:
+/// `{"type": "enabled"}` or `{"type": "disabled"}` (other keys, such as budget_tokens, are ignored), or
+/// a plain boolean. `auto` and `adaptive` leave the choice to the server default. Anything else is an
+/// error rather than a switch that is silently ignored.
+fn thinking_switch(v: &Value) -> Result<Option<bool>, String> {
+    let kind = match v {
+        Value::Bool(b) => return Ok(Some(*b)),
+        Value::Object(o) => match o.get("type") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(t) => t,
         },
+        other => other,
+    };
+    match kind.as_str() {
+        Some("enabled") => Ok(Some(true)),
+        Some("disabled") => Ok(Some(false)),
+        Some("auto" | "adaptive") => Ok(None),
+        _ => Err(format!("invalid thinking type {kind}; allowed values: enabled, disabled, auto")),
+    }
+}
+
+/// The effort a request names, wherever it names it (the top-level field or an alias): one of the
+/// names above (case and surrounding spaces do not matter, as before), an integer 1-100 as it is, an
+/// OpenAI fraction in [0, 1] times 100, or such a number in a string ("40"). Anything else is an error:
+/// a typo no longer falls back to the default silently.
+pub fn effort_budget(v: Option<&Value>, default: i64) -> Result<i64, String> {
+    match v {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => {
+            let t = s.trim().to_ascii_lowercase();
+            if let Some((_, budget)) = EFFORT_LEVELS.iter().find(|(name, _)| *name == t) {
+                return Ok(budget.unwrap_or(default));
+            }
+            // a number in a string is read the way it always was, as a float: "40" is 40, "0.5" is 50
+            // and "1" is the fraction 1.0, so 100
+            match t.parse::<f64>() {
+                Ok(f) if f.is_finite() && f != 0.0 => effort_budget(Some(&json!(f)), default).map_err(|_| invalid_effort(v.unwrap())),
+                _ => Err(invalid_effort(v.unwrap())),
+            }
+        }
         Some(n @ Value::Number(_)) => {
             let s = n.as_number().unwrap().to_string();
             let f = num_f64(n).unwrap_or(f64::NAN);
-            if !s.contains(['.', 'e', 'E']) {
-                let i = f as i64;
-                if (1..=100).contains(&i) {
-                    i
-                } else {
-                    default
-                }
-            } else if (0.0..=1.0).contains(&f) {
-                ((f * 100.0).round() as i64).clamp(1, 100)
+            if !s.contains(['.', 'e', 'E']) && (1.0..=100.0).contains(&f) {
+                Ok(f as i64)
+            } else if s.contains(['.', 'e', 'E']) && (0.0..=1.0).contains(&f) {
+                Ok(((f * 100.0).round() as i64).clamp(1, 100))
             } else if (1.0..=100.0).contains(&f) {
-                f.round() as i64
+                Ok(f.round() as i64)
             } else {
-                default
+                Err(invalid_effort(n))
             }
         }
-        _ => default,
+        Some(v) => Err(invalid_effort(v)),
     }
 }
 
@@ -371,27 +412,41 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         messages[0].as_object_mut().unwrap().insert("tools".into(), Value::Array(tools.clone()));
     }
 
-    // thinking and effort
+    // Thinking and effort. A request that sends what it sent before is answered as before:
+    //   - on: `chat_template_kwargs.thinking` / `.enable_thinking`, a top-level `reasoning_effort`,
+    //     `reasoning.effort` or `reasoning.enabled`; otherwise the server default (--thinking). An
+    //     effort inside chat_template_kwargs only says how much: alone it does not switch thinking on.
+    //   - how much: the effort in chat_template_kwargs, else the top-level one, else `reasoning`'s.
+    // Two things are new. The request's own `thinking` field is a switch too. And every explicit
+    // off-switch wins: any of the switches set to off, or any effort field saying `none`, gives chat
+    // mode whatever else the request carries, so a request never thinks against an off-switch it sent.
+    // Every effort field is validated, also one that another field shadows.
     let ctk = r.get("chat_template_kwargs").and_then(Value::as_object);
     let reasoning = r.get("reasoning").and_then(Value::as_object);
-    let top_effort = r.get("reasoning_effort").filter(|v| !v.is_null());
-    let thinking = if let Some(v) = ctk.and_then(|c| c.get("thinking")).filter(|v| !v.is_null()) {
-        truthy(Some(v))
-    } else if let Some(v) = ctk.and_then(|c| c.get("enable_thinking")).filter(|v| !v.is_null()) {
-        truthy(Some(v))
-    } else if let Some(e) = top_effort.or_else(|| reasoning.and_then(|x| x.get("effort")).filter(|v| !v.is_null())) {
-        e.as_str() != Some("none")
-    } else if let Some(v) = reasoning.and_then(|x| x.get("enabled")).filter(|v| !v.is_null()) {
-        truthy(Some(v))
-    } else {
-        cfg.default_thinking
-    };
-    let effort_src = ctk
-        .and_then(|c| c.get("reasoning_effort"))
-        .filter(|v| !v.is_null())
-        .or(top_effort)
-        .or_else(|| reasoning.and_then(|x| x.get("effort").or_else(|| x.get("reasoning_effort"))).filter(|v| !v.is_null()));
-    let budget = json!(effort_budget(effort_src, cfg.default_effort));
+    let given = |v: Option<&'_ Value>| v.filter(|v| !v.is_null()).cloned();
+    let top_effort = given(r.get("reasoning_effort"));
+    let template_effort = given(ctk.and_then(|c| c.get("reasoning_effort")));
+    let nested_effort = given(reasoning.and_then(|c| c.get("effort")));
+    let nested_reasoning_effort = given(reasoning.and_then(|c| c.get("reasoning_effort")));
+    let mut effort_off = false;
+    for effort in [&top_effort, &template_effort, &nested_effort, &nested_reasoning_effort].into_iter().flatten() {
+        effort_off |= effort_budget(Some(effort), cfg.default_effort)? == 0;
+    }
+    let switch = |v: Option<&'_ Value>| v.filter(|v| !v.is_null()).map(|v| truthy(Some(v)));
+    let switches = [
+        r.get("thinking").filter(|v| !v.is_null()).map(thinking_switch).transpose()?.flatten(),
+        switch(ctk.and_then(|c| c.get("thinking"))),
+        switch(ctk.and_then(|c| c.get("enable_thinking"))),
+        switch(reasoning.and_then(|c| c.get("enabled"))),
+    ];
+    let off = effort_off || switches.contains(&Some(false));
+    let asked = switches.contains(&Some(true)) || top_effort.is_some() || nested_effort.is_some();
+    let thinking = !off && (asked || cfg.default_thinking);
+    // `reasoning.effort`, when the key is there at all, hides `reasoning.reasoning_effort` (as before)
+    let nested = given(reasoning.and_then(|c| c.get("effort").or_else(|| c.get("reasoning_effort"))));
+    let effort = effort_budget(template_effort.as_ref().or(top_effort.as_ref()).or(nested.as_ref()), cfg.default_effort)?;
+    // The encoder accepts 1-100 even in chat mode, where it omits the effort prefix.
+    let budget = json!(if effort == 0 { cfg.default_effort } else { effort });
     let mode = if thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat };
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
@@ -996,21 +1051,419 @@ mod tests {
 
     #[test]
     fn efforts() {
+        for &(name, budget) in EFFORT_LEVELS {
+            assert_eq!(effort_budget(Some(&json!(name)), 75).unwrap(), budget.unwrap_or(75));
+        }
+        for (v, want) in [(json!(30), 30), (json!(0.5), 50), (json!(80.0), 80)] {
+            assert_eq!(effort_budget(Some(&v), 75).unwrap(), want);
+        }
+        for v in [json!("banana"), json!("4o"), json!(""), json!("0"), json!("101"), json!(true), json!(0), json!(101), json!(-5), json!(1.5e3)] {
+            let e = effort_budget(Some(&v), 75).expect_err(&v.to_string());
+            assert!(e.contains(&format!("invalid reasoning_effort {v};")), "the message quotes what was sent: {e}");
+        }
+    }
+
+    /// What this server answered before the validation, for every input it took: the same budget now.
+    #[test]
+    fn efforts_keep_their_earlier_values() {
         for (v, want) in [
             (json!("low"), 50),
+            (json!("medium"), 75),
             (json!("high"), 75),
             (json!("xhigh"), 75),
             (json!("max"), 100),
-            (json!("medium"), 75),
-            (json!(30), 30),
-            (json!(0), 75),
+            (json!("HIGH"), 75),
+            (json!(" Max "), 100),
+            (json!(40), 40),
+            (json!("40"), 40),
+            (json!(1), 1),
+            (json!(100), 100),
             (json!(0.5), 50),
             (json!(80.0), 80),
-            (json!("40"), 40),
-            (json!(true), 75),
+            (json!("0.5"), 50),
+            (json!("1"), 100),
+            (json!(1.0), 100),
         ] {
-            assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
+            assert_eq!(effort_budget(Some(&v), 75).unwrap(), want, "{v}");
         }
+        // medium is the server's default effort (--effort), as before
+        assert_eq!(effort_budget(Some(&json!("medium")), 60).unwrap(), 60);
+        assert_eq!(effort_budget(None, 60).unwrap(), 60);
+        // the new names
+        assert_eq!(effort_budget(Some(&json!("none")), 75).unwrap(), 0);
+        assert_eq!(effort_budget(Some(&json!("minimal")), 75).unwrap(), 1);
+        assert_eq!(effort_budget(Some(&json!("ultra")), 75).unwrap(), 95);
+        // through a request, at the top level and through the aliases, in the prompt the model sees
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            let cfg = ServerConfig { encoding, ..cfg() };
+            for (v, want) in [(json!("low"), 50), (json!("medium"), 75), (json!("xhigh"), 75), (json!(40), 40), (json!("40"), 40), (json!(0.3), 30)] {
+                for field in ["top", "template", "reasoning"] {
+                    let mut r = request();
+                    match field {
+                        "top" => r["reasoning_effort"] = v.clone(),
+                        "template" => r["chat_template_kwargs"] = json!({"thinking": true, "reasoning_effort": v}),
+                        _ => r["reasoning"] = json!({"effort": v}),
+                    }
+                    let p = prepare(&cfg, &r).unwrap_or_else(|e| panic!("{field} {v}: {e}"));
+                    assert_eq!(p.mode, ThinkingMode::Thinking, "{field} {v}");
+                    assert!(p.prompt.contains(&format!("Reasoning Effort: {want} ")), "{field} {v}");
+                }
+            }
+        }
+    }
+
+    fn request() -> Value {
+        json!({"messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    /// A server started with --thinking.
+    fn cfg_thinking() -> ServerConfig {
+        ServerConfig { default_thinking: true, ..cfg() }
+    }
+
+    #[test]
+    fn thinking_is_off_unless_asked() {
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            // the server default: a request with no thinking field is answered in chat mode
+            let cfg = ServerConfig { encoding, ..cfg() };
+            let p = prepare(&cfg, &request()).unwrap();
+            assert_eq!(p.mode, ThinkingMode::Chat);
+            assert!(!p.prompt.contains("Reasoning Effort:") && !p.prompt.ends_with("<think>"));
+            // a request can still ask for it
+            let mut r = request();
+            r["reasoning_effort"] = json!("high");
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
+            let mut r = request();
+            r["chat_template_kwargs"] = json!({"thinking": true});
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
+            // --thinking makes it the server-wide default, and a request can still switch it off
+            let cfg = ServerConfig { encoding, ..cfg_thinking() };
+            assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Thinking);
+            let mut r = request();
+            r["reasoning_effort"] = json!("none");
+            assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Chat);
+        }
+    }
+
+    #[test]
+    fn default_thinking_and_named_efforts() {
+        for encoding in [Encoding::V41, Encoding::V41_1017] {
+            let mut cfg = cfg_thinking();
+            cfg.encoding = encoding;
+            let p = prepare(&cfg, &request()).unwrap();
+            assert_eq!(p.mode, ThinkingMode::Thinking);
+            assert!(p.prompt.contains("Reasoning Effort: 75 "));
+            assert!(p.prompt.ends_with("<think>"));
+            for &(name, budget) in EFFORT_LEVELS {
+                let mut r = request();
+                r["reasoning_effort"] = json!(name);
+                let p = prepare(&cfg, &r).unwrap();
+                if name == "none" {
+                    assert_eq!(p.mode, ThinkingMode::Chat);
+                    assert!(!p.prompt.contains("Reasoning Effort:"));
+                    assert!(!p.prompt.ends_with("<think>"));
+                } else {
+                    let budget = budget.unwrap_or(cfg.default_effort);
+                    assert_eq!(p.mode, ThinkingMode::Thinking);
+                    assert!(p.prompt.contains(&format!("Reasoning Effort: {budget} ")), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effort_validation_and_precedence() {
+        for bad in [json!("banana"), json!("hihg"), json!(""), json!(true), json!(0), json!(101), json!([]), json!({})] {
+            let mut r = request();
+            r["reasoning_effort"] = bad;
+            r["chat_template_kwargs"] = json!({"thinking": false});
+            let error = prepare(&cfg(), &r).err().expect("invalid API effort must fail even with thinking off");
+            assert!(error.contains("allowed values: none, minimal, low, medium, high, xhigh, ultra, max"));
+        }
+        let mut r = request();
+        r["reasoning_effort"] = json!("none");
+        r["chat_template_kwargs"] = json!({"thinking": true, "reasoning_effort": "max"});
+        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Chat);
+        // an explicit off-switch wins over an effort, as it always did
+        r["reasoning_effort"] = json!("minimal");
+        r["chat_template_kwargs"] = json!({"thinking": false});
+        assert_eq!(prepare(&cfg(), &r).unwrap().mode, ThinkingMode::Chat);
+        assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Chat);
+        r["chat_template_kwargs"] = json!({"reasoning_effort": "banana"});
+        assert!(prepare(&cfg(), &r).is_err());
+    }
+
+    #[test]
+    fn thinking_field_is_honoured() {
+        let with = |cfg: &ServerConfig, extra: Value| {
+            let mut r = request();
+            r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            prepare(cfg, &r)
+        };
+        for cfg in [cfg(), cfg_thinking()] {
+            // disabled switches thinking off whatever the server default, and whatever else asks for it
+            for off in [
+                json!({"thinking": {"type": "disabled"}}),
+                json!({"thinking": false}),
+                json!({"thinking": {"type": "disabled"}, "reasoning_effort": "high"}),
+                json!({"thinking": {"type": "disabled"}, "chat_template_kwargs": {"thinking": true}}),
+                json!({"thinking": {"type": "disabled"}, "reasoning": {"enabled": true, "effort": "max"}}),
+                // and so does every other off-switch, against the request's own "enabled"
+                json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}),
+                json!({"thinking": {"type": "enabled"}, "chat_template_kwargs": {"thinking": false}}),
+                json!({"thinking": true, "chat_template_kwargs": {"enable_thinking": false}}),
+                json!({"thinking": true, "reasoning": {"enabled": false}}),
+            ] {
+                let p = with(&cfg, off.clone()).unwrap();
+                assert_eq!(p.mode, ThinkingMode::Chat, "{off}");
+                assert!(!p.prompt.contains("Reasoning Effort:") && !p.prompt.ends_with("<think>"), "{off}");
+            }
+            // enabled switches it on, at the default effort or the one the request names
+            for (on, budget) in [
+                (json!({"thinking": {"type": "enabled"}}), 75),
+                (json!({"thinking": true}), 75),
+                (json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}), 75),
+                (json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"}), 100),
+                (json!({"thinking": {"type": "enabled"}, "chat_template_kwargs": {"reasoning_effort": 40}}), 40),
+            ] {
+                let p = with(&cfg, on.clone()).unwrap();
+                assert_eq!(p.mode, ThinkingMode::Thinking, "{on}");
+                assert!(p.prompt.contains(&format!("Reasoning Effort: {budget} ")) && p.prompt.ends_with("<think>"), "{on}");
+            }
+            // no opinion: the server default
+            for auto in [json!({"thinking": {"type": "auto"}}), json!({"thinking": {"type": "adaptive"}}), json!({"thinking": null}), json!({"thinking": {}})] {
+                let want = if cfg.default_thinking { ThinkingMode::Thinking } else { ThinkingMode::Chat };
+                assert_eq!(with(&cfg, auto.clone()).unwrap().mode, want, "{auto}");
+            }
+            // a typo fails loudly instead of being ignored
+            for bad in [json!({"thinking": {"type": "banana"}}), json!({"thinking": "sometimes"}), json!({"thinking": 1}), json!({"thinking": {"type": true}})] {
+                let e = with(&cfg, bad.clone()).err().unwrap_or_else(|| panic!("{bad} must fail"));
+                assert!(e.contains("allowed values: enabled, disabled, auto"), "{e}");
+            }
+        }
+    }
+
+    /// main's rule before this branch (f211791), copied as it was: whether a request thinks and the
+    /// effort written into its prompt. It never refused a value, and it did not read `thinking`.
+    fn main_rule(cfg: &ServerConfig, req: &Value) -> (bool, i64) {
+        fn effort_budget(v: Option<&Value>, default: i64) -> i64 {
+            match v {
+                Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                    "low" => 50,
+                    "high" | "xhigh" => 75,
+                    "max" => 100,
+                    t => t.parse::<f64>().ok().map_or(default, |f| effort_budget(Some(&json!(f)), default)),
+                },
+                Some(n @ Value::Number(_)) => {
+                    let s = n.as_number().unwrap().to_string();
+                    let f = num_f64(n).unwrap_or(f64::NAN);
+                    if !s.contains(['.', 'e', 'E']) {
+                        let i = f as i64;
+                        if (1..=100).contains(&i) {
+                            i
+                        } else {
+                            default
+                        }
+                    } else if (0.0..=1.0).contains(&f) {
+                        ((f * 100.0).round() as i64).clamp(1, 100)
+                    } else if (1.0..=100.0).contains(&f) {
+                        f.round() as i64
+                    } else {
+                        default
+                    }
+                }
+                _ => default,
+            }
+        }
+        let r = req.as_object().unwrap();
+        let ctk = r.get("chat_template_kwargs").and_then(Value::as_object);
+        let reasoning = r.get("reasoning").and_then(Value::as_object);
+        let top_effort = r.get("reasoning_effort").filter(|v| !v.is_null());
+        let thinking = if let Some(v) = ctk.and_then(|c| c.get("thinking")).filter(|v| !v.is_null()) {
+            truthy(Some(v))
+        } else if let Some(v) = ctk.and_then(|c| c.get("enable_thinking")).filter(|v| !v.is_null()) {
+            truthy(Some(v))
+        } else if let Some(e) = top_effort.or_else(|| reasoning.and_then(|x| x.get("effort")).filter(|v| !v.is_null())) {
+            e.as_str() != Some("none")
+        } else if let Some(v) = reasoning.and_then(|x| x.get("enabled")).filter(|v| !v.is_null()) {
+            truthy(Some(v))
+        } else {
+            cfg.default_thinking
+        };
+        let effort_src = ctk
+            .and_then(|c| c.get("reasoning_effort"))
+            .filter(|v| !v.is_null())
+            .or(top_effort)
+            .or_else(|| reasoning.and_then(|x| x.get("effort").or_else(|| x.get("reasoning_effort"))).filter(|v| !v.is_null()));
+        (thinking, effort_budget(effort_src, cfg.default_effort))
+    }
+
+    /// Every combination of the fields that say whether and how much to think, each with the values main
+    /// took, under each server default: the answer is main's (same mode, same effort in the prompt),
+    /// with the two rules that are new and nothing else:
+    ///   1. an explicit off-switch always wins (main let some on-switches win over some off-switches);
+    ///   2. the request's own `thinking` field, which main did not read, is a switch.
+    /// In particular a request that main answered without thinking is still answered without thinking,
+    /// unless it carries `thinking` enabled, and a request without an off-switch and without the
+    /// `thinking` field is answered exactly as on main.
+    #[test]
+    fn thinking_and_effort_as_on_main_for_every_combination() {
+        let field = [None, Some(json!({"type": "enabled"})), Some(json!({"type": "disabled"})), Some(json!(true)), Some(json!(false)), Some(json!({"type": "auto"}))];
+        let flags = [None, Some(true), Some(false)];
+        let template_efforts = [None, Some(json!(40)), Some(json!("none")), Some(json!("high"))];
+        let top_efforts = [
+            None, Some(Value::Null), Some(json!("none")), Some(json!("low")), Some(json!("medium")), Some(json!("high")), Some(json!("xhigh")),
+            Some(json!("max")), Some(json!("HIGH")), Some(json!(" Max ")), Some(json!(40)), Some(json!("40")), Some(json!(0.5)), Some(json!(1)),
+            Some(json!(100)), Some(json!(80.0)), Some(json!("1")),
+        ];
+        let reasonings = [
+            None, Some(json!({"enabled": true})), Some(json!({"enabled": false})), Some(json!({"effort": "high"})), Some(json!({"effort": "none"})),
+            Some(json!({"reasoning_effort": "low"})), Some(json!({"reasoning_effort": "none"})), Some(json!({"effort": null, "reasoning_effort": 30})),
+            Some(json!({"enabled": true, "effort": "max"})), Some(json!({"enabled": false, "effort": "max"})),
+        ];
+        let is_none = |v: &Value| v.as_str() == Some("none");
+        let (mut cases, mut same_as_main, mut off_won, mut field_on, mut main_chat) = (0, 0, 0, 0, 0);
+        for (default_thinking, default_effort) in [(false, 75), (true, 75), (false, 60), (true, 60)] {
+            let cfg = ServerConfig { default_thinking, default_effort, ..cfg() };
+            for f in &field {
+                for t in flags {
+                    for e in flags {
+                        for te in &template_efforts {
+                            for top in &top_efforts {
+                                for re in &reasonings {
+                                    let mut r = request();
+                                    let mut ctk = serde_json::Map::new();
+                                    if let Some(t) = t {
+                                        ctk.insert("thinking".into(), json!(t));
+                                    }
+                                    if let Some(e) = e {
+                                        ctk.insert("enable_thinking".into(), json!(e));
+                                    }
+                                    if let Some(te) = te {
+                                        ctk.insert("reasoning_effort".into(), te.clone());
+                                    }
+                                    if !ctk.is_empty() {
+                                        r["chat_template_kwargs"] = Value::Object(ctk);
+                                    }
+                                    if let Some(top) = top {
+                                        r["reasoning_effort"] = top.clone();
+                                    }
+                                    if let Some(re) = re {
+                                        r["reasoning"] = re.clone();
+                                    }
+                                    // what main answered: it saw everything but the `thinking` field
+                                    let (main_thinks, main_effort) = main_rule(&cfg, &r);
+                                    if let Some(f) = f {
+                                        r["thinking"] = f.clone();
+                                    }
+                                    // the request's explicit off-switches, read off the request itself
+                                    let off = matches!(f, Some(v) if *v == json!(false) || v["type"] == "disabled")
+                                        || t == Some(false)
+                                        || e == Some(false)
+                                        || te.as_ref().is_some_and(is_none)
+                                        || top.as_ref().is_some_and(is_none)
+                                        || re.as_ref().is_some_and(|re| re["enabled"] == json!(false) || is_none(&re["effort"]) || is_none(&re["reasoning_effort"]));
+                                    let on_by_field = matches!(f, Some(v) if *v == json!(true) || v["type"] == "enabled");
+                                    let want = !off && (main_thinks || on_by_field);
+                                    let p = prepare(&cfg, &r).unwrap_or_else(|e| panic!("main took {r}; now: {e}"));
+                                    assert_eq!(p.mode == ThinkingMode::Thinking, want, "{r} (server default {default_thinking}); main thinking: {main_thinks}");
+                                    if want {
+                                        assert!(p.prompt.contains(&format!("Reasoning Effort: {main_effort} ")) && p.prompt.ends_with("<think>"), "{r}: main's effort is {main_effort}");
+                                    } else {
+                                        assert!(!p.prompt.contains("Reasoning Effort:") && !p.prompt.ends_with("<think>"), "{r}");
+                                    }
+                                    // the guarantees, spelled out
+                                    if !main_thinks && !on_by_field {
+                                        assert_eq!(p.mode, ThinkingMode::Chat, "main answered {r} without thinking");
+                                        main_chat += 1;
+                                    }
+                                    if want == main_thinks {
+                                        same_as_main += 1;
+                                    } else if main_thinks {
+                                        assert!(off, "{r}: thinking on main, chat now, with no off-switch in the request");
+                                        off_won += 1;
+                                    } else {
+                                        assert!(on_by_field && !off, "{r}: chat on main, thinking now, without `thinking` enabled");
+                                        field_on += 1;
+                                    }
+                                    if f.is_none() && !off {
+                                        assert_eq!(want, main_thinks, "{r}: no off-switch and no `thinking` field");
+                                    }
+                                    cases += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 6 * 3 * 3 * 4 * 17 * 10);
+        assert_eq!(cases, same_as_main + off_won + field_on);
+        assert!(same_as_main > cases / 2 && off_won > 0 && field_on > 0 && main_chat > 0, "{cases} {same_as_main} {off_won} {field_on} {main_chat}");
+    }
+
+    /// The intended differences from main for values, apart from the two rules above: a value that is
+    /// not an effort returns 400 wherever it is sent (main fell back to the default silently), and the
+    /// new names have their own value (main read `minimal` and `ultra` as unknown: the default, 75).
+    #[test]
+    fn what_differs_from_main_is_a_400_or_a_new_name() {
+        let cfg = cfg();
+        for bad in [json!("banana"), json!("hihg"), json!(""), json!("0"), json!("101"), json!(0), json!(101), json!(-5), json!(true), json!([]), json!({})] {
+            for place in ["top", "template", "reasoning.effort", "reasoning.reasoning_effort"] {
+                // also next to an off-switch, and where another field's effort is the one used
+                for extra in [json!({}), json!({"thinking": false}), json!({"thinking": true, "reasoning_effort": "max"})] {
+                    let mut r = request();
+                    r["chat_template_kwargs"] = extra.clone();
+                    match place {
+                        "top" => r["reasoning_effort"] = bad.clone(),
+                        "template" => r["chat_template_kwargs"]["reasoning_effort"] = bad.clone(),
+                        "reasoning.effort" => r["reasoning"] = json!({"effort": bad}),
+                        _ => r["reasoning"] = json!({"reasoning_effort": bad}),
+                    }
+                    if place == "template" && extra.get("reasoning_effort").is_some() {
+                        continue;
+                    }
+                    let _ = main_rule(&cfg, &r); // main answered it
+                    let e = prepare(&cfg, &r).err().unwrap_or_else(|| panic!("{r} must be refused"));
+                    assert!(e.starts_with("invalid reasoning_effort ") && e.contains("allowed values: none, minimal, low, medium, high, xhigh, ultra, max"), "{e}");
+                }
+            }
+        }
+        for (name, now) in [("minimal", 1), ("ultra", 95)] {
+            let mut r = request();
+            r["reasoning_effort"] = json!(name);
+            assert_eq!(main_rule(&cfg, &r), (true, 75));
+            let p = prepare(&cfg, &r).unwrap();
+            assert!(p.mode == ThinkingMode::Thinking && p.prompt.contains(&format!("Reasoning Effort: {now} ")), "{name}");
+        }
+        // `none` switches off in any case and with spaces (main: only the exact lower-case word)
+        let mut r = request();
+        r["reasoning_effort"] = json!(" None ");
+        assert_eq!(main_rule(&cfg_thinking(), &r).0, true);
+        assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Chat);
+    }
+
+    #[test]
+    fn thinking_aliases_remain_supported() {
+        for alias in [
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"thinking": true, "reasoning_effort": "none"}}),
+            json!({"reasoning": {"enabled": false}}),
+            json!({"reasoning": {"effort": "none"}}),
+            json!({"reasoning": {"reasoning_effort": "none"}}),
+        ] {
+            let mut r = request();
+            r.as_object_mut().unwrap().extend(alias.as_object().unwrap().clone());
+            assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Chat, "{r}");
+        }
+        let mut r = request();
+        r["reasoning_effort"] = Value::Null;
+        assert_eq!(prepare(&cfg_thinking(), &r).unwrap().mode, ThinkingMode::Thinking);
+        let cfg = cfg();
+        assert_eq!(prepare(&cfg, &request()).unwrap().mode, ThinkingMode::Chat);
+        r["reasoning"] = json!({"effort": "low"});
+        assert_eq!(prepare(&cfg, &r).unwrap().mode, ThinkingMode::Thinking);
     }
 
     #[test]

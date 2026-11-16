@@ -233,8 +233,26 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 **7. Use it.** dsfront serves OpenAI's chat completions (`POST /v1/chat/completions`, streamed with
 `"stream": true`, `tools` answered by `tool_calls`), `GET /v1/models` and `GET /health`, under the name
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default; a request's `model` is ignored).
-Thinking is off unless asked for, by `"chat_template_kwargs": {"thinking": true}` or `"reasoning_effort"`
-(`"low"`, `"high"`, `"max"`); the reasoning comes back in `reasoning_content`. Sampling defaults to
+Thinking is off unless asked for: by a request (a top-level `"reasoning_effort"`, `"reasoning":
+{"effort": ...}` or `{"enabled": true}`, `"chat_template_kwargs": {"thinking": true}`, or the request's
+own switch `"thinking": {"type": "enabled"}` / `true`), or for every request that does not say by
+starting dsfront with `--thinking` (`--no-thinking` spells out the default). Every explicit off-switch
+wins over everything else in the request: `"thinking": {"type": "disabled"}` or `false`,
+`chat_template_kwargs` `{"thinking": false}` or `{"enable_thinking": false}`, `"reasoning": {"enabled":
+false}`, or the effort `none` in any effort field. `"thinking": {"type": "auto"}` leaves it to the other
+fields and the server default. Allowed effort names are
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max` (case does not matter), or a
+number: an integer from 1 to 100 as it is, a fraction in [0, 1] times 100, also as a string (`"40"`).
+Anything else returns HTTP 400 with that list. The names stand for the model's numeric effort hints:
+`minimal` 1, `low` 50, `medium` the server's default effort (`--effort`, 75), `high` and `xhigh` 75,
+`ultra` 95, `max` 100. The names this server took before the validation (`low`, `medium`, `high`,
+`xhigh`, `max`) keep the values they had, so existing clients get the same prompt. The hints guide how
+thoroughly the model reasons, rather than imposing a reasoning-token limit. Reasoning comes back in
+`reasoning_content`. How much is taken from `chat_template_kwargs`' `reasoning_effort` when it is
+there, else the top-level one, else `reasoning`'s; an effort inside `chat_template_kwargs` alone does
+not switch thinking on. A request that sends only fields and values the server took before these
+changes is answered as before (same mode, same effort), with one exception: a request that carried both
+an on-switch and an off-switch now always gets the off-switch. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put
