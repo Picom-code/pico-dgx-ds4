@@ -55,10 +55,16 @@ def load_encoder(max_rows=100):
                 sys.modules[k] = v
     enc.calls = []
 
-    def encode(raw):  # the "image" is its row count in ASCII: b"30" is an image of 30 rows
-        enc.calls.append(raw)
-        return torch.zeros((int(raw), 8), dtype=torch.bfloat16), (1, 1, 1, 1)
+    def measure(raw):  # the "image" is its row count in ASCII: b"30" is an image of 30 rows
+        enc.measured.append(raw)
+        return raw, torch.zeros(int(raw), dtype=torch.int64), (1, 1, 1, 1)
 
+    def encode(patches, types, grid):  # the ViT's stand-in: counts what is really encoded
+        enc.calls.append(patches)
+        return torch.zeros((types.numel(), 8), dtype=torch.bfloat16), grid
+
+    enc.measured = []
+    enc.measure = measure
     enc.encode = encode
     enc.torch.cuda.synchronize = lambda: None
     return enc
@@ -75,6 +81,7 @@ class RowLimitTests(unittest.TestCase):
 
     def setUp(self):
         self.enc.calls.clear()
+        self.enc.measured.clear()
 
     def test_default_cap_matches_the_front_end(self):
         self.assertEqual(self.enc.p.parse_args([]).max_rows, 40000)  # dsfront --max-image-rows
@@ -88,7 +95,18 @@ class RowLimitTests(unittest.TestCase):
         with self.assertRaises(self.enc.TooManyRows) as e:
             self.enc.handle({"images": [image(30)] * 3 + [image(11)] + [image(30)] * 6})
         self.assertEqual(str(e.exception), "at most 100 image tokens per request; the first 4 of 10 images already take 101")
-        self.assertEqual(len(self.enc.calls), 4, "the six images after it are never encoded")
+        self.assertEqual(len(self.enc.measured), 4, "the six images after it are not even read")
+        self.assertEqual(self.enc.calls, [b"30"] * 3, "the image that crosses the cap is refused before the ViT runs on it")
+
+    def test_41_full_size_images_cost_40_encodes(self):
+        enc = load_encoder(max_rows=40000)
+        with self.assertRaises(enc.TooManyRows) as e:
+            enc.handle({"images": [image(994)] * 41})
+        self.assertEqual(str(e.exception), "at most 40000 image tokens per request; the first 41 of 41 images already take 40754")
+        self.assertEqual(len(enc.calls), 40)
+        enc.calls.clear()
+        out, _ = enc.handle({"images": [image(994)] * 40})
+        self.assertEqual((len(out), len(enc.calls)), (40, 40))
 
     def test_a_request_can_lower_the_cap_but_not_raise_it(self):
         self.assertEqual(self.enc.row_limit({"max_rows": 50}), 50)
