@@ -146,6 +146,36 @@ mod tests {
         assert!(replacements(&reply, 1, 1).is_err());
     }
 
+    /// A clip's frames are held against the rows in flight (--max-image-rows-in-flight) like still
+    /// images, 1100 rows a frame until the encoder has said what they take; text is not counted.
+    #[test]
+    fn video_frames_count_against_the_rows_in_flight() {
+        use crate::server::{hold_image_rows, prepare};
+        let frames: Vec<Value> = (0..8).map(|i| json!({"timestamp": i as f64, "url": "data:image/jpeg;base64,AA"})).collect();
+        let reply = json!({"ok": true, "videos": [{"duration": 8.0, "frames": frames}]});
+        let mut parts = replacements(&reply, 1, 100).unwrap().into_iter();
+        let still = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}});
+        let mut content = json!([{"type": "video_url", "video_url": "x"}, still, {"type": "text", "text": "what happens?"}]);
+        replace(&mut content, &mut parts);
+        let mut cfg = crate::server::tests::cfg();
+        cfg.vision_addr = Some("127.0.0.1:18950".into());
+        let budget = crate::vision::RowsInFlight::new(2 * 9 * 1100);
+        let request = json!({"messages": [{"role": "user", "content": content}]});
+        let mut a = prepare(&cfg, &request).unwrap();
+        assert_eq!(a.images.len(), 9, "8 frames and the still");
+        assert!(hold_image_rows(&cfg, &budget, &mut a).is_ok());
+        assert_eq!(budget.in_flight(), 9 * 1100);
+        let mut b = prepare(&cfg, &request).unwrap();
+        assert!(hold_image_rows(&cfg, &budget, &mut b).is_ok());
+        // a third clip does not fit while the two are in flight: 429 with the frames named
+        let mut c = prepare(&cfg, &request).unwrap();
+        let refusal = hold_image_rows(&cfg, &budget, &mut c).unwrap_err();
+        assert_eq!(refusal.status(), 429);
+        assert_eq!(refusal.headers()["retry-after"], "5");
+        drop(a);
+        assert!(hold_image_rows(&cfg, &budget, &mut c).is_ok());
+    }
+
     /// A clip's frames become image parts, so they count against the cap on a request's image rows
     /// (--max-image-rows) exactly as still images do, together with them.
     #[tokio::test]

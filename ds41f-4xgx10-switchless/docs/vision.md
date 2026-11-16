@@ -113,7 +113,8 @@ request cap), then, once the encoder has answered, what they do take; it gives t
 ends, however it ends. A request that does not fit is answered at once with 429, `Retry-After: 5` and
 a message that says how much is held; it is not queued, because a queued request is its body held in
 memory while it waits (inline images are megabytes), and OpenAI-style clients retry a 429 after
-`Retry-After` by themselves. Text requests are never counted, delayed or refused by this limit. What it
+`Retry-After` by themselves. A clip's frames count like images (they are image parts by then; the
+decoding before that is one clip at a time in the encoder). Text requests are never counted, delayed or refused by this limit. What it
 does not bound: the bodies of requests while they are being received and parsed, which is what
 `--max-body-mb` is for.
 
