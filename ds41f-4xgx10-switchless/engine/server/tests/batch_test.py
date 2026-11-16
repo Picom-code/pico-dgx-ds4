@@ -9,7 +9,13 @@ default, docs/batching.md B3) batches of up to kMaxRows / 2 sessions decode with
 last two scenarios run pairs and triples (a draft cap of 5 and 4 each with kMaxRows 16), a pause, a
 cancel and a stop id inside a drafted batch; every request must still equal its run alone.
 
+With --wide: ten more requests, all sixteen submitted at once (a server with --slots 16 decodes them
+undrafted, the draft cap spec_batch_rows / 2 = 8 leaving a 16-row step plain; with fewer slots the rest
+wait for one or take turns, --slice), eight together with drafts on, then a cancel and a stop id inside the
+16-session batch, a pause inside a 13-session batch, and a pause inside a drafted batch of seven.
+
   python3 engine/server/tests/batch_test.py --socket S --slots 4
+  python3 engine/server/tests/batch_test.py --socket S --slots 16 --wide
 """
 import argparse
 import os
@@ -60,6 +66,8 @@ def main():
     ap.add_argument('--socket', default='/tmp/dsgb10-engine.sock')
     ap.add_argument('--tokens', default='/data/dsgb10/golden/synth270k/tokens.npy')
     ap.add_argument('--slots', type=int, default=4, help="the server's --slots")
+    ap.add_argument('--wide', action='store_true', help='ten more requests, 16 at once, a cancel and a stop '
+                    'id and pauses inside large batches (scenarios 9-13; a server with --slots 16 fills them)')
     a = ap.parse_args()
     T = load_npy_i32(a.tokens)
     e = Mux(a.socket)
@@ -71,7 +79,19 @@ def main():
          ('D', dict(prompt=T[60000:61500], max_new=320, n_top=0, temp=0.9, top_p=0.95, seed=11)),
          ('E', dict(prompt=T[80000:80800], max_new=260, n_top=0)),
          ('F', dict(prompt=T[100000:103000], max_new=180, n_top=0, temp=0.6, seed=3))]
-    K = dict(R)
+    RW = []
+    if a.wide:  # ten more, further along the transcript, so all 16 slots hold different texts
+        RW = [('G', dict(prompt=T[110000:111200], max_new=200, n_top=0)),
+              ('H', dict(prompt=T[120000:121000], max_new=180, n_top=0, temp=0.7, seed=5)),
+              ('I', dict(prompt=T[130000:131500], max_new=160, n_top=0)),
+              ('J', dict(prompt=T[140000:140800], max_new=220, n_top=0, temp=0.9, top_p=0.9, seed=13)),
+              ('K', dict(prompt=T[150000:152000], max_new=140, n_top=0)),
+              ('L', dict(prompt=T[160000:160600], max_new=200, n_top=0, temp=0.5, seed=17)),
+              ('M', dict(prompt=T[170000:171000], max_new=160, n_top=0)),
+              ('N', dict(prompt=T[180000:182000], max_new=120, n_top=0, temp=0.8, seed=19)),
+              ('O', dict(prompt=T[190000:191200], max_new=180, n_top=0)),
+              ('P', dict(prompt=T[200000:201000], max_new=160, n_top=0, temp=0.75, seed=23))]
+    K = dict(R + RW)
     used = []
 
     def start(name, sid, **over):
@@ -82,8 +102,8 @@ def main():
 
     print('1. each alone, in a fresh session')
     ref = {}
-    for i, (name, kw) in enumerate(R):
-        r = start(name, 1 + i)
+    for i, (name, kw) in enumerate(R + RW):  # --wide's ten in sessions 201.. (11.. are scenario 2's)
+        r = start(name, 1 + i if i < len(R) else 201 + i - len(R))
         e.pump(lambda: e.finished(r))
         ref[name] = e.recs[r]
         d = ref[name]['done']
@@ -95,7 +115,7 @@ def main():
 
     n_tog = min(a.slots, len(R))
     names = [n for n, _ in R[:n_tog]]
-    print('2. %s together (as many as there are slots), submitted at once' % ', '.join(names))
+    print('2. %s together (%d of the %d slots), submitted at once' % (', '.join(names), len(names), a.slots))
     t0 = time.time()
     rids = [start(n, 11 + i) for i, n in enumerate(names)]
     e.pump(lambda: e.finished(*rids))
@@ -132,7 +152,7 @@ def main():
     during = sum(e.recs[rids[1]]['t_tok'][0] < t < e.recs[rids[1]]['done']['t'] for t in first['t_tok'])
     check(during > 0, '%s decoded while %s was in flight: %d of its tokens' % (first['name'], e.recs[rids[1]]['name'], during))
 
-    print('4. all %d at once: more than the %d slots' % (len(R), a.slots))
+    print('4. all %d at once: %s the %d slots' % (len(R), 'more than' if len(R) > a.slots else 'at most', a.slots))
     t0 = time.time()
     rids = [start(n, 31 + i) for i, (n, _) in enumerate(R)]
     e.pump(lambda: e.finished(*rids))
@@ -208,6 +228,77 @@ def main():
           'B %s after %d tokens, its tokens B\'s alone as far as they go' % (db['reason'], e.ntok(r_b)))
     check(dc['reason'] == 'stop' and e.recs[r_c]['ids'] == cref[:k + 1],
           'C stopped at its stop id %d: %d tokens (%s; alone it is at %d)' % (sid, e.ntok(r_c), dc['reason'], k))
+
+    if a.wide:
+        n_all = len(R + RW)
+        print('9. %d requests at once: %d slots, %s' % (n_all, a.slots, (
+            'every one decodes (the 16-row step cap leaves them undrafted)' if a.slots >= n_all else
+            '%d decode, %d wait for a slot or take turns (--slice)' % (a.slots, n_all - a.slots))))
+        t0 = time.time()
+        rids = [start(n, 91 + i) for i, (n, _) in enumerate(R + RW)]
+        e.pump(lambda: e.finished(*rids))
+        for r in rids:
+            same(e.recs[r]['name'], e.recs[r], ref[e.recs[r]['name']])
+        wall = max(e.recs[r]['done']['t'] for r in rids) - t0
+        tok = sum(e.recs[r]['done']['completion'] - 1 for r in rids)
+        print('    %d requests: %d tokens in %.2f s from the submit (%.1f tok/s in all)'
+              % (len(rids), tok, wall, tok / wall))
+
+        print('10. eight at once with drafts (spec_batch_rows / 2, the B3 cap), all 16 rows of a step (%d slots)'
+              % a.slots)
+        grp = [n for n, _ in (R + RW)[:8]]
+        t0 = time.time()
+        rids = [start(n, 111 + i) for i, n in enumerate(grp)]
+        e.pump(lambda: e.finished(*rids))
+        for r in rids:
+            same('%s (%s, 8 with drafts)' % (e.recs[r]['name'], '+'.join(grp)), e.recs[r], ref[e.recs[r]['name']])
+        tok = sum(e.recs[r]['done']['completion'] - 1 for r in rids)
+        wall = max(e.recs[r]['done']['t'] for r in rids) - t0
+        print('    %s: %d tokens in %.2f s from the submit (%.1f tok/s in all)' % ('+'.join(grp), tok, wall, tok / wall))
+
+        print('11. a cancel and a stop id inside the 16-session batch (plain: past the draft cap)')
+        grp = [n for n, _ in R + RW]
+        t0 = time.time()
+        rids = [start(n, 131 + i, **({'stop': (sid,)} if n == 'C' else {})) for i, n in enumerate(grp)]
+        e.pump(lambda: e.ntok(rids[0]) >= 20)
+        e.cancel(rids[0])
+        e.pump(lambda: e.finished(*rids))
+        for r in rids:
+            name = e.recs[r]['name']
+            if r == rids[0]:
+                d = e.recs[r]['done']
+                check(d['reason'] == 'cancelled' and e.recs[r]['ids'] == ref[name]['ids'][:e.ntok(r)],
+                      'A %s after %d tokens, its tokens A\'s alone as far as they go' % (d['reason'], e.ntok(r)))
+            elif name == 'C':
+                dc = e.recs[r]['done']
+                check(dc['reason'] == 'stop' and e.recs[r]['ids'] == cref[:k + 1],
+                      'C stopped at its stop id %d: %d tokens (%s; alone it is at %d)'
+                      % (sid, e.ntok(r), dc['reason'], k))
+            else:
+                same(name, e.recs[r], ref[name])
+        wall = max(e.recs[r]['done']['t'] for r in rids) - t0
+        print('    16 sessions, A cancelled and C stopped: the batch ended after %.2f s' % wall)
+
+        print('12. a pause inside a 13-session batch (plain): a 14th request arrives')
+        grp = [n for n, _ in (R + RW)[:13]]
+        rids = [start(n, 151 + i) for i, n in enumerate(grp)]
+        e.pump(lambda: e.ntok(rids[0]) >= 20)
+        r14 = start((R + RW)[13][0], 171)
+        e.pump(lambda: e.finished(*rids, r14))
+        for r in rids + [r14]:
+            same('%s (%d-session batch)' % (e.recs[r]['name'], len(rids) + 1), e.recs[r], ref[e.recs[r]['name']])
+        lag = ttft(e.recs[r14]) - ttft(ref[e.recs[r14]['name']])
+        check(lag < 1.0, "%s's first token %.3f s after its submit, %.3f s later than alone"
+              % (e.recs[r14]['name'], ttft(e.recs[r14]), lag))
+
+        print('13. a pause inside a drafted batch of seven: an eighth session joins (16 rows)')
+        grp = [n for n, _ in (R + RW)[:7]]
+        rids = [start(n, 181 + i) for i, n in enumerate(grp)]
+        e.pump(lambda: e.ntok(rids[0]) >= 20)
+        r8 = start((R + RW)[7][0], 191)
+        e.pump(lambda: e.finished(*rids, r8))
+        for r in rids + [r8]:
+            same('%s (drafted batch, paused)' % e.recs[r]['name'], e.recs[r], ref[e.recs[r]['name']])
 
     for s in sorted(set(used)):
         e.release(s)
