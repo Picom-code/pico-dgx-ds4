@@ -24,6 +24,14 @@
 #   DSGB10_ENGINE_ARGS        the engine's arguments after --mode serve --socket <run/engine.sock>:
 #                             --max-ctx 262144 (the rest are serve's defaults)
 #   DSGB10_FRONT_ARGS         more of dsfront's arguments
+#   DSGB10_VISION_CMD         images (docs/vision.md): the vision encoder's command, which runs in the
+#                             foreground, from this configuration's directory:
+#                             "python3 tools/vision/vision_encoder.py --model <checkpoint>", say. The
+#                             service adds --host 127.0.0.1 --port DSGB10_VISION_PORT, runs it on rank 0
+#                             for as long as the front-end (with VISION_PRELOAD=1, unless the environment
+#                             has it: the weights load at its start), starts it again when it exits, and
+#                             gives the front-end --vision-addr. Unset: image input is refused
+#   DSGB10_VISION_PORT (18950)  the encoder's port on 127.0.0.1
 #   DSGB10_NOTE               added to ring.owner: how long the service will hold the ring, say
 #   DSGB10_BIN, DSGB10_FRONT_BIN  the binaries, copied at start (to the workers once the service has
 #                             the ring), so a later build does not change a running service:
@@ -45,7 +53,7 @@
 # installed beside the frozen engine as bin/fleet.conf on every box, where the engine reads it.
 # Files: SERVICE_DIR/{bin,logs} (~/dsgb10/service here) on every box; on rank 0 also run/ (mode 700: the
 # engine's socket, dsfront's admin socket, pids, state, settings). Logs: logs/service.log (the
-# supervisor), rank.0.log and front.log on rank 0, rank.<r>.log on each worker; rotated at every (re)start
+# supervisor), rank.0.log, front.log and vision.log (the encoder) on rank 0, rank.<r>.log on each worker; rotated at every (re)start
 # and, on rank 0, once over LOG_MIB (64); KEEP (5). Kept sessions, mode 600 in directories of mode 700:
 # rank<r>.service.spill and .index in the engine's spill directory on every box (the fleet's
 # RANK<r>_SPILL: /data/dsgb10/spill on rank 0, ~/dsgb10/spill on the others), server.service.index (the
@@ -53,7 +61,8 @@
 # conversations' text), saved at its stop; forget removes them.
 # A test instance, from the environment of every command: DSGB10_MOCK=1 runs dsfront's mock engine in
 # place of the four ranks, on rank 0 alone, and touches no rank, worker or page cache; it needs its own
-# DSGB10_HOME (in place of SERVICE_DIR), DSGB10_PORT and RING_LOCK (tests/yield_test.sh).
+# DSGB10_HOME (in place of SERVICE_DIR), DSGB10_PORT and RING_LOCK (tests/yield_test.sh), and with an
+# encoder its own DSGB10_VISION_PORT (tests/vision_test.sh).
 set -u
 NAME=dsgb10_rank
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -66,6 +75,7 @@ SOCK=$RUN/engine.sock ADMIN=$RUN/front.admin
 OWNERF=$RING_OWNER
 WS=("${FLEET_WORKERS[@]}")  # ranks 1-3
 MOCK=${DSGB10_MOCK:-0}
+VCMD= VPORT=18950  # for status and stop on a service whose run/settings predates the encoder
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
 KEEP=${KEEP:-5} LOG_MIB=${LOG_MIB:-64}
 READY_S=${READY_S:-600}           # rank 0 must be listening this long after it starts (it takes ~60 s)
@@ -73,6 +83,7 @@ MAX_FAILS=${MAX_FAILS:-5}         # more failures than this within FAIL_WINDOW s
 FAIL_WINDOW=${FAIL_WINDOW:-3600}
 ENGINE_DELAYS=(10 30 60 120 300)  # seconds before the n-th restart in a row
 FRONT_DELAYS=(2 5 10 30 60)
+VISION_DELAYS=(2 10 60 300 900)   # each start loads a model onto rank 0's GPU: one that keeps failing soon is rare
 
 log() { echo "$(date '+%F %T') $*"; }
 die() {
@@ -93,6 +104,7 @@ settings() {
   MIN_AVAIL_GIB=${MIN_AVAIL_GIB:-100}
   YIELD_IDLE_S=${DSGB10_YIELD_IDLE_S:-600} HOLD_S=${DSGB10_HOLD_S:-600}
   KEEP_GIB=${DSGB10_KEEP_GIB:-4}
+  VCMD=${DSGB10_VISION_CMD:-} VPORT=${DSGB10_VISION_PORT:-18950}
 }
 
 # the front-end's addresses, one per line; its URLs; every address's /health code; all of them 200
@@ -123,6 +135,10 @@ check() {
   [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
   [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "DSGB10_YIELD_IDLE_S and DSGB10_HOLD_S are seconds"
   [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "DSGB10_KEEP_GIB '$KEEP_GIB' is not GiB"
+  if [ -n "$VCMD" ]; then
+    [[ $VPORT =~ ^[0-9]+$ ]] && [ "$VPORT" != "$PORT" ] || die "DSGB10_VISION_PORT '$VPORT' is not a port of the encoder's own"
+    [[ " $FARGS " != *" --vision-addr "* ]] || die "DSGB10_VISION_CMD gives the front-end its --vision-addr: take it out of DSGB10_FRONT_ARGS"
+  fi
   if [ "$MOCK" = 1 ]; then  # a test instance must share nothing with the service
     [ "$H" != "$(fleet_local "$FLEET_SERVICE_DIR")" ] || die "a mock instance needs its own DSGB10_HOME"
     [ "$LOCK" != "$FLEET_LOCK" ] || die "a mock instance needs its own RING_LOCK"
@@ -268,7 +284,8 @@ stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight,
 start_front() {
   rotate "$LOGS/front.log"
   "$H/bin/dsfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
-    --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
+    --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" ${VCMD:+--vision-addr "127.0.0.1:$VPORT"} \
+    $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
   FE=$! FE_T=$(date +%s)
   echo "$FE" > "$RUN/front.pid"
   log "front-end started: pid $FE, $(urls)"
@@ -287,6 +304,45 @@ stop_front() {
   [ -n "$FE" ] && wait "$FE" 2> /dev/null
   FE=
   rm -f "$RUN/front.pid"
+}
+
+# The vision encoder (docs/vision.md), with DSGB10_VISION_CMD: beside the front-end, for as long as it,
+# a lend included. It runs in a session of its own, so that its pid is its process group's and a stop
+# reaches what the command started (a wrapper's child, a container's client). Image requests answer
+# 503 while it is down and text never passes through it: its exits are logged and it is started again
+# (VISION_DELAYS: at once, then ever more rarely, down to every 15 minutes), and they do not count
+# towards giving up.
+listening() { (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; }  # port: something accepts there
+start_vision() {
+  rotate "$LOGS/vision.log"
+  (cd "$SRC" && VISION_PRELOAD=${VISION_PRELOAD:-1} exec setsid bash -c "exec $VCMD --host 127.0.0.1 --port $VPORT") \
+    >> "$LOGS/vision.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
+  VE=$! VE_T=$(date +%s)
+  echo "$VE" > "$RUN/vision.pid"
+  log "vision encoder started: pid $VE, 127.0.0.1:$VPORT: $VCMD"
+}
+vision_pid() {  # the encoder's pid, if run/vision.pid still names the session started here on its port
+  local p port
+  p=$(cat "$RUN/vision.pid" 2> /dev/null) && [ -n "$p" ] || return 1
+  port=$(source "$RUN/settings" 2> /dev/null; echo "$VPORT")
+  tr '\0' ' ' < "/proc/$p/cmdline" 2> /dev/null | grep -q -- "--host 127.0.0.1 --port $port \$" && echo "$p"
+}
+end_group() {  # pid: SIGTERM to its process group, and SIGKILL to what is left of it 20 s later
+  local i
+  kill -TERM -- "-$1" 2> /dev/null || return 0
+  for ((i = 0; i < 40; i++)); do
+    kill -0 -- "-$1" 2> /dev/null || return 0
+    sleep 0.5
+  done
+  log "vision encoder still running 20 s after SIGTERM: kill -9"
+  kill -9 -- "-$1" 2> /dev/null
+}
+stop_vision() {  # also after its exit: what it left of its process group
+  [ -n "$VE" ] || return 0
+  end_group "$VE"
+  wait "$VE" 2> /dev/null
+  VE=
+  rm -f "$RUN/vision.pid"
 }
 
 # Lending the ring (docs/engine.md, "Borrowing the ring"): to a job that waits for it, once dsfront
@@ -356,14 +412,14 @@ supervise() {
   echo 0 > /proc/self/oom_score_adj 2> /dev/null
   STOP=
   trap 'STOP=1' TERM INT
-  log "supervisor pid $$: front-end $(urls), engine $EARGS"
+  log "supervisor pid $$: front-end $(urls), engine $EARGS${VCMD:+, vision encoder on 127.0.0.1:$VPORT}"
   exec 6>> "$RING_RECLAIM"  # flock'd while requests wait during a lend: no job takes the ring before us
   if ! freeze; then
     state failed "copying the binaries failed"
     rm -f "$RUN/supervisor.pid"
     exit 1
   fi
-  R0= FE= READY=0 READY_T=0 KILL_AT=0 R0_T=0 FE_T=0 LENT=0 LENT_T=0 RECLAIMING=0 FIRST=0
+  R0= FE= VE= READY=0 READY_T=0 KILL_AT=0 R0_T=0 FE_T=0 VE_T=0 LENT=0 LENT_T=0 RECLAIMING=0 FIRST=0
   # The front-end first: until the engine is up, it holds requests (DSGB10_HOLD_S each). A job that
   # holds the ring keeps it as during a lend, with no bound on the wait: a request that waits takes it
   # back (the job is preempted unless PREEMPT=0); with none, the engine starts once no job waits.
@@ -376,7 +432,7 @@ supervise() {
     log "the ring is busy ($(cat "$OWNERF" 2> /dev/null)): the engine starts once no job waits; requests wait at the front-end meanwhile, and one that waits takes the ring back as during a lend"
     state waiting "for the ring; requests wait at the front-end, up to $HOLD_S s each"
   fi
-  local now rc eb=0 fb=0 next_e=0 next_f=0 last_w=0 why= w r gone jobs seen= g n
+  local now rc eb=0 fb=0 vb=0 next_e=0 next_f=0 next_v=0 last_w=0 why= w r gone jobs seen= g n
   while [ -z "$STOP" ]; do
     now=$(date +%s)
     # the front-end: it reconnects to the engine's socket by itself, so it outlives engine restarts
@@ -394,6 +450,17 @@ supervise() {
       fb=$((fb + 1))
     fi
     if [ -z "$FE" ] && ((now >= next_f)); then start_front; fi
+    # the vision encoder: started here, and again after an exit, which is no failure of the service
+    if [ -n "$VE" ] && ! kill -0 "$VE" 2> /dev/null; then
+      wait "$VE"
+      rc=$?
+      ((now - VE_T >= 600)) && vb=0
+      next_v=$((now + VISION_DELAYS[vb < 4 ? vb : 4]))
+      vb=$((vb + 1))
+      log "vision encoder exited (rc $rc) after $((now - VE_T)) s; the next start at $(date -d "@$next_v" +%T): $(tail -n 2 "$LOGS/vision.log" | tr '\n' '|')"
+      stop_vision
+    fi
+    if [ -n "$VCMD" ] && [ -z "$VE" ] && ((now >= next_v)); then start_vision; fi
     # the engine: rank 0 exits when a peer dies or a step hangs (the step watchdog)
     if [ -n "$R0" ] && ! kill -0 "$R0" 2> /dev/null; then
       wait "$R0"
@@ -489,6 +556,7 @@ supervise() {
       fi
       rotate_live "$LOGS/rank.0.log"
       rotate_live "$LOGS/front.log"
+      [ -n "$VCMD" ] && rotate_live "$LOGS/vision.log"
       rotate_live "$LOGS/service.log"
       # a release that did not arrive (dsfront restarted, or its socket did not answer) must not hold
       # requests while the ring is ours
@@ -500,6 +568,7 @@ supervise() {
   state stopping "${why:-by service.sh stop}"
   [ "$LENT" = 0 ] && stop_engine  # lent: the ranks are the job's
   stop_front
+  stop_vision
   rm -f "$RUN/supervisor.pid" "$SOCK" "$ADMIN"
   if [ -n "$why" ]; then state failed "$why"; else state stopped "by service.sh stop"; fi
   exit 0  # the ring lock goes with this process
@@ -512,8 +581,10 @@ cmd_start() {
     cmd_status
     return
   fi
+  [ -z "$VCMD" ] || ! listening "$VPORT" ||
+    die "127.0.0.1:$VPORT is taken, where the vision encoder listens (an encoder a dead supervisor left: service.sh stop; a test instance needs its own DSGB10_VISION_PORT)"
   mkdir -p "$RUN" "$LOGS" && chmod 700 "$RUN" || die "cannot make $RUN"
-  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S KEEP_GIB MOCK > "$RUN/settings"
+  declare -p ADDR PORT KEY EARGS FARGS NOTE BIN FBIN MIN_AVAIL_GIB YIELD_IDLE_S HOLD_S KEEP_GIB MOCK VCMD VPORT > "$RUN/settings"
   rm -f "$RUN/state"
   setsid nohup bash "$SELF" _supervise > /dev/null 2>&1 < /dev/null &
   p=$!
@@ -572,11 +643,12 @@ cmd_stop() {
   fi
   # no supervisor: clean up after one that died, but only with the ring lock (else the ranks may be
   # another job's)
-  if [ -f "$RUN/rank0.pid" ] || [ -f "$RUN/front.pid" ]; then
+  if [ -f "$RUN/rank0.pid" ] || [ -f "$RUN/front.pid" ] || [ -f "$RUN/vision.pid" ]; then
     exec 9>> "$LOCK"
     if flock -n 9; then
       p=$(cat "$RUN/front.pid" 2> /dev/null)
       [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = dsfront ] && kill -TERM "$p"
+      p=$(vision_pid) && end_group "$p"
       p=$(cat "$RUN/rank0.pid" 2> /dev/null)
       if [ "$MOCK" = 1 ]; then
         [ -n "$p" ] && [ "$(cat "/proc/$p/comm" 2> /dev/null)" = dsfront ] && kill -TERM "$p"
@@ -584,7 +656,7 @@ cmd_stop() {
         pkill -x $NAME
       fi
       reap_all 10
-      rm -f "$RUN/rank0.pid" "$RUN/front.pid" "$SOCK"
+      rm -f "$RUN/rank0.pid" "$RUN/front.pid" "$RUN/vision.pid" "$SOCK"
       echo "service.sh: not running; stopped what a dead supervisor left"
       return 0
     fi
@@ -653,6 +725,11 @@ cmd_status() {
   code=$(health)
   fp=$(cat "$RUN/front.pid" 2> /dev/null)
   echo "  front-end: $(urls), pid ${fp:-none}, /health ${code% } ($(health_ok && echo "the engine is connected" || echo "not serving"))"
+  if [ -n "$VCMD" ] && p=$(vision_pid); then
+    echo "  vision encoder: pid $p, up $(ps -o etime= -p "$p" | tr -d ' '), 127.0.0.1:$VPORT $(listening "$VPORT" && echo "listening" || echo "not listening (it loads its weights first)")"
+  elif [ -n "$VCMD" ]; then
+    echo "  vision encoder: not running (image requests answer 503 until it is started again)"
+  fi
   p=$(admin status) && echo "  gate: $p"
   p=$(wants)
   [ -n "$p" ] && echo "  waiting for the ring:" && sed 's/^/    /' <<< "$p"
@@ -668,7 +745,7 @@ cmd_status() {
     echo "  rank $r ($w): ${pids:-unreachable}"
     r=$((r + 1))
   done
-  echo "  logs: $LOGS/{service,rank.0,front}.log${WS[*]:+; workers ~/$RH/logs/rank.<r>.log}"
+  echo "  logs: $LOGS/{service,rank.0,front${VCMD:+,vision}}.log${WS[*]:+; workers ~/$RH/logs/rank.<r>.log}"
   [ "$st" = serving ] && health_ok
 }
 
