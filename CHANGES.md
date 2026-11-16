@@ -119,3 +119,18 @@ Measured and not built:
   166 held-out sequences did not close the gap (chat accepted length 1.463 -> 1.464, FP8 1.493); a full fine-tune was not run.
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
+
+## Thinking options, 100 images per request, video input (2026-11-15; pull requests #4, #5, #6 by MiaAI-Lab)
+
+Merged with maintainer commits on top. Tested on the real 4-Spark engine on a test port: output identity 54/54,
+images 15/15, 16 users 375-378 tok/s (unchanged), encoder rows byte-identical to the previous encoder's.
+
+| Change | Default | Notes |
+|---|---|---|
+| `reasoning_effort` is validated; `thinking: {"type": "enabled" \| "disabled"}` is read | thinking stays OFF unless a request or `--thinking` turns it on | unknown values now return 400; any explicit off-switch wins; `minimal` = 1, `ultra` = 95 |
+| Up to 100 images per request (was 16) | `--max-image-rows 40000` per request, `--max-image-rows-in-flight 80000` across requests | over the per-request cap: 400 before anything is encoded; over the in-flight cap: 429 with `Retry-After`; body limit stays 64 MiB (`--max-body-mb`) |
+| Video input (`video_url`, timestamped frame sampling, 32 frames by default) | on when the vision encoder runs | frames count against the same row caps; unreadable clips, local paths and private addresses return 400 |
+
+Memory on a 4-Spark head: about 1.3 GiB for 100 small images, 0.8 GiB for 40 full-size images in one request (measured).
+Two full-size requests at once were not measured: set `--max-image-rows-in-flight 40000` on a head with less than ~10 GiB free.
+The engine, the front-end and the vision encoder must be updated together: the new front-end sends requests the older engine and encoder refuse.
