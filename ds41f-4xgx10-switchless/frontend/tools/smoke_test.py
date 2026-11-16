@@ -117,6 +117,13 @@ def main():
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
           and not b["choices"][0]["message"].get("reasoning_content"), "none disables thinking despite a conflicting template flag")
 
+    # an explicit off-switch wins over an effort, and a template effort alone does not switch thinking on
+    for extra, what in (({"reasoning_effort": "high", "chat_template_kwargs": {"thinking": False}}, "template thinking false wins over a top-level effort"),
+                        ({"chat_template_kwargs": {"reasoning_effort": 40}}, "a template effort alone leaves thinking off")):
+        s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}], **extra})
+        check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there"
+              and not b["choices"][0]["message"].get("reasoning_content"), what)
+
     # the request's own thinking switch
     hi = [{"role": "user", "content": "Hello there"}]
     s, b = request("POST", "/v1/chat/completions", {"messages": hi, "thinking": {"type": "enabled"}})
