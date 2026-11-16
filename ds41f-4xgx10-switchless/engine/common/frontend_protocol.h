@@ -51,6 +51,8 @@ struct ImageSpan {
   uint64_t hash;  // of the image's bytes (logs)
 };
 constexpr int kImageDim = 5120;
+constexpr uint32_t kMaxImages = 100;
+constexpr uint32_t kMaxImageRows = 1100;
 constexpr uint32_t kImageTokenId = 129264;
 
 struct SubmitHeader {

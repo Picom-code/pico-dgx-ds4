@@ -84,15 +84,77 @@ across ranks) and the slot layout are unchanged. Workers are untouched.
 
 ## Running it
 
+Each chat-completions request accepts up to **100 images across all messages**, including prior
+turns. Image URLs and base64 data URLs are supported. The JSON body limit is 64 MiB unless
+`dsfront serve --max-body-mb N` raises it (a larger body is answered 413); image tokens
+and text must together fit the context window. Images are encoded sequentially. The encoder and
+engine frame limits include room for all 100 images' embedding rows. Large image batches take
+longer than single-image requests; the encoder timeout scales with image count to allow URL fetches.
+
+Memory follows image **tokens**, not the number of images. Every image token is one embedding row of
+10 KiB (bf16 x 5120) in the encoder's reply, again in the front-end and again in rank 0's request, on
+the box that also holds rank 0's weights. A 768 x 768 picture is about 380 rows; the largest an image
+gets is 994. Measured on 4 Sparks with the engine up: 100 pictures of 383 rows (38,300 rows) took about
+2 GB on rank 0's box; 40 full-size images (39,760 rows) took its free memory from 11.6 to 8.4 GiB, and
+100 full-size ones (99,400 rows) would have exhausted it. So the rows of all the images of one request
+are capped as well: **40,000 by default**, `dsfront serve --max-image-rows N` (up to 110,000, which is
+what the frame limits have room for) and the encoder's `--max-rows N`; the lower of the two applies.
+A request over the cap is answered 400 (`at most 40000 image tokens per request ...`) from the
+encoder's reply header, before the front-end reads or allocates any row and before anything reaches
+the engine; an encoder with `--max-rows` also stops at the image that crosses it, before the ViT runs on that image (its rows are known from its size). Raise both
+flags together, and only with the memory to spare: budget 50 to 80 MiB of rank 0's box per 1,000 rows
+of one request (the two measurements above, taken before the front-end's copies of the rows were
+halved; expect less), times the image requests in flight.
+
+Image requests in flight are limited together as well: `--max-image-rows-in-flight N` (80,000: two
+requests at the default cap; not below `--max-image-rows`). A request with images takes its share
+before anything is done for it: first the most its images can take (1,100 rows each, at most the
+request cap), then, once the encoder has answered, what they do take; it gives the share back when it
+ends, however it ends. A request that does not fit is answered at once with 429, `Retry-After: 5` and
+a message that says how much is held; it is not queued, because a queued request is its body held in
+memory while it waits (inline images are megabytes), and OpenAI-style clients retry a 429 after
+`Retry-After` by themselves. Text requests are never counted, delayed or refused by this limit. What it
+does not bound: the bodies of requests while they are being received and parsed, which is what
+`--max-body-mb` is for.
+
+What a request costs in the front-end itself, as peak resident memory over idle (mock engine and a
+stand-in encoder, no GPU):
+
+| request | before | now |
+|---|---|---|
+| rows: 100 pictures of 383 rows (374 MiB of rows), peak | 1,496 MiB (4.0x) | 748 MiB (2.0x) |
+| rows: resident after the request | 375 MiB | 1 MiB |
+| body: 60 MiB with 20 inline images, peak | 716 MiB (12x) | 444 MiB (7.4x) |
+| body: while the encoder works | 476 MiB (7.9x) | 295 MiB (4.9x) |
+
+The rows are read from the encoder into the SUBMIT's image part directly and exist once more only
+while the frame is written. A body of inline images is still copied while its request is prepared
+(the bytes, the parsed JSON, the converted messages, the image records, the encoder's request), which
+is why the body limit stays at 64 MiB unless `--max-body-mb` raises it. Images given by URL cost the
+front-end nothing of this: the encoder fetches them.
+
+The encoder's request limits have CPU tests that need only torch (no model, no GPU):
+`python3 -m unittest discover -s tools/vision -p test_encoder_limits.py -v`.
+
 ```
 docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g -e VISION_PRELOAD=1 \
   -v $MODEL:/model:ro -v $PWD/tools/vision:/app:ro --entrypoint python3 <image with torch + PIL + safetensors> \
-  /app/vision_encoder.py --host 127.0.0.1 --port 18950
+  /app/vision_encoder.py --host 127.0.0.1 --port 18950 --max-images 100
 dsfront serve ... --vision-addr 127.0.0.1:18950
 ```
 
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
 (correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).
+
+For a running vision-enabled endpoint, the 100-image smoke test generates numbered OCR cards
+locally (Pillow and a TrueType font required), checks the first and last image of the full batch,
+verifies that 101 images and broken image bytes return 400, and checks text afterwards:
+
+```bash
+python3 tools/vision/smoke_100.py http://127.0.0.1:PORT/v1/chat/completions --key-file ~/api-key --output vision-100.json
+```
+
+Omit `--key-file` for an unauthenticated test server; `--font PATH` selects another font.
 
 ## Not done (v1)
 
