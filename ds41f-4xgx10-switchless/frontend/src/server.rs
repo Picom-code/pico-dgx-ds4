@@ -171,14 +171,16 @@ const IMAGE_RETRY_AFTER_S: u64 = 5;
 /// is done for it (before the encoder, the read of the rows and the engine), and gives it back when
 /// it ends: answered, failed or abandoned by its client. What it will take is not known until the
 /// encoder has answered, so it first holds the most its images can take (1100 rows each, at most the
-/// request cap), and from the encoder's answer on what they do take.
+/// request cap), and from the encoder's answer on what they do take. A clip's frames are image parts
+/// by the time a request gets here (video.rs), so they are counted like any other image; the decoding
+/// before that is one clip at a time in the encoder.
 ///
 /// A request that does not fit is refused at once: 429 with Retry-After. It is not queued, because a
 /// waiting request is its body held in memory (megabytes of inline images each) for as long as the
 /// ones ahead of it take, and that queue would need a bound and a time limit of its own; the clients'
 /// SDKs retry a 429 after Retry-After by themselves. A text request has no images and is never
 /// counted, delayed or refused here.
-fn hold_image_rows(cfg: &ServerConfig, budget: &Arc<crate::vision::RowsInFlight>, p: &mut Prepared) -> Result<(), Response> {
+pub(crate) fn hold_image_rows(cfg: &ServerConfig, budget: &Arc<crate::vision::RowsInFlight>, p: &mut Prepared) -> Result<(), Response> {
     if p.images.is_empty() {
         return Ok(());
     }
@@ -189,9 +191,9 @@ fn hold_image_rows(cfg: &ServerConfig, budget: &Arc<crate::vision::RowsInFlight>
             Ok(())
         }
         Err(in_flight) => {
-            eprintln!("image rows in flight: {in_flight} of {}; a request with {} images (up to {rows} rows) is answered 429", budget.max(), p.images.len());
+            eprintln!("image rows in flight: {in_flight} of {}; a request with {} images and video frames (up to {rows} rows) is answered 429", budget.max(), p.images.len());
             let msg = format!(
-                "too much image work in flight: the image requests being answered hold {in_flight} of {} image tokens (--max-image-rows-in-flight) and this request's {} images may take up to {rows}; try again in a few seconds",
+                "too much image work in flight: the image requests being answered hold {in_flight} of {} image tokens (--max-image-rows-in-flight) and this request's {} images and video frames may take up to {rows}; try again in a few seconds",
                 budget.max(),
                 p.images.len()
             );
@@ -932,13 +934,16 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
-    let req: Value = match serde_json::from_slice(&body) {
+    let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
     };
     // A request with inline images is megabytes: each copy is freed when its last reader is done,
     // rather than held until the answer ends. The body's bytes are not needed once parsed.
     drop(body);
+    if let Err(e) = crate::video::expand(&mut req, app.cfg.vision_addr.as_deref()).await {
+        return if e.starts_with("cannot read") { bad_request(e) } else { error(StatusCode::SERVICE_UNAVAILABLE, "server_error", e) };
+    }
     let mut p = match prepare(&app.cfg, &req) {
         Ok(p) => p,
         Err(e) => return bad_request(e),
@@ -1102,10 +1107,10 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn cfg() -> ServerConfig {
+    pub(crate) fn cfg() -> ServerConfig {
         ServerConfig {
             model_name: "m".into(),
             api_key: None,
@@ -1635,7 +1640,7 @@ mod tests {
         assert_eq!(v["error"]["code"], 429);
         assert_eq!(v["error"]["type"], "rate_limit_error");
         let msg = v["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("hold 40000 of 40000 image tokens (--max-image-rows-in-flight)") && msg.contains("3 images may take up to 3300"), "{msg}");
+        assert!(msg.contains("hold 40000 of 40000 image tokens (--max-image-rows-in-flight)") && msg.contains("3 images and video frames may take up to 3300"), "{msg}");
     }
 
     /// POST a body of `len` bytes to a route that takes its body the way the chat route does, behind

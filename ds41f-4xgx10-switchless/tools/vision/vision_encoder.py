@@ -25,9 +25,12 @@ import os
 import socket
 import socketserver
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -45,6 +48,8 @@ p.add_argument("--max-images", type=int, default=100)
 # own cap (--max-image-rows, the same default) with each request; the lower of the two applies.
 p.add_argument("--max-rows", type=int, default=40000)
 p.add_argument("--max-bytes", type=int, default=32 << 20)  # per fetched image
+p.add_argument("--max-video-bytes", type=int, default=128 << 20)
+p.add_argument("--video-timeout-s", type=float, default=60)
 p.add_argument("--idle-unload-s", type=float, default=0)   # 0: keep the weights resident
 a = p.parse_args()
 
@@ -80,6 +85,7 @@ assert args.vision_n_layers > 0
 
 _model = None
 _lock = threading.Lock()
+_video_lock = threading.Lock()
 _last = time.time()
 
 
@@ -115,9 +121,13 @@ def load():
     return _model
 
 
-def _public(host):
+class MediaError(ValueError):
+    """A request's image or video cannot be taken; the message is ours and goes to the client as it is."""
+
+
+def _public(host, kind="image"):
     """Only public addresses are fetched (no loopback, private, link-local or reserved: no SSRF into the
-    cluster); VISION_ALLOW_PRIVATE=1 lifts it for tests."""
+    cluster); VISION_ALLOW_PRIVATE=1 lifts it for tests. `kind` names the input in the message."""
     import ipaddress
 
     if os.environ.get("VISION_ALLOW_PRIVATE", "0") == "1":
@@ -125,11 +135,13 @@ def _public(host):
     for fam, _, _, _, sa in socket.getaddrinfo(host, None):
         ip = ipaddress.ip_address(sa[0])
         if not ip.is_global or ip.is_multicast:
-            raise ValueError("image URL host %s is not a public address" % host)
+            raise MediaError("%s URL host %s is not a public address" % (kind, host))
 
 
-def fetch(record):
-    """Image bytes from a record (image_processor.load_image_bytes, with a size cap for URLs)."""
+def fetch(record, max_bytes=None, kind="image"):
+    """Image (or, for kind "video", clip) bytes from a record (image_processor.load_image_bytes, with a
+    size cap for URLs). The messages name the input by `kind`."""
+    limit = a.max_bytes if max_bytes is None else max_bytes
     url = record.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
         from urllib.parse import urlsplit
@@ -137,21 +149,91 @@ def fetch(record):
 
         class Redir(HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                _public(urlsplit(newurl).hostname or "")
+                _public(urlsplit(newurl).hostname or "", kind)
                 return super().redirect_request(req, fp, code, msg, hdrs, newurl)
 
-        _public(urlsplit(url).hostname or "")
+        _public(urlsplit(url).hostname or "", kind)
         with build_opener(Redir).open(Request(url, headers={"User-Agent": "dsgx10-vision/1"}), timeout=20) as r:
-            b = r.read(a.max_bytes + 1)
-        if len(b) > a.max_bytes:
-            raise ValueError("image larger than %d bytes" % a.max_bytes)
+            b = r.read(limit + 1)
+        if len(b) > limit:
+            raise MediaError("%s larger than %d bytes" % (kind, limit))
         return b
     if isinstance(url, str) and url and not url.startswith("data:"):
-        raise ValueError("image url must be a data: URL or http(s)")  # no local paths over the API
+        raise MediaError("%s url must be a data: URL or http(s)" % kind)  # no local paths over the API
     src = record.get("source")
     if isinstance(src, dict) and src.get("url") and not src.get("data"):
-        return fetch({"url": src["url"]})
-    return ip.load_image_bytes(record)
+        return fetch({"url": src["url"]}, limit, kind)
+    raw = ip.load_image_bytes(record)
+    if len(raw) > limit:
+        raise MediaError("%s larger than %d bytes" % (kind, limit))
+    return raw
+
+
+def fetch_video(record):
+    """A clip's bytes. Our own refusals (MediaError) go to the client as they are; anything a library
+    raises while fetching or unpacking (urllib's "<urlopen error [Errno -2] ...>", base64's "Incorrect
+    padding", a socket timeout) is logged and replaced by plain words."""
+    from urllib.error import HTTPError
+
+    try:
+        return fetch(record, a.max_video_bytes, "video")
+    except MediaError:
+        raise
+    except HTTPError as e:
+        raise MediaError("could not fetch the video: the server answered HTTP %d" % e.code) from e
+    except Exception as e:  # noqa: BLE001
+        log("video fetch failed:", repr(e))
+        url = record.get("url") or (record.get("source") or {}).get("url") if isinstance(record, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            raise MediaError("could not fetch the video from its URL") from e
+        raise MediaError("the video data is not valid base64") from e
+
+
+def decode_videos(req):
+    videos = req.get("videos")
+    budget = req.get("frame_budget", a.max_images)
+    if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= a.max_images:
+        raise MediaError("invalid video frame budget")
+    if not isinstance(videos, list) or not 1 <= len(videos) <= budget:
+        raise MediaError("not enough frame budget for the videos")
+    results = []
+    with _video_lock:
+        for record in videos:
+            count = record.get("max_frames", 32)
+            if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= a.max_images:
+                raise MediaError("max_frames must be an integer between 1 and %d" % a.max_images)
+            count = min(count, budget // len(videos))
+            raw = fetch_video(record)
+            with tempfile.TemporaryDirectory(prefix="vision-video-") as tmp:
+                clip = Path(tmp) / "clip"
+                clip.write_bytes(raw)
+                try:
+                    result = subprocess.run(
+                        [sys.executable, str(Path(__file__).with_name("video_frames.py")), str(clip), "--max-frames", str(count)],
+                        capture_output=True, timeout=a.video_timeout_s, check=False,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    raise MediaError("video decoding timed out") from e
+            # The decoder answers in plain words (video_frames.VideoError). Whatever else comes out of the
+            # subprocess (a crash, no JSON, a library's error text on stderr) is logged here and the
+            # client is told the clip is not a readable video.
+            if result.stderr.strip():
+                log("video decoder stderr:", result.stderr[-400:].decode(errors="replace").strip())
+            try:
+                decoded = json.loads(result.stdout)
+            except (ValueError, UnicodeError):
+                decoded = None
+            if not isinstance(decoded, dict) or result.returncode or not decoded.get("ok"):
+                said = decoded.get("error") if isinstance(decoded, dict) else None
+                if not isinstance(said, str) or not said or result.returncode not in (0, 1):
+                    log("video decoder failed: exit %s, %d B of output" % (result.returncode, len(result.stdout)))
+                    said = "not a readable video"
+                raise MediaError(said)
+            if not isinstance(decoded.get("duration"), (int, float)) or not isinstance(decoded.get("frames"), list):
+                raise MediaError("not a readable video")
+            results.append({"duration": decoded["duration"], "frames": decoded["frames"]})
+            log(f"video {len(raw)} B, {decoded['duration']:.3f} s -> {len(decoded['frames'])} timestamped frames")
+    return results
 
 
 @torch.inference_mode()
@@ -249,8 +331,18 @@ class H(socketserver.BaseRequestHandler):
             if n > (256 << 20):
                 return
             try:
-                imgs, data = handle(json.loads(recv_exact(s, n)))
-                hdr = {"ok": True, "images": imgs}
+                req = json.loads(recv_exact(s, n))
+                if "videos" in req:
+                    try:
+                        hdr, data = {"ok": True, "videos": decode_videos(req)}, b""
+                    except MediaError:
+                        raise
+                    except Exception as e:  # noqa: BLE001  (not one of our refusals: its text stays in the log)
+                        log("video error:", repr(e))
+                        raise MediaError("the video could not be processed") from e
+                else:
+                    imgs, data = handle(req)
+                    hdr = {"ok": True, "images": imgs}
             except Exception as e:  # noqa: BLE001  (the error goes back to the client as a 400)
                 log("error:", repr(e))
                 hdr, data = {"ok": False, "error": str(e)[:500]}, b""

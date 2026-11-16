@@ -113,7 +113,8 @@ request cap), then, once the encoder has answered, what they do take; it gives t
 ends, however it ends. A request that does not fit is answered at once with 429, `Retry-After: 5` and
 a message that says how much is held; it is not queued, because a queued request is its body held in
 memory while it waits (inline images are megabytes), and OpenAI-style clients retry a 429 after
-`Retry-After` by themselves. Text requests are never counted, delayed or refused by this limit. What it
+`Retry-After` by themselves. A clip's frames count like images (they are image parts by then; the
+decoding before that is one clip at a time in the encoder). Text requests are never counted, delayed or refused by this limit. What it
 does not bound: the bodies of requests while they are being received and parsed, which is what
 `--max-body-mb` is for.
 
@@ -156,9 +157,64 @@ python3 tools/vision/smoke_100.py http://127.0.0.1:PORT/v1/chat/completions --ke
 
 Omit `--key-file` for an unauthenticated test server; `--font PATH` selects another font.
 
+## Video input
+
+Chat-completions requests also accept `video_url` content parts. Public HTTP(S) URLs and base64
+data URLs work, for example:
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,...", "max_frames": 32}},
+  {"type": "text", "text": "Describe what happens in this clip, in order."}
+]}]}
+```
+
+The encoder needs PyAV (`av`) as well as the image dependencies. It samples up to 32 frames per clip
+by default, uniformly from the start through the end; `max_frames` accepts integers from 1 to 100.
+For several clips, the available frame budget is divided between them. Video frames and still
+images together share the 100-image limit across all messages. Each frame is resized to fit within
+768x768 pixels and is inserted as an image with its timestamp and the clip duration, preserving
+its place in the conversation. Frame extraction runs in a separate process with a 60-second timeout.
+Clips are limited to 128 MiB (`--max-video-bytes`). A clip sent inline as base64 must also fit the
+HTTP JSON limit, 64 MiB unless `dsfront serve --max-body-mb N` raises it (about 47 MiB of video at
+the default); larger clips go by URL. Nested media protocols are disabled,
+and video URLs use the same public-address-only fetch rules as images.
+
+Video frames are images to everything after the decoder, so they count against the cap on a
+request's image tokens (`--max-image-rows`, 40,000 by default; see above) together with its still
+images. A frame is at most 768x768, about 380 tokens, so a clip alone stays under the default cap
+even at 100 frames (the 32-frame default is 7,000 to 12,000 tokens); a clip next to many large images
+may not, and is then answered 400 like any request over the cap.
+
+This is visual video analysis through the existing vision tower. Audio tracks are ignored. Streaming
+and non-streaming chat requests both work; video decoding happens before generation starts.
+
+A clip that cannot be used is answered 400 in plain words: `cannot read the video: not a readable
+video` for anything the decoder cannot open (corrupt or truncated files, playlists, other formats),
+`the clip has no video stream`, `video url must be a data: URL or http(s)`, `video URL host H is not
+a public address`, `could not fetch the video from its URL`. The decoder's and the libraries' own
+error text goes to the encoder's log, not to the client.
+
+CPU-only decoder tests (PyAV and Pillow required; `test_video_errors.py` also needs torch, CPU only):
+
+```bash
+python3 -m unittest discover -s tools/vision -p test_video_frames.py -v
+python3 -m unittest discover -s tools/vision -p test_video_errors.py -v
+```
+
+For a running endpoint, test a local clip with streaming and non-streaming requests, bad inputs,
+the shared frame budget, then ordinary image and text requests:
+
+```bash
+python3 tools/vision/smoke_video.py http://127.0.0.1:PORT/v1/chat/completions clip.mp4 --key-file ~/api-key --output video-results.json
+```
+
+With a clip showing known codes in successive scenes, add `--expected 1111 2222 3333` to assert
+their order. The live smoke script needs Pillow; generating or decoding clips on the client is not required.
+
 ## Not done (v1)
 
 - No prefix reuse for image turns (each image request prefills its whole prompt).
 - Images are encoded one at a time on one GPU; no batching across requests.
-- `input_image` (Responses API), video and audio parts are refused.
+- `input_image` (Responses API) and audio parts are refused.
 

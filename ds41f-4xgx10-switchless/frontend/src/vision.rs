@@ -113,13 +113,48 @@ pub struct Encoded {
     pub ms: f64,
 }
 
+/// A loopback encoder RPC whose answer is its JSON header: video expansion (video.rs), which returns
+/// frame records and no binary data. Image rows go through `encode`, which checks the header against
+/// the row cap before it reads them.
+pub(crate) async fn exchange(addr: &str, body: &Value, timeout: Duration, max_data: usize) -> Result<(Value, Vec<u8>), String> {
+    let body = body.to_string().into_bytes();
+    if body.len() > 256 << 20 {
+        return Err("media request exceeds 256 MiB".into());
+    }
+    let fut = async {
+        let mut s = TcpStream::connect(addr).await.map_err(|e| format!("the image encoder is not reachable: {e}"))?;
+        s.write_all(&(body.len() as u32).to_le_bytes()).await.map_err(|e| e.to_string())?;
+        s.write_all(&body).await.map_err(|e| e.to_string())?;
+        let mut n4 = [0u8; 4];
+        s.read_exact(&mut n4).await.map_err(|e| format!("image encoder: {e}"))?;
+        let header_len = u32::from_le_bytes(n4) as usize;
+        if header_len > 128 << 20 {
+            return Err("image encoder: JSON reply too large".into());
+        }
+        let mut h = vec![0u8; header_len];
+        s.read_exact(&mut h).await.map_err(|e| format!("image encoder: {e}"))?;
+        let mut n8 = [0u8; 8];
+        s.read_exact(&mut n8).await.map_err(|e| format!("image encoder: {e}"))?;
+        let n = u64::from_le_bytes(n8) as usize;
+        if n > max_data {
+            return Err("image encoder: reply too large".to_string());
+        }
+        let mut data = vec![0u8; n];
+        s.read_exact(&mut data).await.map_err(|e| format!("image encoder: {e}"))?;
+        let h: Value = serde_json::from_slice(&h).map_err(|e| format!("image encoder: {e}"))?;
+        Ok::<_, String>((h, data))
+    };
+    tokio::time::timeout(timeout, fut).await.map_err(|_| "the image encoder timed out".to_string())?
+}
+
 /// Whether an error of `encode` is the request's fault (answered 400) rather than the encoder's (503).
 pub fn is_request_error(e: &str) -> bool {
     e.starts_with("cannot read") || e.starts_with("at most ")
 }
 
 fn too_many_rows(max_rows: usize, total: usize) -> String {
-    format!("at most {max_rows} image tokens per request (--max-image-rows); the images of this request take {total}")
+    // video frames are images by now (video.rs): they count like any other
+    format!("at most {max_rows} image tokens per request (--max-image-rows); the images and video frames of this request take {total}")
 }
 
 /// The rows and hash of each image from the encoder's reply header, checked against the request and the
@@ -270,7 +305,7 @@ impl EncodeRequest<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -423,7 +458,7 @@ mod tests {
         let (addr, _enc) = fake_encoder(reply_with_rows(&[994; 41]), false).await;
         let t0 = Instant::now();
         let e = encode(&addr, &records(41), T, DEFAULT_MAX_IMAGE_ROWS).await.unwrap_err();
-        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images of this request take 40754");
+        assert_eq!(e, "at most 40000 image tokens per request (--max-image-rows); the images and video frames of this request take 40754");
         assert!(is_request_error(&e), "answered 400, not 503");
         assert!(t0.elapsed() < Duration::from_secs(5), "refused from the reply's header, without waiting for rows");
         // 40 of them are exactly 39,760: allowed
