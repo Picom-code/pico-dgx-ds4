@@ -237,17 +237,27 @@ def decode_videos(req):
 
 
 @torch.inference_mode()
-def encode(raw: bytes):
-    """One image's span rows [n, 5120] bf16 and its grid (the reference's load_image + encode_image +
+def measure(raw: bytes):
+    """One image read and cut into ViT patches, and the layout of its span (the reference's load_image
+    and image_token_types): CPU work. `types.numel()` is the rows the image will take, known here,
+    before the ViT has run on it."""
+    with torch.device("cuda"):  # the same default device as `encode`, as before the two were split
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = ip.load_image({"data": raw}, args)
+        types = ip.image_token_types(n_llm_h, n_llm_w)
+    return patches, types, (n_vit_h, n_vit_w, n_llm_h, n_llm_w)
+
+
+@torch.inference_mode()
+def encode(patches, types, grid):
+    """A measured image's span rows [n, 5120] bf16 and its grid (the reference's encode_image +
     merge_image_embeddings, for one span)."""
     vit, aligner, delim = load()
     with torch.device("cuda"):  # set_default_device is per thread; the RoPE tables are made here
-        return _encode(raw, vit, aligner, delim)
+        return _encode(patches, types, grid, vit, aligner, delim)
 
 
-def _encode(raw, vit, aligner, delim):
-    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = ip.load_image({"data": raw}, args)
-    types = ip.image_token_types(n_llm_h, n_llm_w)
+def _encode(patches, types, grid, vit, aligner, delim):
+    n_vit_h, n_vit_w, n_llm_h, n_llm_w = grid
     feats = aligner(vit(patches.to("cuda"), n_vit_h, n_vit_w), n_vit_h, n_vit_w)  # [n_llm_h * n_llm_w, 5120]
     assert feats.shape[0] == n_llm_h * n_llm_w, (feats.shape, n_llm_h, n_llm_w)
     t = types.to("cuda")
@@ -282,11 +292,13 @@ def handle(req):
         for k, r in enumerate(recs, 1):
             t0 = time.time()
             raw = fetch(r)
-            span, g = encode(raw)
-            total += span.shape[0]
-            if total > limit:  # stop here: nothing more is encoded or kept for this request
+            patches, types, grid = measure(raw)
+            total += types.numel()
+            if total > limit:  # stop here, before the ViT runs on this image: it and the rest are never encoded
                 raise TooManyRows("at most %d image tokens per request; the first %d of %d images already take %d"
                                   % (limit, k, len(recs), total))
+            span, g = encode(patches, types, grid)
+            assert span.shape[0] == types.numel(), (span.shape, types.numel())
             torch.cuda.synchronize()
             ms = 1e3 * (time.time() - t0)
             blobs.append(span.view(torch.int16).cpu().numpy().tobytes())

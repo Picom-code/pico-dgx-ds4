@@ -101,7 +101,7 @@ are capped as well: **40,000 by default**, `dsfront serve --max-image-rows N` (u
 what the frame limits have room for) and the encoder's `--max-rows N`; the lower of the two applies.
 A request over the cap is answered 400 (`at most 40000 image tokens per request ...`) from the
 encoder's reply header, before the front-end reads or allocates any row and before anything reaches
-the engine; an encoder with `--max-rows` also stops encoding at the image that crosses it. Raise both
+the engine; an encoder with `--max-rows` also stops at the image that crosses it, before the ViT runs on that image (its rows are known from its size). Raise both
 flags together, and only with the memory to spare: budget 50 to 80 MiB of rank 0's box per 1,000 rows
 of one request (the two measurements above, taken before the front-end's copies of the rows were
 halved; expect less), times the image requests in flight.
