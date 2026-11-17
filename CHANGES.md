@@ -147,7 +147,13 @@ Memory on a 4-Spark head: about 1.3 GiB for 100 small images, 0.8 GiB for 40 ful
 Two full-size requests at once were not measured: set `--max-image-rows-in-flight 40000` on a head with less than ~10 GiB free.
 The engine, the front-end and the vision encoder must be updated together: the new front-end sends requests the older engine and encoder refuse.
 
-## `/metrics` for sparkDash (2026-11-17)
+## `/metrics` for sparkDash (2026-11-17; pull request #12 by 100menotu001)
+
+The endpoint, its series and the exposition's tests are [@100menotu001](https://github.com/100menotu001)'s work,
+contributed to [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4) as
+[PR #12](https://github.com/Picom-code/pico-dgx-ds4/pull/12) and carried here onto the branch the ring deploys.
+This fork's contribution is the port: the same code on top of the vision encoder and the other pull requests,
+with the deploy tool pointed at the branch. The text below is theirs.
 
 dsfront answers `GET /metrics` on the same addresses and port as the API, unauthenticated like `/health`, in the
 Prometheus text exposition format. The series keep the `tensorfold:` prefix of the serve they replace, so a scraper

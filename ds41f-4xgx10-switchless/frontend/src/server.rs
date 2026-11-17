@@ -72,6 +72,8 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
 /// Monotonic counters for /metrics (sparkDash reads them as `tensorfold:*`).
 ///
+/// By @100menotu001, from Picom-code/pico-dgx-ds4#12; carried onto this branch unchanged.
+///
 /// `CACHED_TOTAL` counts the prompt tokens whose KV was reused, and those sit *inside*
 /// `PROMPT_TOTAL` (see `Done::cached_tokens`): sparkDash derives prefill as `prompt - cached`,
 /// so the two are a subset relation, never a partition. The clamp at the update site keeps that
@@ -265,6 +267,8 @@ async fn health(State(app): State<Arc<App>>) -> Response {
 
 /// The `/metrics` body: the two gauges, the counters and the summaries, in the Prometheus text
 /// exposition format. Built from the statics alone, so a test reads the exposition without a server.
+///
+/// By @100menotu001, from Picom-code/pico-dgx-ds4#12; carried onto this branch unchanged.
 fn metrics_body(running: u32, waiting: u32) -> String {
     format!(
         "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\

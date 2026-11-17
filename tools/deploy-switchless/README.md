@@ -512,7 +512,7 @@ needs it, images do not), and allocates a tensor under the same `--memory` the e
 
 ## The pull requests
 
-`--fork` deploys a branch that merges five pull requests on top of `main`. **None of them are this
+`--fork` deploys a branch that merges six pull requests on top of `main`. **None of them are this
 tool's work**: each is someone else's fix, contributed to
 [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), and each is worth having on its
 own. This script only carries them on one branch so a ring can be deployed with them.
@@ -524,6 +524,7 @@ own. This script only carries them on one branch so a ring can be deployed with 
 | [#7](https://github.com/Picom-code/pico-dgx-ds4/pull/7) | [@mpfaffenberger](https://github.com/mpfaffenberger) | a stream's tool calls in pieces, instead of one chunk once the call is complete |
 | [#15](https://github.com/Picom-code/pico-dgx-ds4/pull/15) | [@mpfaffenberger](https://github.com/mpfaffenberger) | the service owns the image encoder (`DSGB10_VISION_CMD`) |
 | [#19](https://github.com/Picom-code/pico-dgx-ds4/pull/19) | [@grisetio](https://github.com/grisetio) | batched outputs bit-identical again at 9..16 rows: the norms run with the fused call's CTA |
+| [#12](https://github.com/Picom-code/pico-dgx-ds4/pull/12) | [@100menotu001](https://github.com/100menotu001) | `GET /metrics` on dsfront: the request gauges, token counters, TTFT and the engine's own prefill time |
 
 PR #7 conflicts with PR #2 in `encoding.rs` (both rewrite the same parser), so the branch is a
 deliberate merge, not a rebase. The merge is this tool's only contribution to them; the fixes are the
@@ -540,7 +541,7 @@ so a ring deployed with `--fork` runs it.
 | Change | What it does |
 | --- | --- |
 | the vision encoder in the service | PR #15's `DSGB10_VISION_CMD` wiring, with `VISION=1` starting, restarting and stopping the encoder with the service |
-| `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)) |
+| `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)). **[@100menotu001](https://github.com/100menotu001)'s work, from [PR #12](https://github.com/Picom-code/pico-dgx-ds4/pull/12)**; this fork only carries it onto the branch |
 | PR #19's batch-norm fix | the 9..16-row norms run with the fused call's CTA, so a session decoded in a batch of 9..16 rows (or a drafted batch of two or more) is bit-identical to the same session alone ([CHANGES.md](../../CHANGES.md), change 17) |
 
 The `/metrics` endpoint is additive: a build without it answers 404 and every consumer behaves as

@@ -54,6 +54,10 @@ on rank 0 (ready in ~6 min).
 
 ## The `/metrics` endpoint
 
+By [@100menotu001](https://github.com/100menotu001), from
+[Picom-code/pico-dgx-ds4#12](https://github.com/Picom-code/pico-dgx-ds4/pull/12); carried onto this branch
+unchanged.
+
 dsfront answers `GET /metrics` on the same addresses and port as the API, unauthenticated like
 `/health`, in the Prometheus text exposition format (`text/plain; version=0.0.4`). The series keep the
 `tensorfold:` prefix of the serve they replace, so a scraper already reading the TensorFold counters
