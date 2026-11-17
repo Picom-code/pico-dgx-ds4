@@ -11,7 +11,7 @@
 //! The parse side has the reference's strict parser and `StreamParser`, an incremental version for
 //! streamed output that falls back to plain content where the strict one would raise.
 
-use crate::pyjson::{dumps as to_json, py_str, truthy};
+use crate::pyjson::{dumps as to_json, py_str, truthy, write_escaped};
 use serde_json::{json, Map, Value};
 
 pub const BOS: &str = "<｜begin▁of▁sentence｜>";
@@ -990,29 +990,35 @@ fn match_tool_name(s: &str) -> Option<String> {
     None
 }
 
-/// `^ name="(.*?)" string="(true|false)">(.*?)<$` with DOTALL.
-fn match_param(s: &str) -> Option<(String, String, String)> {
-    let rest = s.strip_prefix(" name=\"")?;
+/// `^ name="(.*?)" string="(true|false)">` of match_param's pattern: the name, the flag and where
+/// the value starts. The lazy name ends at the first `" string="` that a flag and `">` follow, which
+/// the text up to there decides: what it finds in a parameter that is still arriving stays found.
+fn match_param_head(s: &str) -> Option<(&str, &'static str, usize)> {
+    const NAME: &str = " name=\"";
+    const STRING: &str = "\" string=\"";
+    let rest = s.strip_prefix(NAME)?;
     let mut from = 0;
-    while let Some(p) = rest[from..].find("\" string=\"") {
+    while let Some(p) = rest[from..].find(STRING) {
         let name_end = from + p;
-        let after = &rest[name_end + 10..];
+        let after = &rest[name_end + STRING.len()..];
         for flag in ["true", "false"] {
-            if let Some(v) = after.strip_prefix(flag).and_then(|x| x.strip_prefix("\">")) {
-                // lazy value up to a '<' that ends the string (or precedes a final newline)
-                let mut q = 0;
-                while let Some(k) = v[q..].find('<') {
-                    let at = q + k;
-                    if at + 1 == v.len() || (at + 2 == v.len() && v.ends_with('\n')) {
-                        return Some((rest[..name_end].to_string(), flag.to_string(), v[..at].to_string()));
-                    }
-                    q = at + 1;
-                }
+            if after.strip_prefix(flag).is_some_and(|x| x.starts_with("\">")) {
+                return Some((&rest[..name_end], flag, NAME.len() + name_end + STRING.len() + flag.len() + 2));
             }
         }
         from = name_end + 1;
     }
     None
+}
+
+/// `^ name="(.*?)" string="(true|false)">(.*?)<$` with DOTALL.
+fn match_param(s: &str) -> Option<(String, String, String)> {
+    let (name, flag, at) = match_param_head(s)?;
+    // The lazy value runs up to a '<' that ends the string (or precedes a final newline). Whether
+    // there is one does not depend on where the name ended, so no later `" string="` is tried.
+    let v = &s[at..];
+    let value = v.strip_suffix('<').or_else(|| v.strip_suffix("<\n"))?;
+    Some((name.to_string(), flag.to_string(), value.to_string()))
 }
 
 /// encoding.py parse_tool_calls: (new index, last stop, [(name, arguments json)]).
@@ -1062,13 +1068,31 @@ fn parse_tool_calls(mut index: usize, text: &str) -> Result<(usize, Option<Strin
     Ok((index, stop, calls))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParsedMessage {
     pub content: String,
     pub reasoning_content: String,
     /// (name as the model wrote it, `namespace::name` under 1017 too (api_tool_name splits it),
     /// arguments as a JSON string)
     pub tool_calls: Vec<(String, String)>,
+}
+
+impl ParsedMessage {
+    /// A StreamParser's deltas, added in order, are the message: a tool call sent in pieces is put
+    /// together (its index is its place among the calls).
+    pub fn add(&mut self, d: Delta) {
+        match d {
+            Delta::Reasoning(s) => self.reasoning_content.push_str(&s),
+            Delta::Content(s) => self.content.push_str(&s),
+            Delta::ToolCall(_, name, args) => self.tool_calls.push((name, args)),
+            Delta::ToolCallStart(_, name) => self.tool_calls.push((name, String::new())),
+            Delta::ToolArgs(i, piece) => {
+                if let Some((_, args)) = self.tool_calls.get_mut(i) {
+                    args.push_str(&piece);
+                }
+            }
+        }
+    }
 }
 
 /// encoding.py parse_message_from_completion_text: the whole completion, ending with EOS. 1017's
@@ -1129,369 +1153,315 @@ pub enum Delta {
     Content(String),
     /// A complete tool call: (index, name, arguments JSON).
     ToolCall(usize, String, String),
+    /// A tool call whose arguments follow in pieces (StreamParser::stream_args): (index, name).
+    ToolCallStart(usize, String),
+    /// The next piece of that call's arguments JSON: (index, text). A call's pieces, in order, are
+    /// the arguments its ToolCall would have carried.
+    ToolArgs(usize, String),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Phase {
-    Reasoning,
-    Content,
-    /// Inside the tool-call block, in the state parse_tool_calls would be in.
-    ExpectCall,
-    Name,
-    Param,
-    AfterParam,
-    /// After the block: only EOS may follow.
-    AfterCalls,
-    /// Malformed tool calls: everything else is plain content.
-    Raw,
-    Done,
-}
+enum Phase { Reasoning, Content, Calls, Name, Param, AfterParam, Failed, Done }
 
-const CALLS_END: &str = "</｜DSML｜ calls>";
-const CALL_START: &str = "<｜DSML｜ invoke";
-const CALL_END: &str = "</｜DSML｜ invoke";
-const PARAM_START: &str = "<｜DSML｜ parameter";
-const PARAM_END: &str = "/｜DSML｜ parameter";
-const TC_START: &str = "\n\n<｜DSML｜ calls";
+const DSML_OPEN: &str = "<｜DSML｜";
+const DSML_CLOSE: &str = "</｜DSML｜";
 
-/// Incremental version of parse_message_from_completion_text for streamed output. Feed decoded text
-/// as it arrives: reasoning and content come out as soon as they cannot be the start of a marker,
-/// each tool call once its invoke block has parsed (with the same rules as parse_tool_calls).
-/// Where the reference parser would raise on malformed tool calls, the rest of the output is passed
-/// on as plain content instead.
+/// What a value cannot run into: the parameter's end, and that end with the '<' (and the newline it
+/// may precede) that match_param takes as the value's end.
+const VALUE_STOPS: [&str; 3] = ["/｜DSML｜ parameter", "</｜DSML｜ parameter", "<\n/｜DSML｜ parameter"];
+
+/// Incremental output protocol decoder. Markers are recognized at any position, including
+/// across UTF-8/token/chunk boundaries. Malformed protocol is never downgraded to API text.
+/// Complete calls are atomic; unfinished or ambiguous arguments are not executed.
+///
+/// With `stream_args` a tool call is not held until its end: its name goes out when it has parsed
+/// (ToolCallStart) and its arguments as they arrive (ToolArgs), a value's text as soon as it cannot
+/// be the start of the value's end. Reasoning and content are what they are without it, piece for
+/// piece, and so is every call that parses. A call that does not (malformed, or cut off) is still
+/// quarantined as a protocol error, after the start and the pieces already sent, and does not count
+/// in tool_calls_seen: its client is left with a call whose arguments stop where it did. They lack
+/// at least the brace that closes them, so they are not complete JSON, unless a value the model wrote
+/// with string="false" (passed on as written, here as in a ToolCall) is not JSON and closes them.
 pub struct StreamParser {
     phase: Phase,
-    /// Text not yet consumed. In the tool-call phases it starts at the current invoke (or at the `>`
-    /// that closes the previous one).
     buf: String,
-    /// Parse position in `buf` and the offset from which the next stop search may start.
-    pos: usize,
-    scan: usize,
     calls: usize,
     name: String,
-    args: Vec<(String, String, String)>,
+    args: Vec<(String,String,String)>,
     tools: bool,
+    error: Option<&'static str>,
+    stream_args: bool,
+    /// stream_args: how much of the parameter being read has gone out. None before its name, then
+    /// the bytes of its value.
+    value_sent: Option<usize>,
     pub saw_eos: bool,
 }
 
+/// Remove reserved model-only tokens, not arbitrary XML/code, from a complete parameter.
+fn clean_protocol(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let marks = [THINK_START, THINK_END, "<｜", "<|", "</｜", "</|"];
+        let found = marks.iter().filter_map(|m| rest.find(m).map(|p| (p, *m))).min_by_key(|x| x.0);
+        let Some((p, m)) = found else { out.push_str(rest); break };
+        out.push_str(&rest[..p]); rest = &rest[p..];
+        let end = if m == THINK_START || m == THINK_END { Some(m.len()) }
+            else if let Some(p)=rest.find('>') {
+                if rest[..p].ends_with('｜') || rest[..p].ends_with('|') { Some(p+1) }
+                else { out.push_str(&rest[..p+1]);rest=&rest[p+1..];continue }
+            } else { None };
+        match end { Some(n) => rest = &rest[n..], None => break }
+    }
+    out
+}
+
+/// Find a DSML tag, tolerating both released tag-name spellings. Returned offsets are
+/// UTF-8 boundaries. The payload is never normalized or scanned as markup before its close.
+fn closing(s: &str, name: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(p) = s[from..].find(DSML_CLOSE) {
+        let start = from + p; let end = s[start..].find('>')? + start + 1;
+        if s[start+DSML_CLOSE.len()..end-1].trim() == name { return Some((start, end)) }
+        from = end;
+    }
+    None
+}
+
+fn opening(s: &str, name: &str) -> Option<(usize,usize)> {
+    let mut from=0;
+    while let Some(p)=s[from..].find(DSML_OPEN) {
+        let start=from+p;let tail=&s[start+DSML_OPEN.len()..];let t=tail.trim_start();
+        if t.starts_with(name) && t[name.len()..].chars().next().map_or(false,|c| c.is_whitespace() || c=='>') {
+            return Some((start,start+DSML_OPEN.len()+tail.len()-t.len()+name.len()))
+        }
+        from=start+DSML_OPEN.len();
+    }
+    None
+}
+
 impl StreamParser {
-    pub fn new(mode: ThinkingMode) -> Self {
-        Self::with_tools(mode, true)
-    }
-
-    /// `tools = false`: DSML in the output is plain content (the request offered no tools).
+    pub fn new(mode: ThinkingMode) -> Self { Self::with_tools(mode, true) }
     pub fn with_tools(mode: ThinkingMode, tools: bool) -> Self {
-        StreamParser {
-            tools,
-            phase: if mode == ThinkingMode::Thinking {
-                Phase::Reasoning
-            } else if tools {
-                Phase::Content
-            } else {
-                Phase::Raw
-            },
-            buf: String::new(),
-            pos: 0,
-            scan: 0,
-            calls: 0,
-            name: String::new(),
-            args: Vec::new(),
-            saw_eos: false,
-        }
+        Self { phase: if mode == ThinkingMode::Thinking { Phase::Reasoning } else { Phase::Content },
+            buf: String::new(), calls: 0, name: String::new(), args: Vec::new(), tools, error: None,
+            stream_args: false, value_sent: None, saw_eos: false }
     }
 
-    pub fn tool_calls_seen(&self) -> usize {
-        self.calls
+    /// Tool calls in pieces (ToolCallStart, ToolArgs) instead of whole (ToolCall).
+    pub fn stream_args(mut self, on: bool) -> Self {
+        self.stream_args = on;
+        self
     }
 
+    pub fn tool_calls_seen(&self) -> usize { self.calls }
+    pub fn protocol_error(&self) -> Option<&'static str> { self.error }
     pub fn push(&mut self, text: &str, out: &mut Vec<Delta>) {
-        if self.phase == Phase::Done {
-            return;
-        }
-        self.buf.push_str(text);
-        self.advance(out, false);
+        if matches!(self.phase, Phase::Done | Phase::Failed) { return }
+        self.buf.push_str(text); self.advance(out, false);
     }
-
-    /// End of generation: flush everything that is left.
     pub fn finish(&mut self, out: &mut Vec<Delta>) {
         self.advance(out, true);
-        let rest = std::mem::take(&mut self.buf);
-        match self.phase {
-            Phase::Reasoning if !rest.is_empty() => out.push(Delta::Reasoning(rest)),
-            Phase::Content | Phase::Raw if !rest.is_empty() => out.push(Delta::Content(rest)),
-            // Cut off right after a complete call (or the block marker): parse_tool_calls accepts that.
-            Phase::ExpectCall if self.pos >= rest.len() => {}
-            Phase::ExpectCall | Phase::Name | Phase::Param | Phase::AfterParam => {
-                // Cut off inside the block (max_tokens or a stop): show the unfinished call as text.
-                let raw = self.unparsed(&rest);
-                if !raw.trim().is_empty() && !CALLS_END.starts_with(raw.trim_start_matches(['>', '\n'])) {
-                    out.push(Delta::Content(raw));
-                }
-            }
-            _ => {}
-        }
-        self.phase = Phase::Done;
+        if matches!(self.phase, Phase::Name | Phase::Param | Phase::AfterParam) { self.fail("incomplete tool invocation") }
+        self.buf.clear(); self.phase = Phase::Done;
     }
-
-    /// The raw text of the block from the current invoke on, for the fallback.
-    fn unparsed(&self, rest: &str) -> String {
-        if self.calls == 0 {
-            format!("{TC_START}{rest}")
+    fn fail(&mut self, message: &'static str) { self.error = Some(message); self.buf.clear(); self.phase = Phase::Failed; }
+    fn consume(&mut self, n: usize) { self.buf.drain(..n); }
+    fn text(&self, s: String, out: &mut Vec<Delta>) {
+        if !s.is_empty() { out.push(if self.phase == Phase::Reasoning { Delta::Reasoning(s) } else { Delta::Content(s) }); }
+    }
+    fn emit_call(&mut self,out:&mut Vec<Delta>) {
+        if clean_protocol(&self.name)!=self.name { self.fail("reserved token in tool name");return }
+        if self.stream_args {
+            // the name and the parameters have gone out: what is left closes the object
+            out.push(Delta::ToolArgs(self.calls, if self.args.is_empty() { "{}" } else { "}" }.into()));
+            self.name.clear();
         } else {
-            rest.strip_prefix('>').unwrap_or(rest).to_string()
+            out.push(Delta::ToolCall(self.calls,std::mem::take(&mut self.name),decode_dsml_to_arguments(&self.args)));
+        }
+        self.calls+=1;self.args.clear();
+    }
+
+    /// stream_args: the next piece of the arguments JSON, as decode_dsml_to_arguments writes it, for
+    /// the parameter being read, of which `value` has arrived (all of it if `done`).
+    fn args_piece(&self, name: &str, flag: &str, value: &str, done: bool) -> String {
+        let is_str = flag == "true";
+        let mut piece = String::new();
+        let sent = match self.value_sent {
+            Some(n) => n,
+            None => {
+                piece.push_str(if self.args.is_empty() { "{" } else { ", " });
+                piece.push_str(&to_json(&Value::String(name.to_string())));
+                piece.push_str(": ");
+                if is_str {
+                    piece.push('"');
+                }
+                0
+            }
+        };
+        if is_str {
+            write_escaped(&mut piece, &value[sent..]);
+        } else {
+            piece.push_str(&value[sent..]);
+        }
+        if done && is_str {
+            piece.push('"');
+        }
+        piece
+    }
+
+    fn send_args(&self, piece: String, out: &mut Vec<Delta>) {
+        if !piece.is_empty() {
+            out.push(Delta::ToolArgs(self.calls, piece));
         }
     }
 
-    /// Length of the longest suffix of `s` that is a proper prefix of one of `markers`.
+    /// stream_args: send what has arrived of the parameter being read, whose end has not: its name
+    /// once match_param_head has it, then its value up to what could be the start of one of
+    /// VALUE_STOPS. That is all a value's end can take, so what goes out is a prefix of the value
+    /// match_param will find, and of a parameter that will not match, nothing past where it stops.
+    fn send_arriving(&mut self, out: &mut Vec<Delta>) {
+        // Phase::Param starts at the parameter's own text, which match_param_head expects to begin
+        // with a space (the reference pattern's ` name="`).
+        let segment = format!(" {}", self.buf.trim_start());
+        let Some((name, flag, at)) = match_param_head(&segment) else {
+            return;
+        };
+        if self.args.iter().any(|(k, _, _)| k == name) {
+            return; // a repeated name: the call fails at this parameter's end
+        }
+        let value = &segment[at..];
+        let value = &value[..value.len() - Self::holdback(value, &VALUE_STOPS)];
+        let (piece, sent) = (self.args_piece(name, flag, value, false), value.len());
+        self.send_args(piece, out);
+        self.value_sent = Some(sent);
+    }
+
     fn holdback(s: &str, markers: &[&str]) -> usize {
-        let mut best = 0;
-        for m in markers {
-            let max = m.len().saturating_sub(1).min(s.len());
-            for k in (1..=max).rev() {
-                if s.is_char_boundary(s.len() - k) && m.starts_with(&s[s.len() - k..]) {
-                    best = best.max(k);
-                    break;
-                }
-            }
-        }
-        best
-    }
-
-    /// _read_until_stop on the buffer from `pos`, for text that is still arriving: the earliest
-    /// stop, or None if none has arrived yet. None of the stop sets here has one stop inside another,
-    /// so an occurrence found now stays the earliest whatever follows.
-    fn find_stop(&mut self, stops: &[&'static str]) -> Option<(usize, &'static str)> {
-        let from = self.scan.max(self.pos);
-        let mut best: Option<(usize, &'static str)> = None;
-        for s in stops {
-            if let Some(p) = self.buf[from..].find(s) {
-                let p = from + p;
-                if best.map_or(true, |(bp, _)| p < bp) {
-                    best = Some((p, s));
-                }
-            }
-        }
-        if best.is_none() {
-            let longest = stops.iter().map(|s| s.len()).max().unwrap_or(1);
-            let mut scan = self.buf.len().saturating_sub(longest - 1).max(self.pos);
-            while !self.buf.is_char_boundary(scan) {
-                scan -= 1;
-            }
-            self.scan = scan;
-        }
-        best
-    }
-
-    /// Consume up to `end` (exclusive) of the buffer and reset the parse position.
-    fn consume(&mut self, end: usize) {
-        self.buf.drain(..end);
-        self.pos = 0;
-        self.scan = 0;
-    }
-
-    /// Text between the parse position and a stop must be exactly ">\n". While the stop has not
-    /// arrived, false once that can no longer happen.
-    fn gap_can_be_ok(&self, stops: &[&str]) -> bool {
-        let gap = &self.buf[self.pos..];
-        let n = gap.len().min(2);
-        if gap.as_bytes()[..n] != b">\n"[..n] {
-            return false;
-        }
-        n < 2 || stops.iter().any(|s| s.starts_with(&gap[2..]) || gap[2..].starts_with(s))
-    }
-
-    fn fail(&mut self, out: &mut Vec<Delta>) {
-        let raw = self.unparsed(&self.buf);
-        self.buf.clear();
-        self.pos = 0;
-        self.scan = 0;
-        self.phase = Phase::Raw;
-        out.push(Delta::Content(raw));
-    }
-
-    fn emit_call(&mut self, out: &mut Vec<Delta>) {
-        let args = decode_dsml_to_arguments(&self.args);
-        out.push(Delta::ToolCall(self.calls, std::mem::take(&mut self.name), args));
-        self.args.clear();
-        self.calls += 1;
+        markers.iter().flat_map(|m| (1..m.len().min(s.len()+1)).rev().filter(|&k| s.is_char_boundary(s.len()-k) && m.starts_with(&s[s.len()-k..]))).max().unwrap_or(0)
     }
 
     fn advance(&mut self, out: &mut Vec<Delta>, at_end: bool) {
         loop {
             match self.phase {
-                Phase::Reasoning => {
-                    let end = self.buf.find(THINK_END);
-                    let eos = self.buf.find(EOS);
-                    if let Some(e) = eos.filter(|&e| end.map_or(true, |t| e < t)) {
-                        if e > 0 {
-                            out.push(Delta::Reasoning(self.buf[..e].to_string()));
-                        }
-                        self.buf.clear();
-                        self.saw_eos = true;
-                        self.phase = Phase::Done;
-                        return;
-                    }
-                    if let Some(p) = end {
-                        if p > 0 {
-                            out.push(Delta::Reasoning(self.buf[..p].to_string()));
-                        }
-                        self.consume(p + THINK_END.len());
-                        self.phase = if self.tools { Phase::Content } else { Phase::Raw };
-                        continue;
-                    }
-                    let keep = if at_end { 0 } else { Self::holdback(&self.buf, &[THINK_END, EOS]) };
-                    let n = self.buf.len() - keep;
-                    if n > 0 {
-                        out.push(Delta::Reasoning(self.buf[..n].to_string()));
-                        self.consume(n);
-                    }
-                    return;
-                }
-                Phase::Content | Phase::Raw => {
-                    let eos = self.buf.find(EOS);
-                    let tc = if self.phase == Phase::Content { self.buf.find(TC_START) } else { None };
-                    if let Some(e) = eos.filter(|&e| tc.map_or(true, |t| e < t)) {
-                        if e > 0 {
-                            out.push(Delta::Content(self.buf[..e].to_string()));
-                        }
-                        self.buf.clear();
-                        self.saw_eos = true;
-                        self.phase = Phase::Done;
-                        return;
-                    }
-                    if let Some(t) = tc {
-                        if t > 0 {
-                            out.push(Delta::Content(self.buf[..t].to_string()));
-                        }
-                        self.consume(t + TC_START.len());
-                        self.phase = Phase::ExpectCall;
-                        continue;
-                    }
-                    let markers: &[&str] = if self.phase == Phase::Content { &[EOS, TC_START] } else { &[EOS] };
-                    let keep = if at_end { 0 } else { Self::holdback(&self.buf, markers) };
-                    let n = self.buf.len() - keep;
-                    if n > 0 {
-                        out.push(Delta::Content(self.buf[..n].to_string()));
-                        self.consume(n);
-                    }
-                    return;
-                }
-                Phase::ExpectCall => {
-                    let stops = [CALL_START, CALLS_END];
-                    match self.find_stop(&stops) {
-                        Some((p, s)) => {
-                            if &self.buf[self.pos..p] != ">\n" {
-                                self.fail(out);
-                                continue;
+                Phase::Reasoning | Phase::Content => {
+                    let markers = [EOS, THINK_START, THINK_END, "\n\n<｜DSML｜", DSML_OPEN, DSML_CLOSE, "<｜", "<|", "</｜", "</|", "｜DSML｜"];
+                    let hit = markers.iter().filter_map(|m| self.buf.find(m).map(|p| (p, *m))).min_by_key(|x| x.0);
+                    let Some((p, marker)) = hit else {
+                        let keep = Self::holdback(&self.buf, &markers);
+                        let n = self.buf.len()-keep;
+                        self.text(self.buf[..n].to_string(), out); self.consume(n);
+                        // At EOF a reserved-marker prefix is withheld, never flushed as content.
+                        if at_end {
+                            if !(self.buf.starts_with("<｜") || self.buf.starts_with("<|") || self.buf.starts_with("</｜") || self.buf.starts_with("</|") || self.buf.starts_with("<thi") || self.buf.starts_with("</thi") || self.buf.starts_with("｜DS")) {
+                                self.text(self.buf.clone(), out);
                             }
-                            if s == CALLS_END {
-                                self.consume(p + s.len());
-                                self.phase = Phase::AfterCalls;
-                            } else {
-                                // keep the invoke text in the buffer until the call is complete
-                                self.pos = p + s.len();
-                                self.scan = self.pos;
-                                self.phase = Phase::Name;
-                            }
+                            self.buf.clear()
                         }
-                        None => {
-                            if !self.gap_can_be_ok(&stops) {
-                                self.fail(out);
-                                continue;
-                            }
-                            return;
+                        return
+                    };
+                    if !at_end {
+                        let pending = Self::holdback(&self.buf, &markers);
+                        let start = self.buf.len() - pending;
+                        if pending > 0 && start < p {
+                            self.text(self.buf[..start].to_string(), out); self.consume(start); return
                         }
                     }
+                    if p > 0 { self.text(self.buf[..p].to_string(), out); self.consume(p); }
+                    if marker == "\n\n<｜DSML｜" { self.consume(2); continue }
+                    if marker == EOS { self.saw_eos = true; self.buf.clear(); self.phase = Phase::Done; return }
+                    if marker == THINK_END { self.consume(marker.len()); self.phase = Phase::Content; continue }
+                    if marker == THINK_START { self.consume(marker.len()); self.phase = Phase::Reasoning; continue }
+                    let Some(e) = self.buf.find('>') else { if at_end { self.buf.clear() } return };
+                    if marker == DSML_OPEN {
+                        let tag = self.buf[DSML_OPEN.len()..e].trim().to_string();
+                        if tag == "calls" || tag == "tool_calls" {
+                            if !self.tools { self.fail("tool protocol without declared tools"); return }
+                            self.consume(e+1); self.phase = Phase::Calls; continue
+                        }
+                        if let Some((0,end))=opening(&self.buf,"invoke") {
+                            if !self.tools { self.fail("tool protocol without declared tools");return }
+                            self.consume(end);self.phase=Phase::Name;continue
+                        }
+                        self.fail("unrecognized tool protocol tag"); return
+                    }
+                    // Reserved model tokens and stray closing protocol tags are not user text.
+                    self.consume(e+1);
                 }
-                Phase::Name => match self.find_stop(&[PARAM_START, CALL_END]) {
-                    Some((p, s)) => {
-                        let Some(name) = match_tool_name(&self.buf[self.pos..p]) else {
-                            self.fail(out);
-                            continue;
-                        };
-                        self.name = name;
-                        if s == PARAM_START {
-                            self.pos = p + s.len();
-                            self.scan = self.pos;
-                            self.phase = Phase::Param;
-                        } else {
-                            self.emit_call(out);
-                            self.consume(p + s.len());
-                            self.phase = Phase::ExpectCall;
-                        }
+                Phase::Calls => {
+                    let n = self.buf.len()-self.buf.trim_start().len(); self.consume(n);
+                    if self.buf.is_empty() { return }
+                    if self.buf.starts_with(EOS) { self.saw_eos=true; self.buf.clear(); self.phase=Phase::Done; return }
+                    if let Some((0, end)) = closing(&self.buf, "calls").or_else(|| closing(&self.buf, "tool_calls")) {
+                        self.consume(end); self.phase=Phase::Content; continue
                     }
-                    None => return,
-                },
-                Phase::Param => match self.find_stop(&[PARAM_END]) {
-                    Some((p, s)) => {
-                        let Some((pname, flag, value)) = match_param(&self.buf[self.pos..p]) else {
-                            self.fail(out);
-                            continue;
-                        };
-                        if self.args.iter().any(|(k, _, _)| *k == pname) {
-                            self.fail(out);
-                            continue;
-                        }
-                        self.args.push((pname, value, flag));
-                        self.pos = p + s.len();
-                        self.scan = self.pos;
-                        self.phase = Phase::AfterParam;
+                    if self.buf.starts_with(DSML_CLOSE) && !self.buf.contains('>') {
+                        if at_end { self.fail("incomplete closing tool tag") } return
                     }
-                    None => return,
-                },
+                    if self.buf.starts_with(DSML_OPEN) {
+                        if let Some((0,end))=opening(&self.buf,"invoke") { self.consume(end);self.phase=Phase::Name;continue }
+                        if !self.buf.contains('>') && !at_end { return }
+                        self.fail("invalid tool invocation header"); return
+                    }
+                    // Wait for split markers; never return malformed protocol as content.
+                    if !at_end && [DSML_OPEN, DSML_CLOSE, EOS].iter().any(|m| m.starts_with(&self.buf)) { return }
+                    self.fail("invalid tool block framing"); return
+                }
+                Phase::Name => {
+                    let param = opening(&self.buf, "parameter");
+                    let end = closing(&self.buf, "invoke");
+                    let next = match (param, end) {
+                        (Some(a), Some(b)) if a.0 < b.0 => Some((a.0,a.1,false)),
+                        (_,Some(b)) => Some((b.0,b.1,true)),
+                        (Some(a),None) => Some((a.0,a.1,false)),
+                        _ => None,
+                    };
+                    let Some((p, consumed, done)) = next else { if at_end { self.fail("incomplete tool invocation") } return };
+                    let header = self.buf[..p].trim();
+                    let Some(name) = header.strip_prefix("name=\"").and_then(|h| h.strip_suffix("\">")) else { self.fail("invalid tool invocation header"); return };
+                    if clean_protocol(name) != name { self.fail("reserved token in tool name"); return }
+                    self.name = name.to_string(); self.args.clear(); self.consume(consumed);
+                    if self.stream_args {
+                        out.push(Delta::ToolCallStart(self.calls, self.name.clone()));
+                    }
+                    if done { self.emit_call(out); if self.error.is_some() { return } self.phase=Phase::Calls; } else { self.phase=Phase::Param; }
+                }
+                Phase::Param => {
+                    let stops = ["/｜DSML｜ parameter", "/｜DSML｜parameter"];
+                    let hit = stops.iter().filter_map(|m| self.buf.find(m).map(|p| (p,*m))).min_by_key(|x|x.0);
+                    let Some((p,m)) = hit else {
+                        if self.stream_args { self.send_arriving(out) }
+                        if at_end { self.fail("incomplete tool parameter") }
+                        return
+                    };
+                    let tail = p+m.len();
+                    let Some(extra) = self.buf[tail..].find('>') else { if at_end { self.fail("incomplete parameter close") } return };
+                    let segment = format!(" {}", self.buf[..p].trim_start());
+                    let Some((name,flag,value)) = match_param(&segment) else { self.fail("invalid tool parameter"); return };
+                    if self.args.iter().any(|(n,_,_)| n==&name) { self.fail("duplicate tool parameter"); return }
+                    let value=clean_protocol(&value);
+                    if flag=="false" && serde_json::from_str::<Value>(&value).is_err() { self.fail("invalid JSON tool parameter"); return }
+                    if self.stream_args {
+                        // clean_protocol can shorten the value below what has already gone out
+                        if let Some(n) = self.value_sent { self.value_sent = Some(n.min(value.len())) }
+                        self.send_args(self.args_piece(&name, &flag, &value, true), out);
+                        self.value_sent = None;
+                    }
+                    self.args.push((name,value,flag));self.consume(tail+extra+1);self.phase=Phase::AfterParam;
+                }
                 Phase::AfterParam => {
-                    let stops = [PARAM_START, CALL_END];
-                    match self.find_stop(&stops) {
-                        Some((p, s)) => {
-                            if &self.buf[self.pos..p] != ">\n" {
-                                self.fail(out);
-                                continue;
-                            }
-                            if s == PARAM_START {
-                                self.pos = p + s.len();
-                                self.scan = self.pos;
-                                self.phase = Phase::Param;
-                            } else {
-                                self.emit_call(out);
-                                self.consume(p + s.len());
-                                self.phase = Phase::ExpectCall;
-                            }
-                        }
-                        None => {
-                            if !self.gap_can_be_ok(&stops) {
-                                self.fail(out);
-                                continue;
-                            }
-                            return;
-                        }
+                    let n=self.buf.len()-self.buf.trim_start().len();self.consume(n);
+                    if self.buf.is_empty() { if at_end { self.fail("incomplete tool invocation") } return }
+                    if let Some((0,end))=closing(&self.buf,"invoke") { self.consume(end);self.emit_call(out);if self.error.is_some() { return }self.phase=Phase::Calls;continue }
+                    if let Some((0,end))=opening(&self.buf,"parameter") { self.consume(end);self.phase=Phase::Param;continue }
+                    if self.buf.starts_with("</") {
+                        let Some(end)=self.buf.find('>') else { if at_end { self.fail("incomplete closing tag") } return };
+                        self.consume(end+1);continue
                     }
+                    if !at_end && [DSML_OPEN,DSML_CLOSE].iter().any(|m| m.starts_with(&self.buf) || self.buf.starts_with(m)) { return }
+                    self.fail("invalid parameter framing");return
                 }
-                Phase::AfterCalls => {
-                    if let Some(e) = self.buf.find(EOS) {
-                        let before = self.buf[..e].to_string();
-                        if !before.trim().is_empty() {
-                            out.push(Delta::Content(before));
-                        }
-                        self.buf.clear();
-                        self.saw_eos = true;
-                        self.phase = Phase::Done;
-                        return;
-                    }
-                    let keep = if at_end { 0 } else { Self::holdback(&self.buf, &[EOS]) };
-                    let n = self.buf.len() - keep;
-                    if n > 0 && !self.buf[..n].trim().is_empty() {
-                        // text after the block, which the reference rejects: pass it on
-                        out.push(Delta::Content(self.buf[..n].to_string()));
-                    }
-                    if n > 0 {
-                        self.consume(n);
-                    }
-                    return;
-                }
-                Phase::Done => {
-                    self.buf.clear();
-                    return;
-                }
+                Phase::Failed | Phase::Done => { self.buf.clear(); return }
             }
         }
     }
@@ -1581,25 +1551,214 @@ mod tests {
         let text = "Let me look.</think>Checking.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"ls\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
         let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking, Encoding::V41).unwrap();
         // feed in small pieces
-        let mut p = StreamParser::new(ThinkingMode::Thinking);
+        let (out, p) = stream(text, 3, ThinkingMode::Thinking, false);
+        let m = message(out);
+        assert_eq!(m, whole);
+        assert_eq!(m.tool_calls[0].1, "{\"path\": \"a.txt\", \"n\": 3}");
+        assert!(p.saw_eos);
+    }
+
+    /// A StreamParser's deltas for `text`, fed `n` characters at a time, and the parser at the end.
+    fn stream(text: &str, n: usize, mode: ThinkingMode, stream_args: bool) -> (Vec<Delta>, StreamParser) {
+        let mut p = StreamParser::new(mode).stream_args(stream_args);
         let mut out = Vec::new();
         let chars: Vec<char> = text.chars().collect();
-        for ch in chars.chunks(3) {
+        for ch in chars.chunks(n) {
             p.push(&ch.iter().collect::<String>(), &mut out);
         }
         p.finish(&mut out);
-        let (mut r, mut c, mut calls) = (String::new(), String::new(), Vec::new());
-        for d in out {
-            match d {
-                Delta::Reasoning(s) => r.push_str(&s),
-                Delta::Content(s) => c.push_str(&s),
-                Delta::ToolCall(_, n, a) => calls.push((n, a)),
+        (out, p)
+    }
+
+    fn message(deltas: Vec<Delta>) -> ParsedMessage {
+        let mut m = ParsedMessage::default();
+        deltas.into_iter().for_each(|d| m.add(d));
+        m
+    }
+
+    /// The reasoning and content among the deltas, piece for piece.
+    fn text_of(deltas: &[Delta]) -> Vec<Delta> {
+        deltas.iter().filter(|d| matches!(d, Delta::Reasoning(_) | Delta::Content(_))).cloned().collect()
+    }
+
+    #[test]
+    fn param_pattern() {
+        let m = |s: &str| match_param(s).map(|(name, flag, value)| format!("{name}|{flag}|{value}"));
+        assert_eq!(m(" name=\"a\" string=\"true\">x<"), Some("a|true|x".into()));
+        assert_eq!(m(" name=\"a\" string=\"false\">1<\n"), Some("a|false|1".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\">x<y<"), Some("a|true|x<y".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\"><"), Some("a|true|".into()));
+        // the lazy name ends at the first `" string="` that a flag follows
+        assert_eq!(m(" name=\"a\" string=\"no\" string=\"true\">x<"), Some("a\" string=\"no|true|x".into()));
+        assert_eq!(m(" name=\"a\" string=\"true\">b\" string=\"false\">x<"), Some("a|true|b\" string=\"false\">x".into()));
+        for bad in [" name=\"a\" string=\"true\">x", " name=\"a\" string=\"true\">x<\n\n", "name=\"a\" string=\"true\">x<", " name=\"a\" string=\"tru"] {
+            assert_eq!(m(bad), None, "{bad:?}");
+        }
+    }
+
+    /// stream_args: a call's pieces are the call however the text arrives, the reasoning and content
+    /// are what they are without it, and a value goes out before its end has come.
+    #[test]
+    fn stream_parser_tool_calls_in_pieces() {
+        let text = concat!(
+            "Let me look.</think>Writing.\n\n<｜DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"write\">\n",
+            "<｜DSML｜ parameter name=\"path\" string=\"true\">a \"b\"\\c.txt</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"text\" string=\"true\">if a < b && c </ d {\n\t\"é\"\n}\n</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"opts\" string=\"false\">{\"n\": 3, \"tags\": [\"<x>\"]}</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "<｜DSML｜ invoke name=\"now\">\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls><｜end▁of▁sentence｜>"
+        );
+        let whole = parse_message_from_completion_text(text, ThinkingMode::Thinking, Encoding::V41).unwrap();
+        let write = r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c </ d {\n\t\"é\"\n}\n", "opts": {"n": 3, "tags": ["<x>"]}}"#;
+        assert_eq!(whole.tool_calls, [("write".to_string(), write.to_string()), ("now".to_string(), "{}".to_string())]);
+        for n in 1..=40 {
+            let (out, p) = stream(text, n, ThinkingMode::Thinking, true);
+            assert!(!out.iter().any(|d| matches!(d, Delta::ToolCall(..))), "{n} at a time: a whole call");
+            assert_eq!(text_of(&out), text_of(&stream(text, n, ThinkingMode::Thinking, false).0), "{n} at a time");
+            assert_eq!(message(out), whole, "{n} at a time");
+            assert_eq!(p.tool_calls_seen(), 2);
+            assert!(p.saw_eos);
+        }
+        // Up to the middle of a value: the call's name and that much of its arguments are out, and
+        // the call does not count yet.
+        let mut p = StreamParser::new(ThinkingMode::Thinking).stream_args(true);
+        let mut out = Vec::new();
+        let feed = |p: &mut StreamParser, out: &mut Vec<Delta>, s: &str| s.chars().for_each(|c| p.push(c.encode_utf8(&mut [0; 4]), out));
+        let at = text.find("&& c").unwrap() + "&& c".len();
+        feed(&mut p, &mut out, &text[..at]);
+        assert_eq!(out.iter().filter(|d| **d == Delta::ToolCallStart(0, "write".into())).count(), 1);
+        let args = |out: &[Delta]| message(out.to_vec()).tool_calls[0].1.clone();
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c"#);
+        assert_eq!(p.tool_calls_seen(), 0);
+        // what could be the start of the value's end waits for what follows it
+        feed(&mut p, &mut out, " </");
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c "#);
+        feed(&mut p, &mut out, " d");
+        assert_eq!(args(&out), r#"{"path": "a \"b\"\\c.txt", "text": "if a < b && c </ d"#);
+    }
+
+    /// stream_args: a call that does not parse is passed on as content exactly as without it. What
+    /// was sent of it stays unfinished, and it is not counted.
+    #[test]
+    fn stream_parser_in_pieces_malformed() {
+        const END: &str = "</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>";
+        let call = |name: &str, rest: &str| format!("<｜DSML｜ invoke name=\"{name}\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">a.txt{rest}");
+        let good = call("stat", "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n");
+        // each with what is sent of the call's arguments: up to where it stops being one, however
+        // the text arrives
+        let bad = [
+            ("cut off in a value", String::new(), r#"{"path": "a.txt"#),
+            ("cut off in a value's end", "</｜DSML｜ param".to_string(), r#"{"path": "a.txt"#),
+            ("a value's end without its '<'", format!("/｜DSML｜ parameter>\n{END}"), r#"{"path": "a.txt"#),
+            (
+                "a repeated name",
+                format!("</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"path\" string=\"true\">b</｜DSML｜ parameter>\n{END}"),
+                r#"{"path": "a.txt""#,
+            ),
+            (
+                "text between parameters",
+                format!("</｜DSML｜ parameter>\nand <｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n{END}"),
+                r#"{"path": "a.txt""#,
+            ),
+        ];
+        for (case, rest, sent) in &bad {
+            for (before, seen) in [("", 0), (good.as_str(), 1)] {
+                let text = format!("Reading.\n\n<｜DSML｜ calls>\n{before}{}", call("read", rest));
+                for n in 1..=12 {
+                    let what = format!("{case}, after {seen} good, {n} at a time");
+                    let (whole, pw) = stream(&text, n, ThinkingMode::Chat, false);
+                    let (pieces, pp) = stream(&text, n, ThinkingMode::Chat, true);
+                    assert_eq!(text_of(&pieces), text_of(&whole), "{what}");
+                    assert_eq!((pw.tool_calls_seen(), pp.tool_calls_seen()), (seen, seen), "{what}");
+                    let (whole, pieces) = (message(whole), message(pieces));
+                    assert_eq!(pieces.tool_calls[..seen], whole.tool_calls[..], "{what}");
+                    let (name, args) = &pieces.tool_calls[seen];
+                    assert_eq!((name.as_str(), args.as_str()), ("read", *sent), "{what}");
+                    assert!(crate::pyjson::loads(args).is_none(), "{what}: {args} is complete JSON");
+                }
             }
         }
-        assert_eq!(r, whole.reasoning_content);
-        assert_eq!(c, whole.content);
-        assert_eq!(calls, whole.tool_calls);
-        assert_eq!(calls[0].1, "{\"path\": \"a.txt\", \"n\": 3}");
-        assert!(p.saw_eos);
     }
+    fn wire_run(text: &str, width: usize, tools: bool) -> (String, String, Vec<(String, String)>, Option<&'static str>) {
+        let mut p = StreamParser::with_tools(ThinkingMode::Chat, tools);
+        let mut ds = Vec::new();
+        for chunk in text.chars().collect::<Vec<_>>().chunks(width) { p.push(&chunk.iter().collect::<String>(), &mut ds) }
+        p.finish(&mut ds);
+        let (mut r, mut c, mut calls) = (String::new(), String::new(), Vec::new());
+        for d in ds { match d { Delta::Reasoning(s)=>r.push_str(&s), Delta::Content(s)=>c.push_str(&s), Delta::ToolCall(_,n,a)=>calls.push((n,a)), Delta::ToolCallStart(_,_)|Delta::ToolArgs(_,_)=>{} } }
+        assert!(!c.contains("DSML") && !c.contains("place_holder_mm_span") && !c.contains("<think>") && !c.contains("</think>"), "{c:?}");
+        (r,c,calls,p.protocol_error())
+    }
+    const WIRE_CALL: &str = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"exec_command\">\n<｜DSML｜ parameter name=\"cmd\" string=\"true\">pwd</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    #[test]
+    fn wire_anywhere_all_chunk_widths() {
+        for prefix in ["", "Prose", "Prose\n", "Prose\n\n"] {
+            let text = format!("{prefix}{WIRE_CALL}{EOS}");
+            for w in 1..=text.chars().count() {
+                let (_, c, calls, e)=wire_run(&text,w,true);
+                assert_eq!(c,prefix.strip_suffix("\n\n").unwrap_or(prefix));
+                assert_eq!(calls,vec![("exec_command".into(), "{\"cmd\": \"pwd\"}".into())]); assert!(e.is_none());
+            }
+        }
+    }
+    #[test]
+    fn wire_captured_r4_redundant_closes() {
+        let text=WIRE_CALL.replace("</｜DSML｜ invoke>", "</ Chapters>\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>");
+        for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true); assert_eq!(calls.len(),1); assert!(e.is_none()); }
+    }
+    #[test]
+    fn wire_multiple_blocks_and_trailing_prose() {
+        let text=format!("First{WIRE_CALL}After{WIRE_CALL}Done{EOS}");
+        for w in 1..=text.chars().count() { let (_,c,calls,e)=wire_run(&text,w,true); assert_eq!(c,"FirstAfterDone");assert_eq!(calls.len(),2);assert!(e.is_none()); }
+    }
+    #[test]
+    fn wire_both_spellings_and_whitespace() {
+        let text=WIRE_CALL.replace(" calls", "tool_calls").replace(" invoke", "invoke").replace(" parameter", "parameter").replace('\n',"\r\n  ");
+        for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert_eq!(calls.len(),1);assert!(e.is_none()); }
+    }
+    #[test]
+    fn wire_special_tokens_and_stray_think() {
+        let text=format!("a</think>b<｜place_holder_mm_span_0｜>c<|place_holder_mm_span|>d{EOS}");
+        for w in 1..=text.chars().count() { let (_,c,_,e)=wire_run(&text,w,false);assert_eq!(c,"abcd");assert!(e.is_none()); }
+    }
+    #[test]
+    fn wire_special_tokens_in_argument() {
+        let text=WIRE_CALL.replace(">pwd<", ">p<｜place_holder_mm_span_0｜>wd<");
+        for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert_eq!(calls[0].1,"{\"cmd\": \"pwd\"}");assert!(e.is_none()); }
+    }
+    #[test]
+    fn wire_truncated_never_raw() {
+        let chars:Vec<_>=WIRE_CALL.chars().collect();
+        for n in 1..chars.len() { let text:String=chars[..n].iter().collect();let _=wire_run(&text,1,true); }
+    }
+    #[test]
+    fn wire_corruption_fails_closed() {
+        for text in [WIRE_CALL.replace("parameter name", "hicles name"), WIRE_CALL.replace("string=\"true\"", "string=\"false\""), WIRE_CALL.replace("</｜DSML｜ parameter>", "") ] {
+            for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert!(calls.is_empty());assert!(e.is_some()); }
+        }
+    }
+    #[test]
+    fn wire_no_tools_never_passes_protocol() { let (_,_,calls,e)=wire_run(WIRE_CALL,1,false);assert!(calls.is_empty());assert!(e.is_some()); }
+    #[test]
+    fn wire_plain_text_identity() {
+        for text in ["hello\n\n", "x < 5", "x <", "こんにちは\n", "compact JSON: {\"a\":1}"] { for w in 1..=text.chars().count() { let (_,c,_,e)=wire_run(text,w,false);assert_eq!(c,text);assert!(e.is_none()); } }
+    }
+
+    #[test]
+    fn wire_quoted_names_and_literal_close_in_value() {
+        let text=WIRE_CALL.replace("name=\"cmd\"", "name=\"a\"b\"").replace(">pwd<", ">x</｜DSML｜ invoke>y<<");
+        for w in 1..=text.chars().count() {
+            let (_,_,calls,e)=wire_run(&text,w,true);assert!(e.is_none());
+            assert_eq!(calls[0].1,"{\"a\\\"b\": \"x</｜DSML｜ invoke>y<\"}");
+        }
+    }
+    #[test]
+    fn wire_nested_protocol_in_tool_name_rejected() {
+        let text=WIRE_CALL.replace("exec_command", "read\">\n\n\n<｜DSML｜ invoke name=\"a b");
+        for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert!(calls.is_empty());assert_eq!(e,Some("reserved token in tool name")); }
+    }
+
 }

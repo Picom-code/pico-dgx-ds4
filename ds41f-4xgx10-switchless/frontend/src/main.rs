@@ -23,8 +23,12 @@ fn usage() -> ! {
                                 of --thinking and --no-thinking wins); requests can override it
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
+      --stream-tool-args        a stream's tool calls in pieces, as OpenAI streams them: the call's name
+                                when it has parsed, then its arguments as they arrive (default: each
+                                call in one chunk, once it is complete)
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
-                                ids (N.out.json; debugging and bench traces)
+                                ids and exact pre-parser bytes (N.out.json/.bin; also DSFRONT_DUMP_DIR)
+      --protocol-error-dir DIR  opt-in private raw bytes and token ids on parser errors only;\n                                also DSFRONT_PROTOCOL_ERROR_DIR (off by default, may contain sensitive text)
       --hold-s N                while the engine is down (the ring lent, or a restart), a request
                                 waits this long (600), then is answered 503 with Retry-After: 60
       --admin-socket PATH       commands from service.sh (mode 600): status, hold IDLE_S, release
@@ -131,12 +135,16 @@ fn serve(args: &[String]) {
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
-        dump_dir: opt(args, "--dump-dir").map(Into::into),
+        dump_dir: opt(args, "--dump-dir").map(Into::into)
+            .or_else(|| std::env::var_os("DSFRONT_DUMP_DIR").map(Into::into)),
+        protocol_error_dir: opt(args, "--protocol-error-dir").map(Into::into)
+            .or_else(|| std::env::var_os("DSFRONT_PROTOCOL_ERROR_DIR").map(Into::into)),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
+        stream_tool_args: args.iter().any(|a| a == "--stream-tool-args"),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);
@@ -392,7 +400,9 @@ fn tokcheck(args: &[String]) {
 
 /// Compare encoding.rs with encoding.py's output (tools/gen_encoding_cases.py).
 fn enccheck(args: &[String]) {
-    use dsfront::encoding::{encode_messages, parse_message_from_completion_text, Delta, EncodeOptions, StreamParser, ThinkingMode};
+    use dsfront::encoding::{
+        encode_messages, parse_message_from_completion_text, Delta, EncodeOptions, ParsedMessage, StreamParser, ThinkingMode,
+    };
     use serde_json::Value;
     let path = args.get(2).unwrap_or_else(|| usage());
     let f = std::fs::File::open(path).unwrap_or_else(|e| {
@@ -475,33 +485,43 @@ fn enccheck(args: &[String]) {
                     (Ok(m), None) => report(&name, format!("encoding.py raised {}, port gave {m:?}", c["error"])),
                     _ => {}
                 }
-                // The streaming parser, fed in random pieces, must agree wherever the reference parses.
+                // The streaming parser, fed in random pieces, must agree wherever the reference parses,
+                // with its tool calls whole and with them in pieces (stream_args). In pieces, its
+                // reasoning and content are what they are whole, delta for delta, whether the
+                // reference parses or not.
                 let chars: Vec<char> = text.chars().collect();
-                let mut p = StreamParser::new(mode);
-                let mut out = Vec::new();
+                let mut pieces: Vec<String> = Vec::new();
                 let mut i = 0;
                 while i < chars.len() {
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
                     let k = 1 + (rng % 9) as usize;
-                    let piece: String = chars[i..(i + k).min(chars.len())].iter().collect();
-                    p.push(&piece, &mut out);
+                    pieces.push(chars[i..(i + k).min(chars.len())].iter().collect());
                     i += k;
                 }
-                p.finish(&mut out);
+                let stream = |stream_args: bool| {
+                    let mut p = StreamParser::new(mode).stream_args(stream_args);
+                    let mut out = Vec::new();
+                    pieces.iter().for_each(|piece| p.push(piece, &mut out));
+                    p.finish(&mut out);
+                    out
+                };
+                let (whole, in_pieces) = (stream(false), stream(true));
+                let text_of = |ds: &[Delta]| -> Vec<Delta> {
+                    ds.iter().filter(|d| matches!(d, Delta::Reasoning(_) | Delta::Content(_))).cloned().collect()
+                };
+                if text_of(&whole) != text_of(&in_pieces) {
+                    report(&name, format!("stream in pieces: other text than whole: {in_pieces:?}\n  whole {whole:?}"));
+                }
                 if let Ok(m) = got {
                     n_stream += 1;
-                    let (mut r, mut ct, mut calls) = (String::new(), String::new(), Vec::new());
-                    for d in out {
-                        match d {
-                            Delta::Reasoning(s) => r.push_str(&s),
-                            Delta::Content(s) => ct.push_str(&s),
-                            Delta::ToolCall(_, n, a) => calls.push((n, a)),
+                    for (how, deltas) in [("stream", whole), ("stream in pieces", in_pieces)] {
+                        let mut s = ParsedMessage::default();
+                        deltas.into_iter().for_each(|d| s.add(d));
+                        if s != m {
+                            report(&name, format!("{how} differs: {s:?}\n  want {m:?}"));
                         }
-                    }
-                    if r != m.reasoning_content || ct != m.content || calls != m.tool_calls {
-                        report(&name, format!("stream differs: reasoning {r:?} content {ct:?} calls {calls:?}\n  want {m:?}"));
                     }
                 }
             }

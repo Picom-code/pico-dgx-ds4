@@ -50,6 +50,13 @@ fn write_value(out: &mut String, v: &Value) {
 
 fn write_str(out: &mut String, s: &str) {
     out.push('"');
+    write_escaped(out, s);
+    out.push('"');
+}
+
+/// A string as `dumps` writes it, without the quotes. Each character is written on its own, so the
+/// pieces of a string, written one after the other, are the string written whole.
+pub fn write_escaped(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -63,7 +70,6 @@ fn write_str(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
-    out.push('"');
 }
 
 /// Whether Python's json module would read this number literal as an int.

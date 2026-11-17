@@ -5,7 +5,7 @@
 //! matched to a session for prefix reuse, sent to rank 0, and the streamed ids are decoded, checked
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
-use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
+use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, ParsedMessage, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -45,6 +45,8 @@ pub struct ServerConfig {
     /// Write each request, its prompt and its ids here, and at its end the output's ids (debugging and
     /// bench traces; holds conversation text).
     pub dump_dir: Option<std::path::PathBuf>,
+    /// Opt-in private raw generation evidence on protocol errors only; never sent to clients.
+    pub protocol_error_dir: Option<std::path::PathBuf>,
     /// How long a request waits while the engine is down (the ring lent, or a restart) before it is
     /// answered 503 with Retry-After.
     pub hold: Duration,
@@ -58,11 +60,34 @@ pub struct ServerConfig {
     /// vision: the most rows the image requests being answered may take together
     /// (--max-image-rows-in-flight); a request that does not fit is answered 429 with Retry-After
     pub max_image_rows_in_flight: usize,
+    /// A stream's tool calls in pieces, as OpenAI streams them: a chunk with the call's id and name
+    /// when its name has parsed, then its arguments as they arrive. Off: each call in one chunk, once
+    /// it is complete (a call that fails to parse is then never seen as one; StreamParser).
+    pub stream_tool_args: bool,
 }
 
 /// The default body limit: 64 MiB, which holds a 1M-token prompt several times over. Image and video
 /// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
+
+/// Monotonic counters for /metrics (sparkDash reads them as `tensorfold:*`).
+///
+/// By @100menotu001, from Picom-code/pico-dgx-ds4#12; carried onto this branch unchanged.
+///
+/// `CACHED_TOTAL` counts the prompt tokens whose KV was reused, and those sit *inside*
+/// `PROMPT_TOTAL` (see `Done::cached_tokens`): sparkDash derives prefill as `prompt - cached`,
+/// so the two are a subset relation, never a partition. The clamp at the update site keeps that
+/// true even if an engine ever reports a reuse length past the prompt it was handed.
+static GEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TTFT_US_SUM: AtomicU64 = AtomicU64::new(0);
+static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Prefill time as the engine measured it (`Done::prefill_us`: prefill started -> first token),
+/// over completed requests. TTFT is not that quantity (it also covers the gate and the submit round
+/// trip), so the prefill rate divides the computed tokens, `prompt - cached`, by these.
+static PREFILL_US_SUM: AtomicU64 = AtomicU64::new(0);
+static PREFILL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub struct App {
     pub cfg: ServerConfig,
@@ -122,7 +147,7 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     let max_body = app.cfg.max_body_bytes;
-    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    let routes = Router::new().route("/health", get(health)).route("/metrics", get(metrics)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
     body_limit(routes, max_body).with_state(app)
 }
 
@@ -237,6 +262,65 @@ async fn health(State(app): State<Arc<App>>) -> Response {
         (StatusCode::OK, "ok\n").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
+    }
+}
+
+/// The `/metrics` body: the two gauges, the counters and the summaries, in the Prometheus text
+/// exposition format. Built from the statics alone, so a test reads the exposition without a server.
+///
+/// By @100menotu001, from Picom-code/pico-dgx-ds4#12; carried onto this branch unchanged.
+fn metrics_body(running: u32, waiting: u32) -> String {
+    format!(
+        "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
+# TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
+# TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n\
+# TYPE tensorfold:request_prefill_seconds summary\ntensorfold:request_prefill_seconds_sum {}\ntensorfold:request_prefill_seconds_count {}\n",
+        GEN_TOTAL.load(Ordering::Relaxed), PROMPT_TOTAL.load(Ordering::Relaxed), CACHED_TOTAL.load(Ordering::Relaxed),
+        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed),
+        PREFILL_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, PREFILL_COUNT.load(Ordering::Relaxed)
+    )
+}
+
+/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
+/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], metrics_body(running, waiting)).into_response()
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    /// Every series a scraper reads is present and every sample is a number: a missing or misnamed
+    /// series is how a dashboard silently shows nothing.
+    #[test]
+    fn the_exposition_has_every_series() {
+        let body = metrics_body(2, 1);
+        let series = [
+            "tensorfold:requests_running 2",
+            "tensorfold:requests_waiting 1",
+            "tensorfold:generation_tokens_total ",
+            "tensorfold:prompt_tokens_total ",
+            "tensorfold:prompt_tokens_cached_total ",
+            "tensorfold:time_to_first_token_seconds_sum ",
+            "tensorfold:time_to_first_token_seconds_count ",
+            "tensorfold:request_prefill_seconds_sum ",
+            "tensorfold:request_prefill_seconds_count ",
+        ];
+        for want in series {
+            assert!(body.contains(want), "{want} missing from /metrics:\n{body}");
+        }
+        let samples: Vec<&str> = body.lines().filter(|l| l.starts_with("tensorfold:")).collect();
+        assert_eq!(samples.len(), series.len(), "/metrics:\n{body}");
+        for line in samples {
+            let (name, value) = line.rsplit_once(' ').expect("a sample line has a value");
+            assert!(value.parse::<f64>().is_ok(), "not a number: {line}");
+            assert!(name.starts_with("tensorfold:"), "unprefixed series: {line}");
+        }
     }
 }
 
@@ -606,6 +690,40 @@ impl Usage {
     }
 }
 
+/// Capture token bytes before decoding/stopping/parsing. Call only for an opt-in protocol-error
+/// diagnostic. No prompts, authorization headers or raw bytes are put in ordinary logs or SSE.
+/// Every error gets a new private directory, so process restarts cannot overwrite prior evidence.
+fn capture_protocol_error(
+    base: &std::path::Path, req_id: u64, session_id: u64, ids: &[u32], kept: usize,
+    raw: &[u8], error: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(base)?;
+    let meta = std::fs::symlink_metadata(base)?;
+    if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "protocol error directory must be a private real directory (0700)"));
+    }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let dir = base.join(format!("{}-{req_id:06}-{stamp}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let mut bytes = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(dir.join("generation.bin"))?;
+    bytes.write_all(raw)?;
+    bytes.sync_all()?;
+    let record = json!({"schema_version": 1, "req_id": req_id, "session_id": session_id,
+        "protocol_error": error, "token_ids": ids, "kept_tokens": kept,
+        "generated_tokens": ids.len(), "raw_file": "generation.bin", "raw_bytes": raw.len(),
+        "raw_utf8": std::str::from_utf8(raw).ok(),
+        "capture_point": "concatenated tokenizer token_bytes of every engine output id, before parser/stop filtering"});
+    let mut index = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open(dir.join("record.json"))?;
+    index.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
+    index.sync_all()?;
+    Ok(dir)
+}
+
 /// One request in flight on the engine: decodes, stops, guards and parses its token stream.
 struct Gen {
     app: Arc<App>,
@@ -644,6 +762,7 @@ impl Gen {
             match ev {
                 EngineEvent::Tokens(t) => {
                     self.first_token.get_or_insert_with(Instant::now);
+                    GEN_TOTAL.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                     for &id in &t.ids {
                         self.ids.push(id);
                         if self.stopped.is_some() {
@@ -696,6 +815,18 @@ impl Gen {
                         self.flush(out);
                     }
                     self.parser.finish(out);
+                    if let Some(e) = self.parser.protocol_error() {
+                        if let Some(base) = &self.app.cfg.protocol_error_dir {
+                            let raw: Vec<u8> = self.ids.iter().flat_map(|&id| self.app.tok.token_bytes(id).iter().copied()).collect();
+                            match capture_protocol_error(base, self.req_id, self.session_id, &self.ids, self.kept, &raw, e) {
+                                Ok(path) => eprintln!("req {}: protocol error evidence saved to {}", self.req_id, path.display()),
+                                Err(err) => eprintln!("req {}: protocol error evidence capture FAILED: {err}", self.req_id),
+                            }
+                        }
+                        self.app.sessions.lock().unwrap().abandon(self.session_id);
+                        self.app.engine.release(self.session_id);
+                        return Some(Err(format!("malformed model output protocol: {e}")));
+                    }
                     let finish = if self.parser.tool_calls_seen() > 0 {
                         Finish::ToolCalls
                     } else if let Some(f) = self.stopped {
@@ -712,10 +843,28 @@ impl Gen {
                         _ => 0,
                     };
                     self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
-                    let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
+                    // cached is the reused prefix of the prompt, not an extra counter: sparkDash
+                    // derives prefill as prompt - cached, so clamp instead of letting it exceed.
+                    let prompt = self.prompt_ids.len();
+                    let usage = Usage { prompt, cached: d.cached_tokens.min(prompt as u32), completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
+                    PROMPT_TOTAL.fetch_add(usage.prompt as u64, Ordering::Relaxed);
+                    CACHED_TOTAL.fetch_add(usage.cached as u64, Ordering::Relaxed);
+                    TTFT_US_SUM.fetch_add((ttft * 1e6) as u64, Ordering::Relaxed);
+                    TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PREFILL_US_SUM.fetch_add(d.prefill_us, Ordering::Relaxed);
+                    PREFILL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(dir) = &self.app.cfg.dump_dir {
+                        // Debug-only exact pre-parser output for successful parses too: a trial can
+                        // diagnose a content leak even if its parser did not report an error.
+                        let raw: Vec<u8> = self.ids.iter().flat_map(|&id| self.app.tok.token_bytes(id).iter().copied()).collect();
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let bytes = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                            .open(dir.join(format!("{:06}.out.bin", self.req_id)))
+                            .and_then(|mut f| { f.write_all(&raw)?; f.sync_all() });
+                        if let Err(e) = bytes { eprintln!("dump raw output: {e}"); }
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
                             "usage": usage.json(), "ttft_s": ttft, "total_s": total});
@@ -766,6 +915,12 @@ impl Drop for Gen {
             self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
         }
     }
+}
+
+/// The request's parser. Only a stream has its tool calls in pieces: an answer sent whole has no use
+/// for the start of a call that did not parse.
+fn parser(cfg: &ServerConfig, p: &Prepared) -> StreamParser {
+    StreamParser::with_tools(p.mode, p.tools).stream_args(p.stream && cfg.stream_tool_args)
 }
 
 async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
@@ -838,7 +993,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
-        parser: StreamParser::with_tools(p.mode, p.tools),
+        parser: parser(&app.cfg, p),
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -917,7 +1072,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
-        parser: StreamParser::with_tools(p.mode, p.tools),
+        parser: parser(&app.cfg, p),
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -980,23 +1135,20 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     let created = now_secs();
     let model = app.cfg.model_name.clone();
     // non-streaming
-    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+    let mut answer = ParsedMessage::default();
     let mut out = Vec::new();
     let (finish, usage) = loop {
         let end = gen.next(&mut out).await;
-        for d in out.drain(..) {
-            match d {
-                Delta::Reasoning(s) => reasoning.push_str(&s),
-                Delta::Content(s) => content.push_str(&s),
-                Delta::ToolCall(_, name, args) => calls.push(tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)),
-            }
-        }
+        out.drain(..).for_each(|d| answer.add(d));
         match end {
             None => continue,
             Some(Ok(x)) => break x,
             Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
         }
     };
+    let ParsedMessage { content, reasoning_content: reasoning, tool_calls } = answer;
+    let calls: Vec<Value> =
+        tool_calls.into_iter().map(|(name, args)| tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)).collect();
     let mut message = json!({"role": "assistant",
         "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) }});
     if p.mode == ThinkingMode::Thinking {
@@ -1077,6 +1229,12 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                     Delta::ToolCall(i, name, args) => {
                         json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
                     }
+                    // in pieces, as OpenAI streams a call: its id, type and name with empty arguments,
+                    // then chunks that carry its index and the next of its arguments
+                    Delta::ToolCallStart(i, name) => {
+                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, String::new())]})
+                    }
+                    Delta::ToolArgs(i, piece) => json!({"tool_calls": [{"index": i, "function": {"arguments": piece}}]}),
                 };
                 if send(chunk(delta, None)).await.is_err() {
                     return; // client gone; dropping gen cancels the request
@@ -1123,12 +1281,50 @@ pub(crate) mod tests {
             loop_guard: None,
             tokenize_threads: 1,
             dump_dir: None,
+            protocol_error_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
+            stream_tool_args: false,
         }
+    }
+
+    #[test]
+    fn protocol_error_capture_is_exact_private_and_non_overwriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("dsfront-capture-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let raw = b"prose <\xef\xbd\x9cDSML\xef\xbd\x9c parameter>\xff</think>";
+        let ids = [41, 42, 43];
+        let a = capture_protocol_error(&base, 7, 8, &ids, 2, raw, "invalid tool parameter").unwrap();
+        let b = capture_protocol_error(&base, 7, 8, &ids, 2, raw, "invalid tool parameter").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(a.join("generation.bin")).unwrap(), raw);
+        let record: Value = serde_json::from_slice(&std::fs::read(a.join("record.json")).unwrap()).unwrap();
+        assert_eq!(record["token_ids"], json!(ids));
+        assert_eq!(record["kept_tokens"], 2);
+        assert_eq!(record["raw_bytes"], raw.len());
+        assert!(record["raw_utf8"].is_null()); // Never use lossy UTF-8 as the authoritative bytes.
+        for path in [&base, &a, &b] { assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700); }
+        for name in ["generation.bin", "record.json"] { assert_eq!(std::fs::metadata(a.join(name)).unwrap().permissions().mode() & 0o777, 0o600); }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn protocol_error_capture_refuses_public_or_symlink_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("dsfront-capture-mode-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(capture_protocol_error(&base, 1, 1, &[], 0, b"secret", "error").is_err());
+        let link = base.with_extension("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(capture_protocol_error(&link, 1, 1, &[], 0, b"secret", "error").is_err());
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(base).unwrap();
     }
 
     #[test]
@@ -1672,5 +1868,40 @@ pub(crate) mod tests {
         assert_eq!(post_status(4096, 1 << 20).await, 413);
         // the limit follows the setting
         assert_eq!(post_status(2 << 20, 1 << 20).await, 200);
+    }
+
+    /// GET a path from the real router and return (status, content-type, body). None when the
+    /// checkpoint's tokenizer is not on this box (the same skip session.rs's tests take).
+    async fn get_route(path: &str) -> Option<(u16, String, String)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tok = Tokenizer::from_file("/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json").ok()?;
+        let app = App::new(cfg(), Arc::new(tok), EngineClient::start("/nonexistent".into()));
+        let routes: Router = Router::new().route("/metrics", get(metrics)).with_state(app);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply).await;
+        server.abort();
+        let reply = String::from_utf8_lossy(&reply).to_string();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap_or((&reply, ""));
+        let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let ctype = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-type:")).unwrap_or("").to_string();
+        Some((status, ctype, body.to_string()))
+    }
+
+    /// The route is served unauthenticated (like /health) in the Prometheus text format, so a scraper
+    /// that already reads a TensorFold serve reads this one unchanged.
+    #[tokio::test]
+    async fn metrics_is_served_unauthenticated_as_prometheus_text() {
+        let Some((status, ctype, body)) = get_route("/metrics").await else { return };
+        assert_eq!(status, 200);
+        assert!(ctype.to_ascii_lowercase().contains("text/plain"), "{ctype}");
+        assert!(ctype.contains("version=0.0.4"), "{ctype}");
+        assert!(body.contains("tensorfold:requests_running "), "{body}");
+        assert!(body.contains("tensorfold:request_prefill_seconds_sum "), "{body}");
     }
 }

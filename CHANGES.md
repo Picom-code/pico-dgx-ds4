@@ -12,7 +12,7 @@ Speeds are decode tok/s (total across concurrent requests). "agent" = 8 concurre
 | 1 | 17-bit block index in `select_bins` (prefix split `nlow`, guard `bkeys_stride` <= 131072) | `engine/attn/indexer.cu` | on | yes | max context 512K -> 1M; needle at 947,826 tokens 3/3; prefill 9.2k tok/s; qeval 71/75; c1 unchanged |
 | 2 | `DefaultBodyLimit` 64 MB (axum default 2 MB) | `frontend/src/server.rs` | on | yes | HTTP 413 above ~400K tokens -> 948K-token prompts accepted |
 | 3 | 16 slots, big/small slot units (`--big-slots`), slot-aware admission, big-slot wait instead of die | `engine/model/*`, `engine/server/{main,serve}.cpp` | `--slots`/`--big-slots` | yes | code c16 172 -> 234-247, c8 170 -> 195-200; c1 unchanged; qeval 71 |
-| 4 | 9..16-row normed GEMVs as rmsnorm + plain r16 GEMV (`DSGB10_FUSED16=1` reverts) | `engine/model/model.cu` | on | yes (same bits) | c16 234 -> 253, c4 187 -> 204, step 77.3 -> 74.8 ms |
+| 4 | 9..16-row normed GEMVs as rmsnorm + plain r16 GEMV (`DSGB10_FUSED16=1` reverts) | `engine/model/model.cu` | on | yes since change 17 (it was not: a 9..16-row step's norm ran at another CTA size) | c16 234 -> 253, c4 187 -> 204, step 77.3 -> 74.8 ms |
 | 5 | Batch-aware expert re-routing `DSGB10_OEA=K0,KP,MINROWS` | `engine/kernels/{common.cuh,moe.cu}` | off | **no** | with 4,12,9: c16 253 -> 286, agent 180.7 -> 203.4; qeval 71/72 |
 | 6 | Cross-session draft row budget `DSGB10_BUDGET=1` | `engine/model/{spec.cu,ops.h,model.h}`, `engine/server/cmd.cpp` | off | yes | c16 253 -> 259, agent 180.7 -> 189.5 |
 
@@ -120,6 +120,18 @@ Measured and not built:
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
 
+## Batched outputs bit-identical again at 9..16 rows (2026-11-16; pull request #19 by grisetio)
+
+Since change 4 (6f6392e) a session decoded in a batch of 9..16 rows came out other than alone: plain batches of
+9..16 sessions, and drafted batches of two or more (two sessions with drafts run about 12 rows a step).
+`batch_test.py --slots 2` with drafts on: 40 FAIL, first token differences at 17..202, log-probabilities differing
+where the tokens matched. The standalone `dsk::rmsnorm` that change 4 runs before the plain r16 GEMVs used D/8
+threads a row (640 at 5120), the fused calls 256, and a row's 1/rms depends on the threads that sum its squares.
+
+| # | Change | Files | Default | Lossless | Before -> after |
+|---|---|---|---|---|---|
+| 17 | The 9..16-row norms with the fused call's CTA (`dsk::norm_threads`); `dsk::rmsnorm`'s default (D/8) unchanged for every other caller. Tests: `test_kernels` `norm` / `rows16`, `engine/server/tests/batch_matrix.sh` (111 runs), `batch_test.py --wide` | `engine/kernels/{dsk.h,norm_router.cu,README.md}`, `engine/model/model.cu`, `engine/kernels/tests/test_kernels.cu`, `engine/server/tests/{batch_matrix.sh,batch_test.py}` | on | yes | batch_test `--slots 2`, drafts on: 18 ok / 40 FAIL -> 58 ok / 0 FAIL; `--slots 16 --wide` 195 ok / 0 FAIL; batch_matrix 363 of 363 sessions equal alone; refhash unchanged; drafted-pair step at 9..12 rows +1.1-1.7 ms (`DSGB10_FUSED16=1`: +5.4-6.5 ms); c16 / c4 not measured |
+
 ## Thinking options, 100 images per request, video input (2026-11-15; pull requests #4, #5, #6 by MiaAI-Lab)
 
 Merged with maintainer commits on top. Tested on the real 4-Spark engine on a test port: output identity 54/54,
@@ -134,3 +146,43 @@ images 15/15, 16 users 375-378 tok/s (unchanged), encoder rows byte-identical to
 Memory on a 4-Spark head: about 1.3 GiB for 100 small images, 0.8 GiB for 40 full-size images in one request (measured).
 Two full-size requests at once were not measured: set `--max-image-rows-in-flight 40000` on a head with less than ~10 GiB free.
 The engine, the front-end and the vision encoder must be updated together: the new front-end sends requests the older engine and encoder refuse.
+
+## `/metrics` for sparkDash (2026-11-17; pull request #12 by 100menotu001)
+
+The endpoint, its series and the exposition's tests are [@100menotu001](https://github.com/100menotu001)'s work,
+contributed to [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4) as
+[PR #12](https://github.com/Picom-code/pico-dgx-ds4/pull/12) and carried here onto the branch the ring deploys.
+This fork's contribution is the port: the same code on top of the vision encoder and the other pull requests,
+with the deploy tool pointed at the branch. The text below is theirs.
+
+dsfront answers `GET /metrics` on the same addresses and port as the API, unauthenticated like `/health`, in the
+Prometheus text exposition format. The series keep the `tensorfold:` prefix of the serve they replace, so a scraper
+already reading the TensorFold counters (sparkDash) reads these unchanged and no other engine's series change.
+
+| series | type | what it reports |
+|---|---|---|
+| `tensorfold:requests_running` | gauge | requests in flight in the gate |
+| `tensorfold:requests_waiting` | gauge | requests waiting in the gate |
+| `tensorfold:generation_tokens_total` | counter | output tokens, added as the engine streams them |
+| `tensorfold:prompt_tokens_total` | counter | the full prompt length of each served request |
+| `tensorfold:prompt_tokens_cached_total` | counter | the part of that prompt whose KV was reused |
+| `tensorfold:time_to_first_token_seconds_sum`, `_count` | summary | time to first token over completed requests |
+| `tensorfold:request_prefill_seconds_sum`, `_count` | summary | the engine's own prefill time (prefill start -> first token) over completed requests |
+
+`prompt_tokens_cached_total` is a **subset** of `prompt_tokens_total`: sparkDash derives prefill as
+`prompt - cached`, so the two are never a partition. The front end adds the full prompt length to the prompt total
+and only the engine's `Done.cached_tokens` to the cached counter, clamped at the update site to the prompt it was
+handed, so the relation holds even if an engine reports a reuse length longer than the prompt.
+
+`generation_tokens_total` advances while a request decodes, so it includes the tokens of a request still in flight;
+the prompt, cached, TTFT and prefill series are recorded once, when the request completes.
+
+`request_prefill_seconds` is the prefill time the **engine** measured (`Done.prefill_us`), not TTFT: TTFT is measured
+from the front end and also covers the gate and the submit round trip, so dividing by it understates the prefill rate.
+A scraper derives the rate as `d(prompt - cached) / d(request_prefill_seconds_sum)` over its window.
+
+The counters are per-process and begin at zero when dsfront starts. **A restart resets them all to zero, together
+with the session and prefix-cache state**, so a scraper should read a drop to zero as a restart, not a traffic drop,
+and re-seed its own baseline (discarding the first post-restart window is the simple version of that rule).
+
+There is no per-slot or queue-depth gauge beyond the two request gauges. Full text: [docs/operations.md](ds41f-4xgx10-switchless/docs/operations.md).

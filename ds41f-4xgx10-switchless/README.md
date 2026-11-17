@@ -118,6 +118,14 @@ From four GB10 boxes to an OpenAI-compatible endpoint. Commands run on rank 0's 
 directory, unless a step says otherwise; the times are this project's. Each command ran here on
 2026-10-13, on deepseek-ai's checkpoint, with other paths, unless marked *not run on this fleet during the review*.
 
+> [!TIP]
+> **[tools/deploy-switchless/](tools/deploy-switchless/) does all of this in one command**, and
+> keeps doing it: `./tools/deploy-switchless/deploy-switchless.sh deploy` from the repository's root,
+> then `status`, `logs`, `redeploy`. It is idempotent and resumable, so a run that stops can be
+> repeated. The steps below are what it automates, and what to do by hand if you would rather.
+> [tools/deploy-switchless/README.md](../tools/deploy-switchless/README.md) has the network setup, the
+> phases, the settings and what it deliberately does not do.
+
 **1. What you need.**
 
 - Four GB10 boxes (128 GB each), ranks 0–3, rank 0 reaching the others by SSH without a password,
@@ -213,7 +221,8 @@ restarts what fails. `DSGB10_ENGINE_ARGS` (`--max-ctx 262144`) takes engine flag
 (`DSGB10_ENGINE_ARGS="--max-ctx 262144 --slots 4"`): up to four sessions keep their state live and decode
 together, each with its own drafts, ~240 MB a slot ([Where it stands](#where-it-stands-2026-10-13),
 [batching.md](docs/batching.md#b3-the-build-2026-10-13)); with one slot (the default, as production runs)
-requests take turns of 64 tokens. To check it (these ran against a test port):
+requests take turns of 64 tokens. For images, `DSGB10_VISION_CMD` (the vision encoder's command) makes the encoder
+a part of the service ([vision.md](docs/vision.md#running-it)). To check it (these ran against a test port):
 
 ```bash
 (umask 077; { printf 'Authorization: Bearer '; cat ~/api-key; } > ~/api-key.header)
@@ -252,7 +261,10 @@ thoroughly the model reasons, rather than imposing a reasoning-token limit. Reas
 there, else the top-level one, else `reasoning`'s; an effort inside `chat_template_kwargs` alone does
 not switch thinking on. A request that sends only fields and values the server took before these
 changes is answered as before (same mode, same effort), with one exception: a request that carried both
-an on-switch and an off-switch now always gets the off-switch. Sampling defaults to
+an on-switch and an off-switch now always gets the off-switch. A stream carries each tool call in one
+chunk, once the call is complete; with `--stream-tool-args` (in `DSGB10_FRONT_ARGS`) it carries the
+call's name when that has parsed and then its arguments as they arrive, as OpenAI streams them, and a
+call that is cut off or does not parse leaves its client with unfinished arguments. Sampling defaults to
 temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max_tokens` to its cap,
 32,768. With no session id, a request that extends an earlier one's messages resumes from its state;
 `usage.prompt_tokens_details.cached_tokens` counts the prompt tokens reused. For pi (0.84.3 here), put
@@ -296,6 +308,7 @@ The current figures are those of "Where it stands" above.
 | Step | State |
 |---|---|
 | Every experiment, failed and dropped ones included: question, numbers, verdict, where the code lives | index → [docs/experiments.md](docs/experiments.md) |
+| Deploying the ring from one command: phases, settings, resumability | done → [tools/deploy-switchless/](../tools/deploy-switchless/) |
 | Research: model spec, tech report, prior recipes | done → [docs/findings.md](docs/findings.md) |
 | Baseline: the SGLang TP=4 kit as it served on the ring | measured → [DESIGN.md](DESIGN.md#baseline) |
 | Hardware microbenchmarks (bandwidth, block-scaled MMA, RDMA latency) | done → [docs/findings.md](docs/findings.md#hardware-measured-here) |

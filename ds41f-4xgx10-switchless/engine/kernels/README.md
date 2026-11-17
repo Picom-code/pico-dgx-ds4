@@ -189,6 +189,16 @@ at all three and up16 4 the best up kernel (up16 2, `<4,8,2>`, is 0.6 ms behind 
 rows only: the CUDA-core variants, gemv16's mt 4 and the persistent GEMVs. The MoE workspace grows
 to 921,896 B (`moe_workspace_bytes()`; the layout per row budget: `moe_hs_offset(M)`).
 
+A norm's thread count is part of its bits. `rmsnorm_scale` sums a row's squares by thread (thread j's
+chunks j, j + blockDim, ..) and then by warp, so a row's 1/rms depends on the CTA it runs in, not on the
+rows beside it. The model's 9..16-row steps norm once with `dsk::rmsnorm` and then call the plain r16 GEMVs
+(model.cu `unfused16`, unless `DSGB10_FUSED16=1`). That gives the fused calls' bits only with their CTA,
+`dsk::norm_threads(cfg)`. At rmsnorm's default of D/8 threads (640 for attn_norm and ffn_norm, against 256
+for c8k and cgate), 1/rms differs by an ulp in about a third of the rows, and now and then (around 1e-5 of
+the elements) so does a bf16 output. That made a drafted batch's 12-row steps decode other than the
+sessions alone (2026-11-16). `test_kernels "" norm` checks the norm against the fused copies over 1,024
+synthetic rows; 8 reference rows are too few to see it.
+
 Tests (`test_kernels "" rows16`): 16-row inputs are the 8 reference rows and then the same rows
 reversed; at 9, 12 and 16 rows every output row must equal that input row's output from an 8-row
 call bit for bit, and the fused paths (norm + GEMV, wo_a + act_quant, the router inside the MoE)
