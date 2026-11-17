@@ -105,9 +105,11 @@ together give 196 Gb/s.
 ### Setting it up
 
 **1. Cable it.** Rank 0 `f0` → rank 1 `f1`, rank 1 `f0` → rank 2 `f1`, rank 2 `f0` → rank 3 `f1`,
-rank 3 `f0` → rank 0 `f1`. Check what each box actually has:
+rank 3 `f0` → rank 0 `f1`. Then clone this repository on rank 0 and check what each box actually has:
 
 ```bash
+git clone https://github.com/Picom-code/pico-dgx-ds4.git
+cd pico-dgx-ds4
 ds41f-4xgx10-switchless/micro/ring_links.sh
 ```
 
@@ -118,29 +120,112 @@ ssh-keygen -t ed25519          # if there is no key yet
 for h in 192.168.2.102 192.168.2.103 192.168.2.104; do ssh-copy-id "$h"; done
 ```
 
-**3. Write the fleet file.** `--phase fleet` writes a template with this ring's addresses; edit it for
-yours. The keys that matter for the network:
+**3. Write the fleet file.** This is the one file you edit. Let the script write it:
 
 ```bash
-NEXT_DEV0=rocep1s0f0     # every box alike: the four RDMA devices
+./tools/deploy-switchless/deploy-switchless.sh --phase fleet
+```
+
+It writes `ds41deploy/fleet.conf` in the clone, filled in with the ring in the diagram above. This is
+what it writes for a clone at `~/pico-dgx-ds4` — the paths are already right for your clone, so leave
+them alone. Change only the lines marked **← change**: the four boxes' names, their hostnames, their
+management addresses, and their ring addresses.
+
+```bash
+# The fleet: the four boxes of the ring, how they are cabled and addressed, and where each keeps its
+# files. Read by the engine (engine/comm/fleet.cpp) and the scripts (engine/server/fleet.sh).
+# Format: KEY=value lines and # comments; a value has no spaces and no quotes. In a path a leading ~/
+# is the home directory of the user on the box that uses the path, and {rank} is the rank.
+#
+# Every path below is under ~/pico-dgx-ds4/ds41deploy, the directory deploy-switchless.sh runs from, on every box.
+
+# Every box alike: the ConnectX-7's RDMA devices, port f0 (facing rank r + 1) and port f1 (facing
+# rank r - 1), on PCI domain 0 (rocep1s0f*) and PCI domain 2 (roceP2p1s0f*); their RoCE v2 GID index
+NEXT_DEV0=rocep1s0f0
 NEXT_DEV1=roceP2p1s0f0
 PREV_DEV0=rocep1s0f1
 PREV_DEV1=roceP2p1s0f1
 GID_INDEX=3
 
-RANK0_HOSTNAME=qspark01  # `hostname` on the box: the engine finds its rank by it
-RANK0_NEXT_IP0=10.112.80.1   # f0, domain 0
-RANK0_NEXT_IP1=10.112.81.1   # f0, domain 2
-RANK0_PREV_IP0=10.141.80.2   # f1, domain 0
-RANK0_PREV_IP1=10.141.81.2   # f1, domain 2
+# Every box alike: where run4.sh copies binaries and writes logs, and the service's directory
+BIN_DIR=~/pico-dgx-ds4/ds41deploy/dsgb10/bin
+LOG_DIR=~/pico-dgx-ds4/ds41deploy/dsgb10/logs
+SERVICE_DIR=~/pico-dgx-ds4/ds41deploy/dsgb10/service
+# On rank 0: the ring lock; ring.owner, ring.wants/ and ring.reclaim go beside it
+RING_LOCK=~/pico-dgx-ds4/ds41deploy/dsgb10/ring.lock
 
-RANK1_SSH=192.168.2.102  # how rank 0 reaches rank 1 (ranks 1-3 only)
+# Rank 0 (an ASUS Ascent GX10), where the scripts run
+RANK0_NAME=qspark01   # ← change
+RANK0_HOSTNAME=qspark01   # ← change
+RANK0_NEXT_IP0=10.112.80.1   # ← change
+RANK0_NEXT_IP1=10.112.81.1   # ← change
+RANK0_PREV_IP0=10.141.80.2   # ← change
+RANK0_PREV_IP1=10.141.81.2   # ← change
+RANK0_WEIGHTS=~/pico-dgx-ds4/ds41deploy/dsgb10/weights/rank0.dsw
+RANK0_HASHMAP=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/engram_hashmap.bin
+RANK0_ENGRAM=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/rank0
+RANK0_ENGRAM_READ_BATCH=1
+RANK0_SPILL=~/pico-dgx-ds4/ds41deploy/dsgb10/spill
+
+# Rank 1 (an ASUS Ascent GX10)
+RANK1_NAME=qspark02   # ← change
+RANK1_HOSTNAME=qspark02   # ← change
+RANK1_SSH=192.168.2.102   # ← change
+RANK1_NEXT_IP0=10.123.80.1   # ← change
+RANK1_NEXT_IP1=10.123.81.1   # ← change
+RANK1_PREV_IP0=10.112.80.2   # ← change
+RANK1_PREV_IP1=10.112.81.2   # ← change
+RANK1_WEIGHTS=~/pico-dgx-ds4/ds41deploy/dsgb10/weights/rank1.dsw
+RANK1_HASHMAP=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/engram_hashmap.bin
+RANK1_ENGRAM=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/rank1
+RANK1_ENGRAM_READ_BATCH=1
+RANK1_SPILL=~/pico-dgx-ds4/ds41deploy/dsgb10/spill
+
+# Rank 2 (an NVIDIA DGX Spark)
+RANK2_NAME=qspark03   # ← change
+RANK2_HOSTNAME=qspark03   # ← change
+RANK2_SSH=192.168.2.103   # ← change
+RANK2_NEXT_IP0=10.134.80.1   # ← change
+RANK2_NEXT_IP1=10.134.81.1   # ← change
+RANK2_PREV_IP0=10.123.80.2   # ← change
+RANK2_PREV_IP1=10.123.81.2   # ← change
+RANK2_WEIGHTS=~/pico-dgx-ds4/ds41deploy/dsgb10/weights/rank2.dsw
+RANK2_HASHMAP=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/engram_hashmap.bin
+RANK2_ENGRAM=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/rank2
+RANK2_ENGRAM_READ_BATCH=8
+RANK2_SPILL=~/pico-dgx-ds4/ds41deploy/dsgb10/spill
+
+# Rank 3 (an NVIDIA DGX Spark)
+RANK3_NAME=qspark04   # ← change
+RANK3_HOSTNAME=qspark04   # ← change
+RANK3_SSH=192.168.2.104   # ← change
+RANK3_NEXT_IP0=10.141.80.1   # ← change
+RANK3_NEXT_IP1=10.141.81.1   # ← change
+RANK3_PREV_IP0=10.134.80.2   # ← change
+RANK3_PREV_IP1=10.134.81.2   # ← change
+RANK3_WEIGHTS=~/pico-dgx-ds4/ds41deploy/dsgb10/weights/rank3.dsw
+RANK3_HASHMAP=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/engram_hashmap.bin
+RANK3_ENGRAM=~/pico-dgx-ds4/ds41deploy/dsgb10/engram/rank3
+RANK3_ENGRAM_READ_BATCH=8
+RANK3_SPILL=~/pico-dgx-ds4/ds41deploy/dsgb10/spill
 ```
 
-Rank r's `NEXT_IP<d>` and rank r+1's `PREV_IP<d>` must be in the same subnet, and each address must be
-on the netdev of the RDMA device the file names. Before the bootstrap each rank checks that the GID at
-`GID_INDEX` of each of its four devices is the IPv4-mapped address the file gives that link, and stops
-otherwise, naming the device, the GID, the key and the file.
+Three rules for the addresses, and nothing else to get right:
+
+- **Rank r's `NEXT_IP<d>` and rank r+1's `PREV_IP<d>` are the two ends of one link**, so they must be in
+  the same `/24`. Rank 0's `NEXT_IP0` is `10.112.80.1` and rank 1's `PREV_IP0` is `10.112.80.2`: link
+  L0. Rank 3's `NEXT_IP0` is `10.141.80.1` and rank 0's `PREV_IP0` is `10.141.80.2`: link L3, which
+  closes the ring.
+- **`<d>` is the PCI domain, not the port.** `0` is `rocep1s0f*`, `2` is `roceP2p1s0f*`. Both carry the
+  same link, so both addresses must be on that link's cable.
+- **`RANK<n>_SSH` is the management network**, not a ring address. It is how rank 0 reaches the box.
+
+Before the bootstrap each rank checks that the GID at `GID_INDEX` of each of its four devices is the
+IPv4-mapped address the file gives that link, and stops otherwise, naming the device, the GID, the key
+and the file. So a wrong address is caught before anything is built.
+
+If you would rather keep the file somewhere else, `FLEET=/path/to/fleet.conf` points the script at it,
+and `FLEET_SRC=/path/to/fleet.conf` copies yours in instead of writing the template.
 
 **4. Put the addresses on the links.** `--phase net` prints what each box needs and changes nothing:
 
@@ -209,11 +294,10 @@ Everything it creates lives in one directory, `$WORK`, and nothing outside it is
 | The script is at | `$WORK` |
 | --- | --- |
 | `<repo>/tools/deploy-switchless/deploy-switchless.sh` (where this repo keeps it) | `<repo>/ds41deploy` |
-| `<repo>/tools/deploy-switchless.sh` | `<repo>/ds41deploy` |
 | `<repo>/deploy-switchless.sh` | `<repo>/ds41deploy` |
 | anywhere else | the script's own directory |
 
-In the first three cases `$WORK` carries a `.gitignore` (`*`), so `git status` stays clean and a pull
+In the first two cases `$WORK` carries a `.gitignore` (`*`), so `git status` stays clean and a pull
 never touches the checkpoint, the weights or the logs. `REPO=` and `WORK=` override both.
 
 `$WORK` holds the clone, the fleet file, the checkpoint, the weight files, the Engram shards, the
