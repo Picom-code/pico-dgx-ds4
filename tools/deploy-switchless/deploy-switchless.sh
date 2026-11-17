@@ -65,13 +65,13 @@
 # memory is host memory, so it caps the encoder's GPU memory too: a smaller limit fails in load() with
 # "CUDA error: out of memory".
 #
-# Everything goes under the directory deploy-switchless.sh is in: the clone, the fleet file, the checkpoint, the
-# weight files, the Engram shards, the spill and the API key. Run it from where you want them, or set
-# WORK=/somewhere. The same directory must exist on all four boxes (the fleet file's paths are
-# relative to it, or to each box's home when it is under the home directory).
+# Everything goes under one directory: the clone, the fleet file, the checkpoint, the weight files, the
+# Engram shards, the spill and the API key. Run it from where you want them, or set WORK=/somewhere. The
+# same directory must exist on all four boxes (the fleet file's paths are relative to it, or to each
+# box's home when it is under the home directory).
 #
-# deploy-switchless.sh works from inside the recipe's clone too (the repo's root, beside ds41f-4xgx10-switchless/),
-# which is how it is meant to be used: git clone the recipe, cd into it, ./deploy-switchless.sh. Then the clone is
+# deploy-switchless.sh works from inside the recipe's clone too, which is how it is meant to be used:
+# git clone the recipe, cd into it, ./tools/deploy-switchless/deploy-switchless.sh. Then the clone is
 # the repo it is in, and everything it creates goes in one folder beside it, ./ds41deploy, which
 # carries a .gitignore so that git leaves it alone.
 #
@@ -104,11 +104,12 @@ REF=${REF:-}                                         # what to check out: pr:N, 
 PR=${PR:-}                                           # the same as REF=pr:N (a pull request's head)
 SRC_SUB=ds41f-4xgx10-switchless                      # the recipe's directory inside the repo
 
-# Where deploy-switchless.sh is. It works three ways:
-#   - in the recipe's clone at tools/deploy-switchless.sh (where the repo keeps it): the clone is the
-#     repo it is in, and everything this script creates goes in one folder beside it, $HERE/../ds41deploy,
-#     which carries a .gitignore so that git leaves it alone;
-#   - in the recipe's clone's root, beside ds41f-4xgx10-switchless/: the same, with $HERE/ds41deploy;
+# Where deploy-switchless.sh is. It works from four places:
+#   - in the recipe's clone at tools/deploy-switchless/deploy-switchless.sh (where the repo keeps it):
+#     the repo is two levels up, and everything this script creates goes in one folder beside it,
+#     <repo>/ds41deploy, which carries a .gitignore so that git leaves it alone;
+#   - in the recipe's clone at tools/deploy-switchless.sh: the repo is one level up, same WORK;
+#   - in the recipe's clone's root, beside ds41f-4xgx10-switchless/: same, with $HERE/ds41deploy;
 #   - anywhere else: it clones the recipe into $HERE/pico-dgx-ds4 and keeps everything in $HERE.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -d "$HERE/$SRC_SUB" ]; then
@@ -119,6 +120,11 @@ elif [ -d "$HERE/../$SRC_SUB" ]; then
   # tools/deploy-switchless.sh in the repo: the repo is one level up
   IN_REPO=1
   REPO=${REPO:-$(cd "$HERE/.." && pwd)}
+  WORK=${WORK:-$REPO/ds41deploy}
+elif [ -d "$HERE/../../$SRC_SUB" ]; then
+  # tools/deploy-switchless/deploy-switchless.sh in the repo: the repo is two levels up
+  IN_REPO=1
+  REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
   WORK=${WORK:-$REPO/ds41deploy}
 else
   IN_REPO=0
