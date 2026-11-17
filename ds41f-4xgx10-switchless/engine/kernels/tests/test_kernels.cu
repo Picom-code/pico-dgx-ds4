@@ -547,7 +547,7 @@ static void test_norm_gemv() {
     for (int m : {8, 6, 1})
       for (dsk::GemvCfg cfg : {dsk::GemvCfg{1, 1, 8}, dsk::GemvCfg{1, 1, 16}, dsk::GemvCfg{2, 1, 8}}) {
         cfg.tiled = true;
-        dsk::rmsnorm(dx, dw, m, K, 1e-20f, y1, q1, s1, 0);
+        dsk::rmsnorm(dx, dw, m, K, 1e-20f, y1, q1, s1, 0, dsk::norm_threads(cfg));  // the fused call's sums
         dsk::gemv_fp8_multi(q1, s1, m, seg, nseg, K, cfg, 0);
         CUDA_CHECK(cudaMemset(y2, 0, (size_t)M8 * K * 2));
         dsk::gemv_fp8_norm(dx, dw, 1e-20f, m, seg2, nseg, K, cfg, 0, y2, q2, s2);
@@ -583,7 +583,7 @@ static void test_norm_gemv() {
     float *l1 = dev_alloc<float>((size_t)M8 * E), *l2 = dev_alloc<float>((size_t)M8 * E);
     for (int m : {8, 6, 1})
       for (dsk::GemvCfg cfg : {dsk::GemvCfg{1, 1, 8}, dsk::GemvCfg{1, 1, 16}, dsk::GemvCfg{2, 1, 8}}) {
-        dsk::rmsnorm(dx, dw, m, K, 1e-20f, y1, q1, s1, 0);
+        dsk::rmsnorm(dx, dw, m, K, 1e-20f, y1, q1, s1, 0, dsk::norm_threads(cfg));
         dsk::gemv_bf16(y1, m, dgt, E, K, l1, nullptr, cfg, false, 0);
         CUDA_CHECK(cudaMemset(q2, 0, (size_t)M8 * K));
         dsk::gemv_bf16_norm(dx, dw, 1e-20f, m, dgt, E, K, l2, nullptr, cfg, 0, q2, s2);
@@ -1095,8 +1095,10 @@ static void test_prefill_moe() {
 
 // ---- 9..16 rows (docs/batching.md, B4: the _r16 kernels, rows 8..15 in the MMAs' upper half). The
 // 16-row inputs are the 8 reference rows and then the same rows reversed (row r >= 8 is row 15 - r). At
-// 9, 12 and 16 rows every output row must equal, bit for bit, that input row's output from an 8-row call
-// (which the tests above hold to the reference), and the fused paths their unfused sequences.
+// every m in 9..16 rows each output row must equal, bit for bit, that input row's output from an 8-row
+// call (which the tests above hold to the reference), and the fused paths their unfused sequences. The
+// normed GEMVs also check every m in 1..16 against one-row calls: a row's bits do not depend on how many
+// rows ride along.
 static int src8(int r) { return r < 8 ? r : 15 - r; }
 template <class T>
 static T* dev_rows16(const T* h8, size_t cols) {  // [16][cols] on the device from 8 host rows
@@ -1115,6 +1117,14 @@ static size_t diff8(const T* d, const std::vector<T>& h8, int m, size_t cols) {
     for (size_t c = 0; c < cols; ++c) n += memcmp(&h[r * cols + c], &h8[src8(r) * cols + c], sizeof(T)) != 0;
   return n;
 }
+template <class T>  // elements of rows [0, m) of d [m][cols] whose bits differ from row r of h16 [16][cols]
+static size_t diff16(const T* d, const std::vector<T>& h16, int m, size_t cols) {
+  auto h = host(d, (size_t)m * cols);
+  size_t n = 0;
+  for (int r = 0; r < m; ++r)
+    for (size_t c = 0; c < cols; ++c) n += memcmp(&h[r * cols + c], &h16[r * cols + c], sizeof(T)) != 0;
+  return n;
+}
 template <class T>
 static size_t diffd(const T* a, const T* b, size_t n) {  // device arrays, bitwise
   auto ha = host(a, n), hb = host(b, n);
@@ -1127,6 +1137,18 @@ static void verdict(const char* what, size_t d8, long dref = -1) {  // dref < 0:
   g_fail += !ok;
   if (dref < 0) printf("  %-40s %s %zu differ from the 8-row calls\n", what, ok ? "ok  " : "FAIL", d8);
   else printf("  %-40s %s %zu differ from the 8-row calls, %ld from the unfused path\n", what, ok ? "ok  " : "FAIL", d8, dref);
+}
+// dm[m - 1]: elements of rows [0, m) of an m-row call (m = 1..16) that differ from that row's one-row call
+static void verdict_rows(const char* what, const std::vector<size_t>& dm) {
+  size_t d = 0;
+  for (size_t v : dm) d += v;
+  const bool ok = d == 0;
+  g_fail += !ok;
+  printf("  %-40s %s M=1..16 against the 1-row calls: %zu differ", what, ok ? "ok  " : "FAIL", d);
+  if (!ok)
+    for (size_t m = 0; m < dm.size(); ++m)
+      if (dm[m]) printf(" (M=%zu: %zu)", m + 1, dm[m]);
+  printf("\n");
 }
 
 static void test_rows16_gemv() {
@@ -1151,7 +1173,7 @@ static void test_rows16_gemv() {
         const uint8_t* W = tiled ? dwt : dw;
         dsk::gemv_fp8(dq, dqs, 8, W, ds, N, K, reinterpret_cast<__nv_bfloat16*>(dy), cfg, 0);
         const auto y8 = host(dy, (size_t)8 * N);
-        for (int m : {9, 12, 16}) {
+        for (int m = 9; m <= 16; ++m) {
           CUDA_CHECK(cudaMemset(dy, 0xFF, (size_t)16 * N * 2));
           dsk::gemv_fp8(dq, dqs, m, W, ds, N, K, reinterpret_cast<__nv_bfloat16*>(dy), cfg, 0);
           char what[96];
@@ -1193,8 +1215,8 @@ static void test_rows16_gemv() {
       for (int i = 0; i < nseg; ++i) y8[i] = host(seg2[i].y, (size_t)8 * seg2[i].N);
       const auto n8 = host(y2, (size_t)8 * K);
       const auto q8 = host(q2, (size_t)8 * K), s8 = host(s2, (size_t)8 * K / 32);
-      for (int m : {9, 12, 16}) {
-        dsk::rmsnorm(dx, dnw, m, K, 1e-20f, y1, q1, s1, 0);
+      for (int m = 9; m <= 16; ++m) {
+        dsk::rmsnorm(dx, dnw, m, K, 1e-20f, y1, q1, s1, 0, dsk::norm_threads(cfg));  // as model.cu's 9..16 rows
         dsk::gemv_fp8_multi(q1, s1, m, seg, nseg, K, cfg, 0);
         CUDA_CHECK(cudaMemset(y2, 0xFF, (size_t)16 * K * 2));
         CUDA_CHECK(cudaMemset(q2, 0xFF, (size_t)16 * K));
@@ -1210,6 +1232,35 @@ static void test_rows16_gemv() {
         char what[96];
         snprintf(what, sizeof what, "fp8 norm K=%d M=%d mt=%d wk=%d", K, m, cfg.mt, cfg.wk);
         verdict(what, d8, (long)dref);
+      }
+      // a row's bits do not depend on how many rows ride along: rows 0..m-1 of an m-row call (m = 1..16)
+      // against 16 one-row calls (the norm's CTA has the same threads whatever M; the gate's 9..16 rows
+      // scale on the fly instead of staging the normed bf16, and 9..16 fill the MMAs' upper half)
+      {
+        auto* yr = dev_alloc<__nv_bfloat16>((size_t)16 * K);
+        auto *yq = dev_alloc<uint8_t>((size_t)16 * K), *ys = dev_alloc<uint8_t>((size_t)16 * K / 32);
+        std::vector<dsk::Fp8Seg> segr(seg2, seg2 + nseg);
+        for (int i = 0; i < nseg; ++i) segr[i].y = dev_alloc<__nv_bfloat16>((size_t)16 * segr[i].N);
+        for (int r = 0; r < 16; ++r)
+          dsk::gemv_fp8_norm(dx + (size_t)r * K, dnw, 1e-20f, 1, segr.data(), nseg, K, cfg, 0, yr + (size_t)r * K,
+                             yq + (size_t)r * K, ys + (size_t)r * K / 32);
+        const auto hy = host(yr, (size_t)16 * K);
+        const auto hq = host(yq, (size_t)16 * K), hs = host(ys, (size_t)16 * K / 32);
+        std::vector<std::vector<__nv_bfloat16>> sy(nseg);
+        for (int i = 0; i < nseg; ++i) sy[i] = host(segr[i].y, (size_t)16 * segr[i].N);
+        std::vector<size_t> dm;
+        for (int m = 1; m <= 16; ++m) {
+          for (int i = 0; i < nseg; ++i) CUDA_CHECK(cudaMemset(seg2[i].y, 0xFF, (size_t)16 * seg2[i].N * 2));
+          dsk::gemv_fp8_norm(dx, dnw, 1e-20f, m, seg2, nseg, K, cfg, 0, y2, q2, s2);
+          size_t d = diff16(y2, hy, m, K) + diff16(q2, hq, m, K) + diff16(s2, hs, m, K / 32);
+          for (int i = 0; i < nseg; ++i) d += diff16(seg2[i].y, sy[i], m, seg2[i].N);
+          dm.push_back(d);
+        }
+        char what[96];
+        snprintf(what, sizeof what, "fp8 norm K=%d rows mt=%d wk=%d", K, cfg.mt, cfg.wk);
+        verdict_rows(what, dm);
+        cudaFree(yr), cudaFree(yq), cudaFree(ys);
+        for (int i = 0; i < nseg; ++i) cudaFree(segr[i].y);
       }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1229,7 +1280,7 @@ static void test_rows16_gemv() {
       dsk::GemvCfg cfg{mt, 1, 16};
       dsk::gemv_bf16(dx, 8, dwt, N, K, dy, nullptr, cfg, false, 0);
       const auto y8 = host(dy, (size_t)8 * N);
-      for (int m : {9, 12, 16}) {
+      for (int m = 9; m <= 16; ++m) {
         CUDA_CHECK(cudaMemset(dy, 0xFF, (size_t)16 * N * 4));
         dsk::gemv_bf16(dx, m, dwt, N, K, dy, nullptr, cfg, false, 0);
         char what[96];
@@ -1256,8 +1307,8 @@ static void test_rows16_gemv() {
       dsk::gemv_bf16_norm(dx, dnw, 1e-20f, 8, dgt, E, K, l2, nullptr, cfg, 0, q2, s2);
       const auto l8 = host(l2, (size_t)8 * E);
       const auto q8 = host(q2, (size_t)8 * K), s8 = host(s2, (size_t)8 * K / 32);
-      for (int m : {9, 12, 16}) {
-        dsk::rmsnorm(dx, dnw, m, K, 1e-20f, y1, q1, s1, 0);
+      for (int m = 9; m <= 16; ++m) {
+        dsk::rmsnorm(dx, dnw, m, K, 1e-20f, y1, q1, s1, 0, dsk::norm_threads(cfg));  // as model.cu's 9..16 rows
         dsk::gemv_bf16(y1, m, dgt, E, K, l1, nullptr, cfg, false, 0);
         CUDA_CHECK(cudaMemset(l2, 0xFF, (size_t)16 * E * 4));
         CUDA_CHECK(cudaMemset(q2, 0xFF, (size_t)16 * K));
@@ -1268,6 +1319,25 @@ static void test_rows16_gemv() {
         char what[96];
         snprintf(what, sizeof what, "gate norm M=%d mt=%d wk=%d", m, cfg.mt, cfg.wk);
         verdict(what, d8, (long)dref);
+      }
+      // the same row independence for the gate's norm, on its act_quant (CTA 0's) and the logits
+      {
+        auto* lr = dev_alloc<float>((size_t)16 * E);
+        auto *yq = dev_alloc<uint8_t>((size_t)16 * K), *ys = dev_alloc<uint8_t>((size_t)16 * K / 32);
+        for (int r = 0; r < 16; ++r)
+          dsk::gemv_bf16_norm(dx + (size_t)r * K, dnw, 1e-20f, 1, dgt, E, K, lr + (size_t)r * E, nullptr, cfg, 0,
+                              yq + (size_t)r * K, ys + (size_t)r * K / 32);
+        const auto hl = host(lr, (size_t)16 * E);
+        const auto hq = host(yq, (size_t)16 * K), hs = host(ys, (size_t)16 * K / 32);
+        std::vector<size_t> dm;
+        for (int m = 1; m <= 16; ++m) {
+          dsk::gemv_bf16_norm(dx, dnw, 1e-20f, m, dgt, E, K, l2, nullptr, cfg, 0, q2, s2);
+          dm.push_back(diff16(l2, hl, m, E) + diff16(q2, hq, m, K) + diff16(s2, hs, m, K / 32));
+        }
+        char what[96];
+        snprintf(what, sizeof what, "gate norm rows mt=%d wk=%d", cfg.mt, cfg.wk);
+        verdict_rows(what, dm);
+        cudaFree(lr), cudaFree(yq), cudaFree(ys);
       }
     }
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1286,7 +1356,7 @@ static void test_rows16_gemv() {
       dsk::GemvCfg cfg{mt, 1, 16};
       dsk::gemv_woa(dx, 8, dwt, ds, N, K, N / G, dy, cfg, false, 0);
       const auto y8 = host(dy, (size_t)8 * N);
-      for (int m : {9, 12, 16}) {
+      for (int m = 9; m <= 16; ++m) {
         CUDA_CHECK(cudaMemset(dy, 0xFF, (size_t)16 * N * 2));
         dsk::gemv_woa(dx, m, dwt, ds, N, K, N / G, dy, cfg, false, 0);
         char what[96];
@@ -1300,7 +1370,7 @@ static void test_rows16_gemv() {
       dsk::gemv_woa(dx, 8, dwt, ds, N, K, N / G, dy, cfg, false, 0, dq, dqs);
       const auto y8 = host(dy, (size_t)8 * N);
       const auto q8 = host(dq, (size_t)8 * N), s8 = host(dqs, (size_t)8 * N / 32);
-      for (int m : {9, 12, 16}) {
+      for (int m = 9; m <= 16; ++m) {
         CUDA_CHECK(cudaMemset(dq, 0xFF, (size_t)16 * N));
         CUDA_CHECK(cudaMemset(dqs, 0xFF, (size_t)16 * N / 32));
         dsk::gemv_woa(dx, m, dwt, ds, N, K, N / G, dy, cfg, false, 0, dq, dqs);
@@ -1321,7 +1391,7 @@ static void test_rows16_gemv() {
         dsk::GemvCfg cfg{mt, 1, 16};
         dsk::gemv_fp8w_f32(dx1, 8, dwt, ds, N, K, dyf, cfg, 0);
         const auto y8 = host(dyf, (size_t)8 * N);
-        for (int m : {9, 12, 16}) {
+        for (int m = 9; m <= 16; ++m) {
           CUDA_CHECK(cudaMemset(dyf, 0xFF, (size_t)16 * N * 4));
           dsk::gemv_fp8w_f32(dx1, m, dwt, ds, N, K, dyf, cfg, 0);
           char what[96];
@@ -1362,6 +1432,73 @@ static uint8_t* dev_fill16(size_t n, uint32_t seed, int lo = 0, int span = 0) {
 // intermediate (hq/hs) row by row through the unions' slots. moe_up's bits depend only on its warps
 // along K (WK): the 8-row calls use up 0 (WK 4) or 4 (WK 8) to match. Then moe_routed == router_topk +
 // moe, and the task queue == the static schedule, at 16 rows.
+// rmsnorm with a normed GEMV's CTA (dsk::norm_threads) against that GEMV's own normed copy, over many synthetic
+// rows: a row's 1/rms depends on the threads summing its squares, and one ulp of it changes a bf16 output only
+// now and then (about 1e-5 of the elements), so the 8 reference rows of the tests above can miss a difference.
+// Rows of 5120 and 1280 (attn_norm / ffn_norm, q_norm), each its own scale over four decades and a few outliers,
+// as the residual stream has. Also prints how many outputs rmsnorm's default CTA (D/8 threads) changes: the
+// 9..16-row steps' norms before they took norm_threads (informational).
+static void test_norm_threads() {
+  printf("rmsnorm with norm_threads(cfg) == the normed GEMV's copy, many rows\n");
+  Npy nw = L("norm_w");
+  constexpr int kRows = 1024;
+  uint64_t st = 0x9e3779b97f4a7c15ull;
+  auto rnd = [&] {  // splitmix64, uniform in [0, 1)
+    uint64_t z = (st += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull, z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return (double)((z ^ (z >> 31)) >> 11) / 9007199254740992.0;
+  };
+  auto bf = [](float f) {  // round to nearest even
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto* dnw = dev<__nv_bfloat16>(nw);
+  for (const char* mat : {"wq_a", "wq_b"}) {  // K 5120 and 1280
+    Npy wq = L(std::string(mat) + "_w"), sq = L(std::string(mat) + "_s");
+    const int K = wq.shape[1], N = wq.shape[0];
+    uint8_t *dwn = dev(wq), *dwt = dev_alloc<uint8_t>((size_t)N * K), *ds = dev(sq);
+    dsk::tile_fp8(dwn, dwt, N, K, 0);
+    std::vector<uint16_t> hx((size_t)kRows * K);
+    for (int r = 0; r < kRows; ++r) {
+      const double scale = std::pow(10.0, 4.0 * rnd() - 2.0);
+      for (int k = 0; k < K; ++k) {
+        double g = 0;
+        for (int i = 0; i < 4; ++i) g += rnd() - 0.5;
+        if (rnd() < 1e-3) g *= 100;
+        hx[(size_t)r * K + k] = bf((float)(g * scale));
+      }
+    }
+    auto* dx = dev_alloc<__nv_bfloat16>(hx.size());
+    CUDA_CHECK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+    auto *y1 = dev_alloc<__nv_bfloat16>(hx.size()), *y2 = dev_alloc<__nv_bfloat16>(hx.size());
+    auto *y0 = dev_alloc<__nv_bfloat16>(hx.size());
+    auto *q1 = dev_alloc<uint8_t>(hx.size()), *q2 = dev_alloc<uint8_t>(hx.size()), *q0 = dev_alloc<uint8_t>(hx.size());
+    auto *s1 = dev_alloc<uint8_t>(hx.size() / 32), *s2 = dev_alloc<uint8_t>(hx.size() / 32);
+    auto *s0 = dev_alloc<uint8_t>(hx.size() / 32);
+    // the GEMV only carries the norm here (its outputs are not compared)
+    dsk::Fp8Seg seg[1] = {{dwt, ds, dev_alloc<__nv_bfloat16>((size_t)8 * N), N}};
+    for (dsk::GemvCfg cfg : {dsk::GemvCfg{1, 1, 8}, dsk::GemvCfg{1, 1, 16}}) {  // c8k / cgate, c8
+      cfg.tiled = true;
+      for (int r0 = 0; r0 < kRows; r0 += 8)  // CTA 0 of each 8-row call writes the normed copies
+        dsk::gemv_fp8_norm(dx + (size_t)r0 * K, dnw, 1e-6f, 8, seg, 1, K, cfg, 0, y2 + (size_t)r0 * K,
+                           q2 + (size_t)r0 * K, s2 + (size_t)r0 * K / 32);
+      dsk::rmsnorm(dx, dnw, kRows, K, 1e-6f, y1, q1, s1, 0, dsk::norm_threads(cfg));
+      dsk::rmsnorm(dx, dnw, kRows, K, 1e-6f, y0, q0, s0, 0);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      const size_t d = diffd(y1, y2, hx.size()) + diffd(q1, q2, hx.size()) + diffd(s1, s2, hx.size() / 32);
+      const size_t d0 = diffd(y0, y2, hx.size()) + diffd(q0, q2, hx.size()) + diffd(s0, s2, hx.size() / 32);
+      g_fail += d != 0;
+      char what[96];
+      snprintf(what, sizeof what, "K=%d rows=%d wk=%d (%d threads)", K, kRows, cfg.wk, dsk::norm_threads(cfg));
+      printf("  %-36s %s %zu differ; at the default %d threads %zu\n", what, d ? "FAIL" : "ok  ", d, K / 8, d0);
+    }
+    cudaFree(dx), cudaFree(y0), cudaFree(y1), cudaFree(y2), cudaFree(q0), cudaFree(q1), cudaFree(q2);
+    cudaFree(s0), cudaFree(s1), cudaFree(s2), cudaFree(seg[0].y), cudaFree(dwn), cudaFree(dwt), cudaFree(ds);
+  }
+  cudaFree(dnw);
+}
+
 static void test_rows16_moe() {
   Npy x = L("moe_x"), sel = L("moe_sel"), rw = L("moe_rw");
   Npy w1 = L("moe_w1"), s1 = L("moe_s1"), w3 = L("moe_w3"), s3 = L("moe_s3"), w2 = L("moe_w2"), s2 = L("moe_s2");
@@ -1432,7 +1569,7 @@ static void test_rows16_moe() {
       u.erase(std::unique(u.begin(), u.end()), u.end());
       return u;
     };
-    for (int m : {9, 12, 16}) {
+    for (int m = 9; m <= 16; ++m) {
       const auto u16 = uni(0, m), uA = uni(0, 8), uB = uni(8, m);
       for (int wk8 = 0; wk8 < 2; ++wk8) {
         dsk::MoeCfg c8{};
@@ -1497,7 +1634,7 @@ static void test_rows16_moe() {
   int* di2 = dev_alloc<int>(96);
   CUDA_CHECK(cudaMemcpy(dl, hl.data(), hl.size() * 4, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(db, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice));
-  for (int m : {9, 16})
+  for (int m = 9; m <= 16; ++m)
     for (int up16 : {0, 2}) {
       dsk::MoeCfg cfg{};
       cfg.up16 = up16;
@@ -1852,6 +1989,7 @@ int main(int argc, char** argv) {
   if (only.empty() || only == "g16p" || only == "pers") test_gemv16p();
   if (only.empty() || only == "router") test_router();
   if (only.empty() || only == "rows16") test_rows16_gemv();
+  if (only.empty() || only == "norm" || only == "rows16") test_norm_threads();
   if (only.empty() || only == "rows16" || only == "rows16moe") test_rows16_moe();
   if (only.empty() || only == "prefill" || only == "p_fp8") test_prefill_fp8();
   if (only.empty() || only == "prefill" || only == "p_fp8" || only == "p_small") g_fail += small_gemms::run(false);
