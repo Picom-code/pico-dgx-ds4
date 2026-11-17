@@ -6,6 +6,10 @@ and keeps it there. It is the manual procedure in
 [operations.md](../../ds41f-4xgx10-switchless/docs/operations.md) written down once, with the order,
 the checks and the resumability that a hand-run does not have.
 
+It is a deployment tool, not a model or a front-end: the engine, the front-end and the recipe are
+[Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4)'s, and the four fixes it can
+carry are their authors' (see [the four pull requests](#the-four-pull-requests)).
+
 Run it on rank 0, the box with passwordless SSH to the other three.
 
 ```bash
@@ -507,18 +511,24 @@ needs it, images do not), and allocates a tensor under the same `--memory` the e
 
 ## The four pull requests
 
-`--fork` deploys a branch that merges four pull requests on top of `main`. Each is a separate fix, and
-each is worth having on its own:
+`--fork` deploys a branch that merges four pull requests on top of `main`. **None of them are this
+tool's work**: each is someone else's fix, contributed to
+[Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), and each is worth having on its
+own. This script only carries them on one branch so a ring can be deployed with them.
 
-| PR | What it fixes |
-| --- | --- |
-| #3 | the sampler's open-interval endpoint: random Chinese and Cyrillic characters in prose, reasoning and tool arguments |
-| #2 | DSML quarantine: `｜DSML｜` markup leaking into the answer text |
-| #7 | a stream's tool calls in pieces, instead of one chunk once the call is complete |
-| #15 | the service owns the image encoder (`DSGB10_VISION_CMD`) |
+| PR | Author | What it fixes |
+| --- | --- | --- |
+| [#3](https://github.com/Picom-code/pico-dgx-ds4/pull/3) | [@ofan](https://github.com/ofan) | the sampler's open-interval endpoint: random Chinese and Cyrillic characters in prose, reasoning and tool arguments |
+| [#2](https://github.com/Picom-code/pico-dgx-ds4/pull/2) | [@ofan](https://github.com/ofan) | DSML quarantine: `｜DSML｜` markup leaking into the answer text |
+| [#7](https://github.com/Picom-code/pico-dgx-ds4/pull/7) | [@mpfaffenberger](https://github.com/mpfaffenberger) | a stream's tool calls in pieces, instead of one chunk once the call is complete |
+| [#15](https://github.com/Picom-code/pico-dgx-ds4/pull/15) | [@mpfaffenberger](https://github.com/mpfaffenberger) | the service owns the image encoder (`DSGB10_VISION_CMD`) |
 
 PR #7 conflicts with PR #2 in `encoding.rs` (both rewrite the same parser), so the branch is a
-deliberate merge, not a rebase.
+deliberate merge, not a rebase. The merge is this tool's only contribution to them; the fixes are the
+authors'.
+
+The recipe itself is [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), a fork of
+[blaesus/dsgx10](https://github.com/blaesus/dsgx10). This script drives it and does not patch it.
 
 ## Testing it without a ring
 

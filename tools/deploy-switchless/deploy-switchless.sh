@@ -43,10 +43,11 @@
 # By default this script deploys the repository it is in, at whatever that clone has checked out (or
 # REPO_REF, main, when it cloned the recipe itself). `--fork` deploys FORK_REF from FORK_URL instead:
 # the branch that carries every fix the ring needs, all four pull requests on top of main — PR #3
-# (sampler open-interval endpoint), PR #2 (DSML quarantine), PR #7 (a stream's tool calls in pieces)
-# and PR #15 (the service owns the image encoder). STREAM_TOOL_ARGS and VISION are on with it.
-# `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15, without #7); `--no-vision`
-# leaves the encoder out.
+# (sampler open-interval endpoint, @ofan), PR #2 (DSML quarantine, @ofan), PR #7 (a stream's tool calls
+# in pieces, @mpfaffenberger) and PR #15 (the service owns the image encoder, @mpfaffenberger). They are
+# their authors' work, not this script's: it only merges them onto one branch. STREAM_TOOL_ARGS and
+# VISION are on with it. `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15, without
+# #7); `--no-vision` leaves the encoder out.
 #
 # STREAM_TOOL_ARGS=1 starts the front-end with --stream-tool-args: a streamed answer carries each tool
 # call in pieces (its name when that has parsed, then its arguments as they arrive) instead of in one
@@ -92,9 +93,10 @@ FORK_URL=https://github.com/vesatikkanen/pico-dgx-ds4.git
 # of the repo expects, and it is what this script ships as.
 #
 # --fork deploys FORK_REF from FORK_URL instead: the branch that carries every fix the ring needs, all
-# four pull requests on main — PR #3 (sampler open-interval endpoint), PR #2 (DSML quarantine), PR #7
-# (a stream's tool calls in pieces) and PR #15 (the service owns the image encoder). STREAM_TOOL_ARGS
-# and VISION are on with it. --no-stream-args deploys BASE_REF instead: PRs #2, #3 and #15, without #7.
+# four pull requests on main — PR #3 (sampler open-interval endpoint, @ofan), PR #2 (DSML quarantine,
+# @ofan), PR #7 (a stream's tool calls in pieces, @mpfaffenberger) and PR #15 (the service owns the
+# image encoder, @mpfaffenberger). Their authors' work, not this script's. STREAM_TOOL_ARGS and VISION
+# are on with it. --no-stream-args deploys BASE_REF instead: PRs #2, #3 and #15, without #7.
 FORK_REF=${FORK_REF:-fix/sampler-dsml-stream-args}
 BASE_REF=${BASE_REF:-fix/sampler-and-dsml}
 FORK=${FORK:-0}                                      # 1: deploy FORK_REF from FORK_URL (--fork)
@@ -669,8 +671,9 @@ netplan_write() {  # rank... -- netdev... -- ip...
 # REPO_REF, main, when it cloned the recipe itself).
 #
 # --fork deploys FORK_REF (fix/sampler-dsml-stream-args) from FORK_URL instead: that branch carries
-# every fix the ring needs, all four pull requests (PR #3's sampler endpoint, PR #2's DSML quarantine,
-# PR #7's streamed tool calls and PR #15's encoder in the service).
+# every fix the ring needs, all four pull requests (PR #3's sampler endpoint and PR #2's DSML
+# quarantine, both @ofan's; PR #7's streamed tool calls and PR #15's encoder in the service, both
+# @mpfaffenberger's).
 #   ./deploy-switchless.sh redeploy --fork
 #
 # --fork --no-stream-args deploys BASE_REF (fix/sampler-and-dsml) instead: PRs #2, #3 and #15, without
