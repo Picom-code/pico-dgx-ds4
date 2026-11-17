@@ -381,8 +381,9 @@ named. A PR's head is usually behind `main`, so the script merges `main` into it
 `deploy-<ref>` (nothing is pushed); a conflict stops it with a message.
 
 `--fork` deploys `FORK_REF` from `FORK_URL` instead: the branch that carries the four pull requests
-this ring needs (see [below](#the-four-pull-requests)). `--fork --no-stream-args` deploys `BASE_REF`,
-the same without PR #7.
+this ring needs (see [below](#the-four-pull-requests)) plus this fork's own work on top — the vision
+encoder in the service and the `/metrics` endpoint sparkDash reads. `--fork --no-stream-args` deploys
+`BASE_REF`, the same without PR #7.
 
 ## The service afterwards
 
@@ -458,7 +459,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 | --- | --- | --- |
 | `REPO_REF` | `main` | the ref to deploy when the clone has no branch checked out (or the script cloned it) |
 | `FORK` (`--fork`) | 0 | deploy `FORK_REF` from `FORK_URL` instead |
-| `FORK_REF` | `fix/sampler-dsml-stream-args` | the branch `--fork` deploys |
+| `FORK_REF` | `fix/sampler-dsml-stream-args-vision-metrics` | the branch `--fork` deploys |
 | `BASE_REF` | `fix/sampler-and-dsml` | the branch `--fork --no-stream-args` deploys |
 | `REF` (`--ref`) | | a commit, branch or tag to deploy instead |
 | `PR` (`--pr`) | | a pull request's head to deploy instead |
@@ -529,6 +530,19 @@ authors'.
 
 The recipe itself is [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), a fork of
 [blaesus/dsgx10](https://github.com/blaesus/dsgx10). This script drives it and does not patch it.
+
+## This fork's own work on the branch
+
+`FORK_REF` is not only the four pull requests: it also carries what this fork changed on top of them,
+so a ring deployed with `--fork` runs it.
+
+| Change | What it does |
+| --- | --- |
+| the vision encoder in the service | PR #15's `DSGB10_VISION_CMD` wiring, with `VISION=1` starting, restarting and stopping the encoder with the service |
+| `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)) |
+
+The `/metrics` endpoint is additive: a build without it answers 404 and every consumer behaves as
+before, so nothing that reads the engine today changes.
 
 ## Testing it without a ring
 

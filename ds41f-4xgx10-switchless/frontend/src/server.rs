@@ -70,6 +70,23 @@ pub struct ServerConfig {
 /// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
+/// Monotonic counters for /metrics (sparkDash reads them as `tensorfold:*`).
+///
+/// `CACHED_TOTAL` counts the prompt tokens whose KV was reused, and those sit *inside*
+/// `PROMPT_TOTAL` (see `Done::cached_tokens`): sparkDash derives prefill as `prompt - cached`,
+/// so the two are a subset relation, never a partition. The clamp at the update site keeps that
+/// true even if an engine ever reports a reuse length past the prompt it was handed.
+static GEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PROMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TTFT_US_SUM: AtomicU64 = AtomicU64::new(0);
+static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Prefill time as the engine measured it (`Done::prefill_us`: prefill started -> first token),
+/// over completed requests. TTFT is not that quantity (it also covers the gate and the submit round
+/// trip), so the prefill rate divides the computed tokens, `prompt - cached`, by these.
+static PREFILL_US_SUM: AtomicU64 = AtomicU64::new(0);
+static PREFILL_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub struct App {
     pub cfg: ServerConfig,
     pub tok: Arc<Tokenizer>,
@@ -128,7 +145,7 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     let max_body = app.cfg.max_body_bytes;
-    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    let routes = Router::new().route("/health", get(health)).route("/metrics", get(metrics)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
     body_limit(routes, max_body).with_state(app)
 }
 
@@ -243,6 +260,63 @@ async fn health(State(app): State<Arc<App>>) -> Response {
         (StatusCode::OK, "ok\n").into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
+    }
+}
+
+/// The `/metrics` body: the two gauges, the counters and the summaries, in the Prometheus text
+/// exposition format. Built from the statics alone, so a test reads the exposition without a server.
+fn metrics_body(running: u32, waiting: u32) -> String {
+    format!(
+        "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
+# TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
+# TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\ntensorfold:time_to_first_token_seconds_count {}\n\
+# TYPE tensorfold:request_prefill_seconds summary\ntensorfold:request_prefill_seconds_sum {}\ntensorfold:request_prefill_seconds_count {}\n",
+        GEN_TOTAL.load(Ordering::Relaxed), PROMPT_TOTAL.load(Ordering::Relaxed), CACHED_TOTAL.load(Ordering::Relaxed),
+        TTFT_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, TTFT_COUNT.load(Ordering::Relaxed),
+        PREFILL_US_SUM.load(Ordering::Relaxed) as f64 / 1e6, PREFILL_COUNT.load(Ordering::Relaxed)
+    )
+}
+
+/// Load gauges for the pipeline scheduler and sparkDash, under the names the TensorFold serve used
+/// (`tensorfold:requests_running`, `tensorfold:requests_waiting`). Unauthenticated, like /health.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], metrics_body(running, waiting)).into_response()
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    /// Every series a scraper reads is present and every sample is a number: a missing or misnamed
+    /// series is how a dashboard silently shows nothing.
+    #[test]
+    fn the_exposition_has_every_series() {
+        let body = metrics_body(2, 1);
+        let series = [
+            "tensorfold:requests_running 2",
+            "tensorfold:requests_waiting 1",
+            "tensorfold:generation_tokens_total ",
+            "tensorfold:prompt_tokens_total ",
+            "tensorfold:prompt_tokens_cached_total ",
+            "tensorfold:time_to_first_token_seconds_sum ",
+            "tensorfold:time_to_first_token_seconds_count ",
+            "tensorfold:request_prefill_seconds_sum ",
+            "tensorfold:request_prefill_seconds_count ",
+        ];
+        for want in series {
+            assert!(body.contains(want), "{want} missing from /metrics:\n{body}");
+        }
+        let samples: Vec<&str> = body.lines().filter(|l| l.starts_with("tensorfold:")).collect();
+        assert_eq!(samples.len(), series.len(), "/metrics:\n{body}");
+        for line in samples {
+            let (name, value) = line.rsplit_once(' ').expect("a sample line has a value");
+            assert!(value.parse::<f64>().is_ok(), "not a number: {line}");
+            assert!(name.starts_with("tensorfold:"), "unprefixed series: {line}");
+        }
     }
 }
 
@@ -684,6 +758,7 @@ impl Gen {
             match ev {
                 EngineEvent::Tokens(t) => {
                     self.first_token.get_or_insert_with(Instant::now);
+                    GEN_TOTAL.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                     for &id in &t.ids {
                         self.ids.push(id);
                         if self.stopped.is_some() {
@@ -764,9 +839,18 @@ impl Gen {
                         _ => 0,
                     };
                     self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
-                    let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
+                    // cached is the reused prefix of the prompt, not an extra counter: sparkDash
+                    // derives prefill as prompt - cached, so clamp instead of letting it exceed.
+                    let prompt = self.prompt_ids.len();
+                    let usage = Usage { prompt, cached: d.cached_tokens.min(prompt as u32), completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
+                    PROMPT_TOTAL.fetch_add(usage.prompt as u64, Ordering::Relaxed);
+                    CACHED_TOTAL.fetch_add(usage.cached as u64, Ordering::Relaxed);
+                    TTFT_US_SUM.fetch_add((ttft * 1e6) as u64, Ordering::Relaxed);
+                    TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    PREFILL_US_SUM.fetch_add(d.prefill_us, Ordering::Relaxed);
+                    PREFILL_COUNT.fetch_add(1, Ordering::Relaxed);
                     if let Some(dir) = &self.app.cfg.dump_dir {
                         // Debug-only exact pre-parser output for successful parses too: a trial can
                         // diagnose a content leak even if its parser did not report an error.
@@ -1780,5 +1864,40 @@ pub(crate) mod tests {
         assert_eq!(post_status(4096, 1 << 20).await, 413);
         // the limit follows the setting
         assert_eq!(post_status(2 << 20, 1 << 20).await, 200);
+    }
+
+    /// GET a path from the real router and return (status, content-type, body). None when the
+    /// checkpoint's tokenizer is not on this box (the same skip session.rs's tests take).
+    async fn get_route(path: &str) -> Option<(u16, String, String)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tok = Tokenizer::from_file("/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json").ok()?;
+        let app = App::new(cfg(), Arc::new(tok), EngineClient::start("/nonexistent".into()));
+        let routes: Router = Router::new().route("/metrics", get(metrics)).with_state(app);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(l, routes).await.unwrap() });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+        s.write_all(head.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        let _ = s.read_to_end(&mut reply).await;
+        server.abort();
+        let reply = String::from_utf8_lossy(&reply).to_string();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap_or((&reply, ""));
+        let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let ctype = head.lines().find(|l| l.to_ascii_lowercase().starts_with("content-type:")).unwrap_or("").to_string();
+        Some((status, ctype, body.to_string()))
+    }
+
+    /// The route is served unauthenticated (like /health) in the Prometheus text format, so a scraper
+    /// that already reads a TensorFold serve reads this one unchanged.
+    #[tokio::test]
+    async fn metrics_is_served_unauthenticated_as_prometheus_text() {
+        let Some((status, ctype, body)) = get_route("/metrics").await else { return };
+        assert_eq!(status, 200);
+        assert!(ctype.to_ascii_lowercase().contains("text/plain"), "{ctype}");
+        assert!(ctype.contains("version=0.0.4"), "{ctype}");
+        assert!(body.contains("tensorfold:requests_running "), "{body}");
+        assert!(body.contains("tensorfold:request_prefill_seconds_sum "), "{body}");
     }
 }

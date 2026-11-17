@@ -134,3 +134,37 @@ images 15/15, 16 users 375-378 tok/s (unchanged), encoder rows byte-identical to
 Memory on a 4-Spark head: about 1.3 GiB for 100 small images, 0.8 GiB for 40 full-size images in one request (measured).
 Two full-size requests at once were not measured: set `--max-image-rows-in-flight 40000` on a head with less than ~10 GiB free.
 The engine, the front-end and the vision encoder must be updated together: the new front-end sends requests the older engine and encoder refuse.
+
+## `/metrics` for sparkDash (2026-11-17)
+
+dsfront answers `GET /metrics` on the same addresses and port as the API, unauthenticated like `/health`, in the
+Prometheus text exposition format. The series keep the `tensorfold:` prefix of the serve they replace, so a scraper
+already reading the TensorFold counters (sparkDash) reads these unchanged and no other engine's series change.
+
+| series | type | what it reports |
+|---|---|---|
+| `tensorfold:requests_running` | gauge | requests in flight in the gate |
+| `tensorfold:requests_waiting` | gauge | requests waiting in the gate |
+| `tensorfold:generation_tokens_total` | counter | output tokens, added as the engine streams them |
+| `tensorfold:prompt_tokens_total` | counter | the full prompt length of each served request |
+| `tensorfold:prompt_tokens_cached_total` | counter | the part of that prompt whose KV was reused |
+| `tensorfold:time_to_first_token_seconds_sum`, `_count` | summary | time to first token over completed requests |
+| `tensorfold:request_prefill_seconds_sum`, `_count` | summary | the engine's own prefill time (prefill start -> first token) over completed requests |
+
+`prompt_tokens_cached_total` is a **subset** of `prompt_tokens_total`: sparkDash derives prefill as
+`prompt - cached`, so the two are never a partition. The front end adds the full prompt length to the prompt total
+and only the engine's `Done.cached_tokens` to the cached counter, clamped at the update site to the prompt it was
+handed, so the relation holds even if an engine reports a reuse length longer than the prompt.
+
+`generation_tokens_total` advances while a request decodes, so it includes the tokens of a request still in flight;
+the prompt, cached, TTFT and prefill series are recorded once, when the request completes.
+
+`request_prefill_seconds` is the prefill time the **engine** measured (`Done.prefill_us`), not TTFT: TTFT is measured
+from the front end and also covers the gate and the submit round trip, so dividing by it understates the prefill rate.
+A scraper derives the rate as `d(prompt - cached) / d(request_prefill_seconds_sum)` over its window.
+
+The counters are per-process and begin at zero when dsfront starts. **A restart resets them all to zero, together
+with the session and prefix-cache state**, so a scraper should read a drop to zero as a restart, not a traffic drop,
+and re-seed its own baseline (discarding the first post-restart window is the simple version of that rule).
+
+There is no per-slot or queue-depth gauge beyond the two request gauges. Full text: [docs/operations.md](ds41f-4xgx10-switchless/docs/operations.md).
