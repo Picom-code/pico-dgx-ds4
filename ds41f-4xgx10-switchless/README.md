@@ -118,6 +118,14 @@ From four GB10 boxes to an OpenAI-compatible endpoint. Commands run on rank 0's 
 directory, unless a step says otherwise; the times are this project's. Each command ran here on
 2026-10-13, on deepseek-ai's checkpoint, with other paths, unless marked *not run on this fleet during the review*.
 
+> [!TIP]
+> **[tools/deploy-switchless.sh](../tools/deploy-switchless.sh) does all of this in one command**, and
+> keeps doing it: `./tools/deploy-switchless.sh deploy` from the repository's root, then `status`,
+> `logs`, `redeploy`. It is idempotent and resumable, so a run that stops can be repeated. The steps
+> below are what it automates, and what to do by hand if you would rather.
+> [docs/deploy-switchless.md](docs/deploy-switchless.md) has the phases, the settings and what it
+> deliberately does not do.
+
 **1. What you need.**
 
 - Four GB10 boxes (128 GB each), ranks 0–3, rank 0 reaching the others by SSH without a password,
@@ -300,6 +308,7 @@ The current figures are those of "Where it stands" above.
 | Step | State |
 |---|---|
 | Every experiment, failed and dropped ones included: question, numbers, verdict, where the code lives | index → [docs/experiments.md](docs/experiments.md) |
+| Deploying the ring from one command: phases, settings, resumability | done → [tools/deploy-switchless.sh](../tools/deploy-switchless.sh), [docs/deploy-switchless.md](docs/deploy-switchless.md) |
 | Research: model spec, tech report, prior recipes | done → [docs/findings.md](docs/findings.md) |
 | Baseline: the SGLang TP=4 kit as it served on the ring | measured → [DESIGN.md](DESIGN.md#baseline) |
 | Hardware microbenchmarks (bandwidth, block-scaled MMA, RDMA latency) | done → [docs/findings.md](docs/findings.md#hardware-measured-here) |
