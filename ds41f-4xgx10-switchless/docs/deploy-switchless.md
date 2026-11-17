@@ -56,15 +56,19 @@ the home directory, so every box uses its own home.
 
 ## What it deploys
 
-By default, the repository the script is in, at `REPO_REF` (`main`). That is what a reader of this
-repo expects.
+By default, the repository the script is in, at whatever that clone has **checked out**. That is what
+a reader of this repo expects, and it means the script never moves your working tree off your branch.
 
 ```bash
+git checkout main
 ./tools/deploy-switchless.sh redeploy             # this repo at main: fetch, rebuild, restart
 ./tools/deploy-switchless.sh redeploy --pr 2      # a pull request's head, merged with main
 ./tools/deploy-switchless.sh redeploy --ref <sha> # any commit, branch or tag
 ./tools/deploy-switchless.sh redeploy --repo URL --ref <branch>   # a fork's branch
 ```
+
+Outside the clone (the script cloned the recipe itself), the default is `REPO_REF` (`main`), since
+there is no working tree of yours to respect.
 
 A pull request's head lives in the base repository as `refs/pull/<n>/head`, so `--pr` needs no fork
 named. A PR's head is usually behind `main`, so the script merges `main` into it on a local branch
@@ -96,7 +100,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `REPO_REF` | `main` | the ref to deploy from the repository the script is in |
+| `REPO_REF` | `main` | the ref to deploy when the clone has no branch checked out (or the script cloned it) |
 | `FORK` (`--fork`) | 0 | deploy `FORK_REF` from `FORK_URL` instead |
 | `FORK_REF` | `fix/sampler-dsml-stream-args` | the branch `--fork` deploys |
 | `BASE_REF` | `fix/sampler-and-dsml` | the branch `--fork --no-stream-args` deploys |

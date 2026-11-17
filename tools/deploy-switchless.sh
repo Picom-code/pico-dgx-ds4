@@ -39,12 +39,13 @@
 # 192.168.2.101" to choose the addresses, DSGB10_PORT for another port (18893 is the recipe's test port;
 # 8888 needs DSGB10_PROD=1, which follows the port unless you set it).
 #
-# By default this script deploys the repository it is in, at REPO_REF (main). `--fork` deploys FORK_REF
-# from FORK_URL instead: the branch that carries every fix the ring needs, all four pull requests on
-# top of main — PR #3 (sampler open-interval endpoint), PR #2 (DSML quarantine), PR #7 (a stream's tool
-# calls in pieces) and PR #15 (the service owns the image encoder). STREAM_TOOL_ARGS and VISION are on
-# with it. `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15, without #7);
-# `--no-vision` leaves the encoder out.
+# By default this script deploys the repository it is in, at whatever that clone has checked out (or
+# REPO_REF, main, when it cloned the recipe itself). `--fork` deploys FORK_REF from FORK_URL instead:
+# the branch that carries every fix the ring needs, all four pull requests on top of main — PR #3
+# (sampler open-interval endpoint), PR #2 (DSML quarantine), PR #7 (a stream's tool calls in pieces)
+# and PR #15 (the service owns the image encoder). STREAM_TOOL_ARGS and VISION are on with it.
+# `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15, without #7); `--no-vision`
+# leaves the encoder out.
 #
 # STREAM_TOOL_ARGS=1 starts the front-end with --stream-tool-args: a streamed answer carries each tool
 # call in pieces (its name when that has parsed, then its arguments as they arrive) instead of in one
@@ -626,7 +627,8 @@ phase_net() {
 #   ./deploy-switchless.sh redeploy --repo https://github.com/vesatikkanen/pico-dgx-ds4.git \
 #       --ref frontend/stream-tool-args-v2
 #
-# By default this script deploys the repository it is in, at REPO_REF (main).
+# By default this script deploys the repository it is in, at whatever that clone has checked out (or
+# REPO_REF, main, when it cloned the recipe itself).
 #
 # --fork deploys FORK_REF (fix/sampler-dsml-stream-args) from FORK_URL instead: that branch carries
 # every fix the ring needs, all four pull requests (PR #3's sampler endpoint, PR #2's DSML quarantine,
@@ -640,13 +642,20 @@ REF=${REF:-}                                        # pr:N, or a commit/branch/t
 PR=${PR:-}                                           # the same as REF=pr:N
 STREAM_ARGS=${STREAM_ARGS:-1}                        # 0: with --fork, deploy BASE_REF and turn STREAM_TOOL_ARGS off
 
-# The ref to check out, from REF/PR/FORK/REPO_REF
+# The ref to check out, from REF/PR/FORK/REPO_REF. When the script is in the clone and nothing was
+# asked for explicitly, it is whatever that clone has checked out: the clone is the user's, and moving
+# its working tree off their branch to deploy main is not this script's business.
 target_ref() {
   if [ -n "$PR" ]; then printf 'pr:%s\n' "$PR"; return; fi
   if [ -n "$REF" ]; then printf '%s\n' "$REF"; return; fi
   if [ "$FORK" = 1 ]; then
     if [ "$STREAM_ARGS" = 0 ]; then printf '%s\n' "$BASE_REF"; else printf '%s\n' "$FORK_REF"; fi
     return
+  fi
+  if [ "$IN_REPO" = 1 ]; then
+    local cur
+    cur=$(git -C "$REPO" branch --show-current 2> /dev/null) || cur=
+    if [ -n "$cur" ]; then printf '%s\n' "$cur"; return; fi
   fi
   printf '%s\n' "$REPO_REF"
 }
@@ -709,9 +718,9 @@ phase_clone() {
   ref=$(target_ref)
 
   if [ "$IN_REPO" = 1 ]; then
-    # deploy-switchless.sh is in the clone: the clone is the repo, and it is not ours to move. Only a ref other
-    # than REPO_REF needs a checkout (a pull request, a commit); REPO_REF is what is checked out.
-    if [ "$ref" = "$REPO_REF" ] && [ "$(git -C "$REPO" branch --show-current)" = "$REPO_REF" ]; then
+    # deploy-switchless.sh is in the clone: the clone is the repo, and it is not ours to move. Only a
+    # ref other than what it has checked out needs a checkout (a pull request, a commit, --fork).
+    if [ "$ref" = "$(git -C "$REPO" branch --show-current 2> /dev/null)" ]; then
       step "using the clone deploy-switchless.sh is in: $REPO"
       step "$(git -C "$REPO" --no-pager log --oneline -1)"
       [ -d "$SRC" ] || die "$SRC is not there: is $REPO the recipe's clone?"
