@@ -19,7 +19,7 @@ Run it on rank 0, the box with passwordless SSH to the other three.
 - [The deployment](#the-deployment): the twelve phases, in order
 - [Where it puts things](#where-it-puts-things)
 - [What it deploys](#what-it-deploys)
-- [The service afterwards](#the-service-afterwards)
+- [The service afterwards](#the-service-afterwards): start, stop, status, logs, and why a 502 happens
 - [Settings](#settings)
 - [Images](#images)
 - [The four pull requests](#the-four-pull-requests)
@@ -388,10 +388,64 @@ the same without PR #7.
 ./tools/deploy-switchless/deploy-switchless.sh restart    # stop, then start with this script's settings
 ./tools/deploy-switchless/deploy-switchless.sh status     # what it is doing, and the boxes
 ./tools/deploy-switchless/deploy-switchless.sh logs       # the last lines of service, rank 0, front-end, encoder
+./tools/deploy-switchless/deploy-switchless.sh crash      # why the engine last died
 ```
 
 `start` is idempotent: a service already serving with these settings is left alone, because a restart
 drops the requests in flight. One serving with *other* settings is restarted, so the settings here win.
+
+### When a request fails with a 502
+
+A 502 from a gateway in front of the ring is usually **the engine dying and restarting**, not a slow
+model. The gateway's log says which:
+
+```
+model.error  server_error  500  {"error":{"message":"engine connection lost"}}
+model.error  server_error  503  {"error":{"message":"the server is shutting down"}}
+model.error  connection
+model.error  connection
+             → 502 Bad Gateway
+```
+
+That sequence is a process going away. `engine connection lost` is the engine's socket dropping;
+`the server is shutting down` is the front-end following it down as `service.sh` restarts the engine.
+The request then ends `cancelled` in `front.log`, because the client gave up first.
+
+**The retries cannot save it.** The gateway retries for about 5 s (`LLM_MAX_RETRIES`,
+`LLM_RETRY_BACKOFF_SECONDS`) and a client typically for 15 s, but `service.sh` waits 10 s before the
+first engine restart and allows up to 10 minutes for it to be ready. Every retry lands inside the
+restart window, so one engine crash is one user-visible 502.
+
+`crash` collects what is needed to find out why, while it is still on disk — `service.sh` keeps only
+the last 3 lines of `rank.0.log` in its exit line, and rotates `rank.0.log` on every start:
+
+```bash
+./tools/deploy-switchless/deploy-switchless.sh crash
+```
+
+```
+==> the engine's exits, oldest first (service.log)
+5:2026-11-17 11:41:12 rank 0 exited (rc 134) after 3600 s: ...
+
+==> the last exit was rc 134 (SIGABRT): the engine called die() and printed why to stderr
+
+==> the engine's last words (rank.0.log, then its rotated copies)
+--- .../logs/rank.0.log (last 40 lines)
+...
+```
+
+The exit code is the diagnosis:
+
+| rc | What it means |
+| --- | --- |
+| 0 | a clean stop (`stop`, a restart, a lend): not a crash |
+| 134 | `SIGABRT`: the engine called `die()` — a `CUDA_CHECK`, a failed assertion — and printed why to stderr |
+| 137 | `SIGKILL`: the kernel's OOM killer, or `service.sh` killing a rank that did not start |
+| 139 | `SIGSEGV`: a segfault |
+| 143 | `SIGTERM`: `service.sh` stopped it |
+
+`crash` also prints the kernel's OOM verdict from `dmesg`, the restart count, and the front-end's view
+of the same moment. It changes nothing.
 
 The script never patches the recipe. It drives the recipe's own scripts (`fleet.sh`, `service.sh`,
 `ring.sh`), so an upstream change is picked up by re-running `--phase clone`.

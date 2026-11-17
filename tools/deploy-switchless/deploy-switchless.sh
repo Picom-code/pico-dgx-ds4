@@ -12,6 +12,7 @@
 #   ./deploy-switchless.sh deploy               # every phase, in order (the first run: hours, 475 GB)
 #   ./deploy-switchless.sh start|stop|restart   # the service
 #   ./deploy-switchless.sh status|logs          # what it is doing, its last log lines
+#   ./deploy-switchless.sh crash                # why the engine last died: exit code, its last words, OOM
 #   ./deploy-switchless.sh redeploy             # a new version of the recipe: fetch, rebuild, restart
 #   ./deploy-switchless.sh redeploy --pr 2      # ... from a pull request's head (merged with main)
 #   ./deploy-switchless.sh redeploy --ref <sha> # ... from any commit, branch or tag
@@ -1344,6 +1345,82 @@ service_stop() {
   vision_stop
 }
 
+# Why the engine last died. service.sh logs one line per exit, "rank 0 exited (rc N) after T s: <the
+# last 3 lines of rank.0.log>", and rotates rank.0.log on every start (KEEP=5), so the evidence is one
+# restart away from being gone. This collects it while it is still there: the exit line, the engine's
+# own last words from the current log and the rotated copies, the kernel's OOM verdict, and the
+# restart count. Read-only: it changes nothing.
+#
+# The exit code is the diagnosis:
+#   0    a clean stop (service.sh stop, a restart, a lend): not a crash
+#   134  SIGABRT: the engine called die() (a CUDA_CHECK, a failed assertion) and printed why to stderr
+#   137  SIGKILL: the kernel's OOM killer, or service.sh's own kill of a rank that did not start
+#   139  SIGSEGV: a segfault
+#   143  SIGTERM: service.sh stopped it
+crash() {
+  load_fleet
+  local d rc line n=0
+  d=$(local_path "$FLEET_SERVICE_DIR")/logs
+  [ -d "$d" ] || die "no $d (the service has never run here)"
+
+  log "the engine's exits, oldest first (service.log)"
+  # "rank 0 exited (rc N)" and "rank 0 exited (rc N) after T s: ..."; the vision encoder's are not ours
+  grep -n 'rank 0 exited (rc' "$d/service.log" 2> /dev/null | tail -n 10 || true
+  line=$(grep 'rank 0 exited (rc' "$d/service.log" 2> /dev/null | tail -n 1) || line=
+  if [ -z "$line" ]; then
+    warn "no exit recorded in $d/service.log: the engine has not died since the log began"
+  else
+    rc=$(printf '%s\n' "$line" | sed -n 's/.*(rc \([0-9]*\)).*/\1/p')
+    printf '\n'
+    case $rc in
+      0) log "the last exit was rc 0: a clean stop (stop, restart or a lend), not a crash" ;;
+      134) log "the last exit was rc 134 (SIGABRT): the engine called die() and printed why to stderr" ;;
+      137) log "the last exit was rc 137 (SIGKILL): the OOM killer, or service.sh killing a rank that did not start" ;;
+      139) log "the last exit was rc 139 (SIGSEGV): a segfault" ;;
+      143) log "the last exit was rc 143 (SIGTERM): service.sh stopped it" ;;
+      *) log "the last exit was rc $rc" ;;
+    esac
+  fi
+
+  # The engine's own last words. rank.0.log is rotated on every start, so the crash is in the current
+  # file or in one of the copies; print the newest one that has anything in it.
+  printf '\n'
+  log "the engine's last words (rank.0.log, then its rotated copies)"
+  for f in rank.0.log rank.0.log.1 rank.0.log.2 rank.0.log.3 rank.0.log.4 rank.0.log.5; do
+    [ -s "$d/$f" ] || continue
+    printf '\n--- %s (last 40 lines)\n' "$d/$f"
+    tail -n 40 "$d/$f"
+    n=$((n + 1))
+    [ "$n" -lt 2 ] || break  # the current log and the one before it: enough, and not a wall of text
+  done
+  [ "$n" -gt 0 ] || warn "no rank.0.log in $d"
+
+  # The kernel's verdict, when it was the kernel. dmesg needs root; say so rather than fail.
+  printf '\n'
+  log "the kernel's OOM verdict (dmesg)"
+  if command -v dmesg > /dev/null 2>&1; then
+    if dmesg 2> /dev/null | grep -iE 'oom|killed process|out of memory' | tail -n 10 | grep -q .; then
+      dmesg 2> /dev/null | grep -iE 'oom|killed process|out of memory' | tail -n 10
+    elif sudo -n dmesg 2> /dev/null | grep -iE 'oom|killed process|out of memory' | tail -n 10 | grep -q .; then
+      sudo -n dmesg 2> /dev/null | grep -iE 'oom|killed process|out of memory' | tail -n 10
+    else
+      step "nothing in dmesg (or it needs root: sudo dmesg | grep -i oom)"
+    fi
+  else
+    step "no dmesg on this box"
+  fi
+
+  printf '\n'
+  log "restarts"
+  cat "$(local_path "$FLEET_SERVICE_DIR")/run/restarts" 2> /dev/null || step "no run/restarts (the service has not restarted anything)"
+  printf '\n'
+  log "the front-end's view of the same moment (front.log)"
+  tail -n 15 "$d/front.log" 2> /dev/null || step "no front.log"
+  printf '\n'
+  log "a 502 in the gateway is this crash: the gateway retries for ~5 s, the engine takes ~10 s to restart"
+  step "the gateway's log has the request that died: grep the correlation_id of the failed request"
+}
+
 # A new version of the recipe: fetch it, rebuild, restart. The checkpoint, the weight files and the
 # Engram shards are not touched (they are the model, not the code), so this is minutes, not hours.
 redeploy() {
@@ -1432,6 +1509,7 @@ instructions() {
   printf '  ./deploy-switchless.sh restart    stop, then start with this script'"'"'s settings\n'
   printf '  ./deploy-switchless.sh status     what it is doing, and the boxes\n'
   printf '  ./deploy-switchless.sh logs       the last lines of its logs\n'
+  printf '  ./deploy-switchless.sh crash      why the engine last died: exit code, its last words, OOM\n'
   printf '  ./deploy-switchless.sh redeploy   a new version of the recipe: fetch, rebuild, restart\n'
   printf '  ./deploy-switchless.sh redeploy --fork   the branch with PRs #2, #3, #7 and #15\n'
   printf '  ./deploy-switchless.sh redeploy --fork --no-stream-args   ... without PR #7\n'
@@ -1460,7 +1538,7 @@ main() {
       --list) printf '%s\n' "${PHASES[@]}"; exit 0 ;;
       -h | --help) usage 0; exit 0 ;;
       deploy | all) CMD=deploy; shift ;;
-      start | stop | restart | status | logs | redeploy) CMD=$1; shift ;;
+      start | stop | restart | status | logs | crash | redeploy) CMD=$1; shift ;;
       *) usage 2; exit 2 ;;
     esac
   done
@@ -1492,6 +1570,7 @@ main() {
         exit 0
         ;;
       status) service_cmd status; exit $? ;;
+      crash) crash; exit 0 ;;
       stop) service_stop; exit 0 ;;
       *) service_cmd "$CMD"; exit 0 ;;
     esac
