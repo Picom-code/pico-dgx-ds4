@@ -56,8 +56,8 @@
 # VISION=1 runs the image encoder (tools/vision/vision_encoder.py, docs/vision.md) on rank 0: service.sh
 # is given its command (DSGB10_VISION_CMD, PR #15), so it starts the encoder before the engine, starts
 # it again when it exits, stops it with the service and reports it in status. Without it dsfront
-# refuses every image part with "image, audio and video input are not supported", which a gateway in
-# front of it reports as a 502. The encoder runs in a container of the public image VISION_IMAGE (the
+# refuses every image part with "image, audio and video input are not supported". The encoder runs in a
+# container of the public image VISION_IMAGE (the
 # base of the recipe's own kit image: torch, Pillow, safetensors, PyAV), so nothing is built here, and
 # costs about 1 GiB of rank 0's GPU; text requests are unaffected while it is down. On by default;
 # `--no-vision` turns it off. The encoder imports the checkpoint's own inference/vision.py and
@@ -1417,8 +1417,8 @@ crash() {
   log "the front-end's view of the same moment (front.log)"
   tail -n 15 "$d/front.log" 2> /dev/null || step "no front.log"
   printf '\n'
-  log "a 502 in the gateway is this crash: the gateway retries for ~5 s, the engine takes ~10 s to restart"
-  step "the gateway's log has the request that died: grep the correlation_id of the failed request"
+  log "a client's retries cannot cover this: it retries for ~15 s, the engine takes ~10 s to restart"
+  step "the request that died is in front.log, and its correlation_id in whatever sits in front of the ring"
 }
 
 # A new version of the recipe: fetch it, rebuild, restart. The checkpoint, the weight files and the

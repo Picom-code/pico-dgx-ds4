@@ -19,7 +19,7 @@ Run it on rank 0, the box with passwordless SSH to the other three.
 - [The deployment](#the-deployment): the twelve phases, in order
 - [Where it puts things](#where-it-puts-things)
 - [What it deploys](#what-it-deploys)
-- [The service afterwards](#the-service-afterwards): start, stop, status, logs, and why a 502 happens
+- [The service afterwards](#the-service-afterwards): start, stop, status, logs, and why a request fails
 - [Settings](#settings)
 - [Images](#images)
 - [The four pull requests](#the-four-pull-requests)
@@ -394,27 +394,23 @@ the same without PR #7.
 `start` is idempotent: a service already serving with these settings is left alone, because a restart
 drops the requests in flight. One serving with *other* settings is restarted, so the settings here win.
 
-### When a request fails with a 502
+### When a request fails while the engine restarts
 
-A 502 from a gateway in front of the ring is usually **the engine dying and restarting**, not a slow
-model. The gateway's log says which:
+A request that fails with a 5xx while the ring is otherwise healthy is usually **the engine dying and
+restarting**, not a slow model. The logs show it in this order:
 
 ```
-model.error  server_error  500  {"error":{"message":"engine connection lost"}}
-model.error  server_error  503  {"error":{"message":"the server is shutting down"}}
-model.error  connection
-model.error  connection
-             → 502 Bad Gateway
+service.log   rank 0 exited (rc 134) after 3600 s: ...
+front.log     req 587 session ...: ... cancelled
 ```
 
-That sequence is a process going away. `engine connection lost` is the engine's socket dropping;
-`the server is shutting down` is the front-end following it down as `service.sh` restarts the engine.
-The request then ends `cancelled` in `front.log`, because the client gave up first.
+`rank 0 exited` is the engine going away; `cancelled` in `front.log` is the request ending because the
+client gave up first. The front-end itself stays up — it reconnects to the engine's socket by itself —
+so the failure is the engine, not the front-end.
 
-**The retries cannot save it.** The gateway retries for about 5 s (`LLM_MAX_RETRIES`,
-`LLM_RETRY_BACKOFF_SECONDS`) and a client typically for 15 s, but `service.sh` waits 10 s before the
-first engine restart and allows up to 10 minutes for it to be ready. Every retry lands inside the
-restart window, so one engine crash is one user-visible 502.
+**A client's retries cannot save it.** A client typically retries for about 15 s, but `service.sh`
+waits 10 s before the first engine restart and allows up to 10 minutes for it to be ready. Every retry
+lands inside the restart window, so one engine crash is one user-visible failure.
 
 `crash` collects what is needed to find out why, while it is still on disk — `service.sh` keeps only
 the last 3 lines of `rank.0.log` in its exit line, and rotates `rank.0.log` on every start:
@@ -489,7 +485,7 @@ Anything that needs sudo or deletes data is opt-in: `INSTALL_DEPS=1`, `NET_APPLY
 `VISION=1` (the default) gives `service.sh` the encoder's command (`DSGB10_VISION_CMD`), so the
 service starts the encoder before the engine, restarts it when it exits, stops it with the service and
 reports it in `status`. Without it dsfront refuses every image part with
-`400 image, audio and video input are not supported`, which a gateway in front of it reports as a 502.
+`400 image, audio and video input are not supported`.
 [vision.md](../../ds41f-4xgx10-switchless/docs/vision.md) has the encoder itself.
 
 The encoder runs in a container of `VISION_IMAGE`, the public base of the kit image, so nothing is
