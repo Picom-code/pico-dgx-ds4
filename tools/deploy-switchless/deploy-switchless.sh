@@ -104,18 +104,13 @@ REF=${REF:-}                                         # what to check out: pr:N, 
 PR=${PR:-}                                           # the same as REF=pr:N (a pull request's head)
 SRC_SUB=ds41f-4xgx10-switchless                      # the recipe's directory inside the repo
 
-# Where deploy-switchless.sh is. It works from three places:
+# Where deploy-switchless.sh is. It works from two places:
 #   - in the recipe's clone at tools/deploy-switchless/deploy-switchless.sh (where the repo keeps it):
 #     the repo is two levels up, and everything this script creates goes in one folder beside it,
 #     <repo>/ds41deploy, which carries a .gitignore so that git leaves it alone;
-#   - in the recipe's clone's root, beside ds41f-4xgx10-switchless/: same, with $HERE/ds41deploy;
 #   - anywhere else: it clones the recipe into $HERE/pico-dgx-ds4 and keeps everything in $HERE.
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-if [ -d "$HERE/$SRC_SUB" ]; then
-  IN_REPO=1
-  REPO=${REPO:-$HERE}
-  WORK=${WORK:-$HERE/ds41deploy}
-elif [ -d "$HERE/../../$SRC_SUB" ]; then
+if [ -d "$HERE/../../$SRC_SUB" ]; then
   # tools/deploy-switchless/deploy-switchless.sh in the repo: the repo is two levels up
   IN_REPO=1
   REPO=${REPO:-$(cd "$HERE/../.." && pwd)}

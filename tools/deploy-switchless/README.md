@@ -294,11 +294,10 @@ Everything it creates lives in one directory, `$WORK`, and nothing outside it is
 | The script is at | `$WORK` |
 | --- | --- |
 | `<repo>/tools/deploy-switchless/deploy-switchless.sh` (where this repo keeps it) | `<repo>/ds41deploy` |
-| `<repo>/deploy-switchless.sh` | `<repo>/ds41deploy` |
 | anywhere else | the script's own directory |
 
-In the first two cases `$WORK` carries a `.gitignore` (`*`), so `git status` stays clean and a pull
-never touches the checkpoint, the weights or the logs. `REPO=` and `WORK=` override both.
+In the first case `$WORK` carries a `.gitignore` (`*`), so `git status` stays clean and a pull never
+touches the checkpoint, the weights or the logs. `REPO=` and `WORK=` override both.
 
 `$WORK` holds the clone, the fleet file, the checkpoint, the weight files, the Engram shards, the
 spill, the API key and the logs. The fleet file's paths are written as `~/...` when `$WORK` is under
