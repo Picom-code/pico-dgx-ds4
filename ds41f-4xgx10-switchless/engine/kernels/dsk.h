@@ -40,6 +40,11 @@ struct GemvCfg {
   // -1: the one-tile-per-CTA kernel), ctas: its grid (0: one CTA per SM)
   int ring = -1, ctas = 0;
 };
+// The CTA of a GEMV launched with cfg (gemv_fp8's, gemv16's and the persistent kernel's block): the threads its
+// norm prologue (the *_norm calls) sums a row's squares over. A row's 1/rms depends on that count (common.cuh
+// rmsnorm_scale: thread j's chunks j, j + blockDim, .., then the warps' sums in warp order), so rmsnorm()
+// gives a normed call's bits only when given this count.
+inline int norm_threads(const GemvCfg& cfg) { return 32 * cfg.wn * cfg.wk; }
 
 // EXPERIMENT: DSK_CARVEOUT=<percent> gives every launch a shared-memory carveout preference (off by
 // default). At 100 the SMs keep one L1 / shared split across the step, so the next kernel's CTAs can
@@ -171,9 +176,10 @@ void gemv_fp4w_f32(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_
 
 // ---- norm_router.cu
 // y = bf16(w * (x * rsqrt(mean(x^2) + eps))), fp32 math, rows of D (multiple of 256, <= 8192);
-// with q/s non-null also act_quant(y) into them.
+// with q/s non-null also act_quant(y) into them. threads: a row's CTA (0: D/8, a chunk of 8 per thread; else a
+// multiple of 32, at most 1024); norm_threads(cfg) gives the bits of a normed GEMV launched with cfg.
 void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float eps, __nv_bfloat16* y, uint8_t* q,
-             uint8_t* s, cudaStream_t st);
+             uint8_t* s, cudaStream_t st, int threads = 0);
 // Router selection from fp32 logits [M][E] (E <= 512): scores sqrt(softplus(l)), top-6 of
 // scores + bias (descending), weights = scores / (sum + 1e-20) * route_scale.
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,
