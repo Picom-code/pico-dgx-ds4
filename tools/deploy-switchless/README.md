@@ -7,8 +7,8 @@ and keeps it there. It is the manual procedure in
 the checks and the resumability that a hand-run does not have.
 
 It is a deployment tool, not a model or a front-end: the engine, the front-end and the recipe are
-[Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4)'s, and the four fixes it can
-carry are their authors' (see [the four pull requests](#the-four-pull-requests)).
+[Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4)'s, and the fixes it can
+carry are their authors' (see [the pull requests](#the-pull-requests)).
 
 Run it on rank 0, the box with passwordless SSH to the other three.
 
@@ -26,7 +26,7 @@ Run it on rank 0, the box with passwordless SSH to the other three.
 - [The service afterwards](#the-service-afterwards): start, stop, status, logs, and why a request fails
 - [Settings](#settings)
 - [Images](#images)
-- [The four pull requests](#the-four-pull-requests)
+- [The pull requests](#the-pull-requests)
 - [What it does not do](#what-it-does-not-do)
 
 ## The network
@@ -380,10 +380,10 @@ A pull request's head lives in the base repository as `refs/pull/<n>/head`, so `
 named. A PR's head is usually behind `main`, so the script merges `main` into it on a local branch
 `deploy-<ref>` (nothing is pushed); a conflict stops it with a message.
 
-`--fork` deploys `FORK_REF` from `FORK_URL` instead: the branch that carries the four pull requests
-this ring needs (see [below](#the-four-pull-requests)) plus this fork's own work on top — the vision
-encoder in the service and the `/metrics` endpoint sparkDash reads. `--fork --no-stream-args` deploys
-`BASE_REF`, the same without PR #7.
+`--fork` deploys `FORK_REF` from `FORK_URL` instead: the branch that carries the pull requests
+this ring needs (see [below](#the-pull-requests)) plus this fork's own work on top — the vision
+encoder in the service, the `/metrics` endpoint sparkDash reads, and PR #19's batch-norm fix.
+`--fork --no-stream-args` deploys `BASE_REF`, the same without PR #7.
 
 ## The service afterwards
 
@@ -510,9 +510,9 @@ built here. Two things about it are worth knowing:
 `PIL` and `safetensors` (fatal if missing, with the module named), warns if PyAV is absent (video
 needs it, images do not), and allocates a tensor under the same `--memory` the encoder gets.
 
-## The four pull requests
+## The pull requests
 
-`--fork` deploys a branch that merges four pull requests on top of `main`. **None of them are this
+`--fork` deploys a branch that merges five pull requests on top of `main`. **None of them are this
 tool's work**: each is someone else's fix, contributed to
 [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), and each is worth having on its
 own. This script only carries them on one branch so a ring can be deployed with them.
@@ -523,6 +523,7 @@ own. This script only carries them on one branch so a ring can be deployed with 
 | [#2](https://github.com/Picom-code/pico-dgx-ds4/pull/2) | [@ofan](https://github.com/ofan) | DSML quarantine: `｜DSML｜` markup leaking into the answer text |
 | [#7](https://github.com/Picom-code/pico-dgx-ds4/pull/7) | [@mpfaffenberger](https://github.com/mpfaffenberger) | a stream's tool calls in pieces, instead of one chunk once the call is complete |
 | [#15](https://github.com/Picom-code/pico-dgx-ds4/pull/15) | [@mpfaffenberger](https://github.com/mpfaffenberger) | the service owns the image encoder (`DSGB10_VISION_CMD`) |
+| [#19](https://github.com/Picom-code/pico-dgx-ds4/pull/19) | [@grisetio](https://github.com/grisetio) | batched outputs bit-identical again at 9..16 rows: the norms run with the fused call's CTA |
 
 PR #7 conflicts with PR #2 in `encoding.rs` (both rewrite the same parser), so the branch is a
 deliberate merge, not a rebase. The merge is this tool's only contribution to them; the fixes are the
@@ -533,13 +534,14 @@ The recipe itself is [Picom-code/pico-dgx-ds4](https://github.com/Picom-code/pic
 
 ## This fork's own work on the branch
 
-`FORK_REF` is not only the four pull requests: it also carries what this fork changed on top of them,
+`FORK_REF` is not only the pull requests: it also carries what this fork changed on top of them,
 so a ring deployed with `--fork` runs it.
 
 | Change | What it does |
 | --- | --- |
 | the vision encoder in the service | PR #15's `DSGB10_VISION_CMD` wiring, with `VISION=1` starting, restarting and stopping the encoder with the service |
 | `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)) |
+| PR #19's batch-norm fix | the 9..16-row norms run with the fused call's CTA, so a session decoded in a batch of 9..16 rows (or a drafted batch of two or more) is bit-identical to the same session alone ([CHANGES.md](../../CHANGES.md), change 17) |
 
 The `/metrics` endpoint is additive: a build without it answers 404 and every consumer behaves as
 before, so nothing that reads the engine today changes.

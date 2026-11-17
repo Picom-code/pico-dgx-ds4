@@ -12,7 +12,7 @@ Speeds are decode tok/s (total across concurrent requests). "agent" = 8 concurre
 | 1 | 17-bit block index in `select_bins` (prefix split `nlow`, guard `bkeys_stride` <= 131072) | `engine/attn/indexer.cu` | on | yes | max context 512K -> 1M; needle at 947,826 tokens 3/3; prefill 9.2k tok/s; qeval 71/75; c1 unchanged |
 | 2 | `DefaultBodyLimit` 64 MB (axum default 2 MB) | `frontend/src/server.rs` | on | yes | HTTP 413 above ~400K tokens -> 948K-token prompts accepted |
 | 3 | 16 slots, big/small slot units (`--big-slots`), slot-aware admission, big-slot wait instead of die | `engine/model/*`, `engine/server/{main,serve}.cpp` | `--slots`/`--big-slots` | yes | code c16 172 -> 234-247, c8 170 -> 195-200; c1 unchanged; qeval 71 |
-| 4 | 9..16-row normed GEMVs as rmsnorm + plain r16 GEMV (`DSGB10_FUSED16=1` reverts) | `engine/model/model.cu` | on | yes (same bits) | c16 234 -> 253, c4 187 -> 204, step 77.3 -> 74.8 ms |
+| 4 | 9..16-row normed GEMVs as rmsnorm + plain r16 GEMV (`DSGB10_FUSED16=1` reverts) | `engine/model/model.cu` | on | yes since change 17 (it was not: a 9..16-row step's norm ran at another CTA size) | c16 234 -> 253, c4 187 -> 204, step 77.3 -> 74.8 ms |
 | 5 | Batch-aware expert re-routing `DSGB10_OEA=K0,KP,MINROWS` | `engine/kernels/{common.cuh,moe.cu}` | off | **no** | with 4,12,9: c16 253 -> 286, agent 180.7 -> 203.4; qeval 71/72 |
 | 6 | Cross-session draft row budget `DSGB10_BUDGET=1` | `engine/model/{spec.cu,ops.h,model.h}`, `engine/server/cmd.cpp` | off | yes | c16 253 -> 259, agent 180.7 -> 189.5 |
 
@@ -119,6 +119,18 @@ Measured and not built:
   166 held-out sequences did not close the gap (chat accepted length 1.463 -> 1.464, FP8 1.493); a full fine-tune was not run.
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
+
+## Batched outputs bit-identical again at 9..16 rows (2026-11-16; pull request #19 by grisetio)
+
+Since change 4 (6f6392e) a session decoded in a batch of 9..16 rows came out other than alone: plain batches of
+9..16 sessions, and drafted batches of two or more (two sessions with drafts run about 12 rows a step).
+`batch_test.py --slots 2` with drafts on: 40 FAIL, first token differences at 17..202, log-probabilities differing
+where the tokens matched. The standalone `dsk::rmsnorm` that change 4 runs before the plain r16 GEMVs used D/8
+threads a row (640 at 5120), the fused calls 256, and a row's 1/rms depends on the threads that sum its squares.
+
+| # | Change | Files | Default | Lossless | Before -> after |
+|---|---|---|---|---|---|
+| 17 | The 9..16-row norms with the fused call's CTA (`dsk::norm_threads`); `dsk::rmsnorm`'s default (D/8) unchanged for every other caller. Tests: `test_kernels` `norm` / `rows16`, `engine/server/tests/batch_matrix.sh` (111 runs), `batch_test.py --wide` | `engine/kernels/{dsk.h,norm_router.cu,README.md}`, `engine/model/model.cu`, `engine/kernels/tests/test_kernels.cu`, `engine/server/tests/{batch_matrix.sh,batch_test.py}` | on | yes | batch_test `--slots 2`, drafts on: 18 ok / 40 FAIL -> 58 ok / 0 FAIL; `--slots 16 --wide` 195 ok / 0 FAIL; batch_matrix 363 of 363 sessions equal alone; refhash unchanged; drafted-pair step at 9..12 rows +1.1-1.7 ms (`DSGB10_FUSED16=1`: +5.4-6.5 ms); c16 / c4 not measured |
 
 ## Thinking options, 100 images per request, video input (2026-11-15; pull requests #4, #5, #6 by MiaAI-Lab)
 
