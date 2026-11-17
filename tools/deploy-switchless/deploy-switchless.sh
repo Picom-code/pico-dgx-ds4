@@ -146,7 +146,7 @@ VISION_MAX_ROWS=${VISION_MAX_ROWS:-40000}            # the encoder's --max-rows 
 VISION_MEM=${VISION_MEM:-32g}                         # the encoder container's memory limit (see vision_cmd)
 VISION_NAME=${VISION_NAME:-dsgx10-vision}            # the container an older version of this script left
 INSTALL_DEPS=${INSTALL_DEPS:-0}                      # 1: apt-get the build dependencies (needs sudo)
-NET_APPLY=${NET_APPLY:-0}                            # 1: --phase net adds the links' addresses (sudo)
+NET_APPLY=${NET_APPLY:-0}                            # 1: --phase net adds the links' addresses (sudo); either way it writes netplan files
 REDEPLOY=${REDEPLOY:-0}                              # 1: fetch the recipe, rebuild, restart (see redeploy)
 
 STATE=$WORK/.state
@@ -574,8 +574,10 @@ phase_preflight() {
 phase_net() {
   load_fleet
   # The ring's links: each RDMA device's netdev at GID_INDEX carries the fleet file's address for that
-  # link. Prints what each box needs; NET_APPLY=1 runs it (sudo ip addr add / ip link set).
+  # link. Prints what each box needs; NET_APPLY=1 runs it (sudo ip addr add / ip link set). Either way
+  # it writes the same addresses as a netplan file per box, so they survive a reboot.
   local r d dev ip ndev cmds=() c
+  local -a np_rank=() np_ndev=() np_ip=()
   for r in 0 1 2 3; do
     cmds=()
     for d in NEXT_DEV0 NEXT_DEV1 PREV_DEV0 PREV_DEV1; do
@@ -589,6 +591,7 @@ phase_net() {
       ndev=$(run_on "$r" "cat /sys/class/infiniband/$dev/ports/1/gid_attrs/ndevs/$FLEET_GID_INDEX 2>/dev/null") ||
         die "rank $r: no $dev (or no GID $FLEET_GID_INDEX on it)"
       [ -n "$ndev" ] || die "rank $r: $dev has no netdev at GID $FLEET_GID_INDEX"
+      np_rank+=("$r"); np_ndev+=("$ndev"); np_ip+=("$ip")
       if run_on "$r" "ip -4 -o addr show dev $ndev | grep -qw $ip"; then
         step "rank $r: $ndev has $ip ($dev)"
         continue
@@ -606,7 +609,46 @@ phase_net() {
       for c in "${cmds[@]}"; do printf '    rank %s: sudo %s\n' "$r" "$c"; done
     fi
   done
-  [ "$NET_APPLY" = 1 ] || log "re-run with NET_APPLY=1 to apply these (they do not survive a reboot: put them in netplan)"
+  netplan_write "${np_rank[@]}" -- "${np_ndev[@]}" -- "${np_ip[@]}"
+  [ "$NET_APPLY" = 1 ] || log "re-run with NET_APPLY=1 to apply these (they do not survive a reboot: netplan does)"
+}
+
+# The same addresses as a netplan file, so they survive a reboot. One file per box, written under $WORK
+# (netplan/rank<r>.yaml); copy it to /etc/netplan/ on that box and run netplan apply. The netdev names
+# come from the boxes themselves, so the file is right for the hardware rather than for one example.
+netplan_write() {  # rank... -- netdev... -- ip...
+  local -a ranks=() ndevs=() ips=()
+  local a r i part=0
+  for a in "$@"; do
+    if [ "$a" = -- ]; then part=$((part + 1)); continue; fi
+    case $part in
+      0) ranks+=("$a") ;;
+      1) ndevs+=("$a") ;;
+      2) ips+=("$a") ;;
+    esac
+  done
+  [ "${#ranks[@]}" -gt 0 ] || return 0
+  mkdir -p "$WORK/netplan" || die "cannot make $WORK/netplan"
+  for r in 0 1 2 3; do
+    local out=$WORK/netplan/rank$r.yaml any=0
+    {
+      printf '# The ring links of rank %s (%s), from deploy-switchless.sh --phase net.\n' "$r" "$(box_name "$r")"
+      printf '# Copy to /etc/netplan/60-ring.yaml on that box, then: sudo netplan apply\n'
+      printf 'network:\n  version: 2\n  ethernets:\n'
+      for i in "${!ranks[@]}"; do
+        [ "${ranks[$i]}" = "$r" ] || continue
+        any=1
+        printf '    %s:\n      addresses: [%s/24]\n      mtu: 9000\n      dhcp4: false\n' \
+          "${ndevs[$i]}" "${ips[$i]}"
+      done
+    } > "$out"
+    if [ "$any" = 1 ]; then
+      step "rank $r: netplan file $out"
+    else
+      rm -f "$out"
+    fi
+  done
+  log "netplan files are in $WORK/netplan (one per box; copy each to /etc/netplan/60-ring.yaml there)"
 }
 
 # What to check out: the branch REPO_REF of REPO_URL, or a pull request's head, or any ref.

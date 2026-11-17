@@ -240,10 +240,21 @@ and `FLEET_SRC=/path/to/fleet.conf` copies yours in instead of writing the templ
   ...
 ```
 
-`NET_APPLY=1` runs them. They do **not** survive a reboot, so put them in netplan once they work:
+`NET_APPLY=1` runs them. They do **not** survive a reboot, so the same command also writes a netplan
+file for each box, with the netdev names that box reported:
+
+```
+  · rank 0: netplan file /home/vesku/pico-dgx-ds4/ds41deploy/netplan/rank0.yaml
+  · rank 1: netplan file /home/vesku/pico-dgx-ds4/ds41deploy/netplan/rank1.yaml
+  ...
+```
+
+Each file is a complete netplan document with one stanza per netdev — four per box, because each box
+has four RDMA devices: `f0` and `f1`, each on two PCI domains. `rank0.yaml`:
 
 ```yaml
-# /etc/netplan/60-ring.yaml on rank 0, for one link; one stanza per netdev
+# The ring links of rank 0 (qspark01), from deploy-switchless.sh --phase net.
+# Copy to /etc/netplan/60-ring.yaml on that box, then: sudo netplan apply
 network:
   version: 2
   ethernets:
@@ -251,26 +262,72 @@ network:
       addresses: [10.112.80.1/24]
       mtu: 9000
       dhcp4: false
+    enP2p1s0f0np0:
+      addresses: [10.112.81.1/24]
+      mtu: 9000
+      dhcp4: false
+    enp1s0f1np1:
+      addresses: [10.141.80.2/24]
+      mtu: 9000
+      dhcp4: false
+    enP2p1s0f1np1:
+      addresses: [10.141.81.2/24]
+      mtu: 9000
+      dhcp4: false
 ```
 
+Copy each box's file to that box and apply it. Rank 0 is the box you are on; the others are the
+`RANK<n>_SSH` addresses from the fleet file:
+
 ```bash
-sudo netplan apply
+sudo install -m 600 ds41deploy/netplan/rank0.yaml /etc/netplan/60-ring.yaml && sudo netplan apply
+for r in 1 2 3; do
+  ssh 192.168.2.10$((r + 1)) "sudo install -m 600 /dev/stdin /etc/netplan/60-ring.yaml && sudo netplan apply" \
+    < ds41deploy/netplan/rank$r.yaml
+done
 ```
+
+The netdev names come from the boxes, not from this page, so the files are right for the hardware. If
+a box's names differ from the ones above, the file it gets has its own.
 
 **5. Check it.** `--phase preflight` checks SSH, disk, memory, the GPU and the tools; `--phase verify`
 runs the ring test, which is the real proof that the links work.
 
 ## The deployment
 
-Twelve phases, in this order. Each is idempotent and leaves a marker in `$WORK/.state`, so a run that
-stops can be repeated and picks up where it left off.
+**You do not run twelve commands.** One command runs all twelve steps, in order:
 
-| Phase | What it does |
+```bash
+./tools/deploy-switchless/deploy-switchless.sh deploy
+```
+
+That is the whole deployment. It clones the repository, writes the fleet file, checks the boxes,
+configures the links, installs the build dependencies, downloads the checkpoint, builds the engine and
+the front-end, cuts the weight files, packs the Engram shards, copies the gate weights, runs the ring
+test and starts the service. A first run is hours, most of it the 475 GB download.
+
+Each step is idempotent and leaves a marker in `$WORK/.state`, so a run that stops can be repeated and
+picks up where it left off. If a step fails, the run stops there and says which one; fix the cause and
+run `deploy` again, or run just that step:
+
+```bash
+./tools/deploy-switchless/deploy-switchless.sh --phase build      # one step
+./tools/deploy-switchless/deploy-switchless.sh --phase build --phase serve   # two, in order
+./tools/deploy-switchless/deploy-switchless.sh --skip checkpoint  # everything but these
+./tools/deploy-switchless/deploy-switchless.sh --force --phase build   # redo one that finished
+./tools/deploy-switchless/deploy-switchless.sh --list             # the steps' names
+```
+
+`--phase NAME` runs that step even if its marker says it finished: asking for it is the request.
+
+The twelve steps, in the order `deploy` runs them:
+
+| Step | What it does |
 | --- | --- |
 | `clone` | clones this repository (or uses the clone the script is in) and checks out the ref to deploy |
 | `fleet` | writes the fleet file: the four boxes, their cabling, their addresses, their directories |
 | `preflight` | checks the boxes: SSH, disk, memory, the GPU, the tools the build needs |
-| `net` | prints the link addresses to configure (adds them only with `NET_APPLY=1`) |
+| `net` | prints the link addresses to configure, and writes the netplan files (adds them only with `NET_APPLY=1`) |
 | `deps` | installs the build dependencies (`INSTALL_DEPS=1`; needs sudo) |
 | `checkpoint` | downloads the checkpoint (475 GB, resumes), including the encoder's `inference/` imports |
 | `build` | builds the engine (`sm_121a`) and the front-end |
@@ -280,12 +337,8 @@ stops can be repeated and picks up where it left off.
 | `verify` | runs the ring test |
 | `serve` | starts the service, and checks that it answers |
 
-`--phase NAME` runs one phase (repeatable, and it runs even if it finished before); `--skip NAME` runs
-everything but those; `--force` redoes a phase that finished. `--list` prints them.
-
-A first run is hours, most of it the 475 GB download. Disk, per box: rank 0 needs the checkpoint
-(475 GB) + one rank's files at a time (78 GB) + its own weights (78 GB) + its Engram shards (51 GB) +
-64 GiB of spill; ranks 1-3 need 78 + 51 + 64 GiB.
+Disk, per box: rank 0 needs the checkpoint (475 GB) + one rank's files at a time (78 GB) + its own
+weights (78 GB) + its Engram shards (51 GB) + 64 GiB of spill; ranks 1-3 need 78 + 51 + 64 GiB.
 
 ## Where it puts things
 
@@ -372,7 +425,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 | `VISION_PORT` | 18950 | the encoder's port on rank 0's loopback |
 | `VISION_MAX_IMAGES` / `VISION_MAX_ROWS` | 100 / 40000 | the encoder's `--max-images` / `--max-rows` |
 | `INSTALL_DEPS` | 0 | `1` apt-gets the build dependencies (needs sudo) |
-| `NET_APPLY` | 0 | `1` lets `--phase net` add the link addresses (needs sudo) |
+| `NET_APPLY` | 0 | `1` lets `--phase net` add the link addresses (needs sudo); either way it writes the netplan files |
 
 Anything that needs sudo or deletes data is opt-in: `INSTALL_DEPS=1`, `NET_APPLY=1`,
 `KEEP_CHECKPOINT=0`.
@@ -425,8 +478,8 @@ a DGX.
 
 ## What it does not do
 
-- It does not configure the links' addresses unless `NET_APPLY=1`, and it does not put them in netplan,
-  so they do not survive a reboot until you do.
+- It does not configure the links' addresses unless `NET_APPLY=1`. It writes the netplan files, but it
+  does not install them: copying each to `/etc/netplan/` on its box is yours to do.
 - It does not install the build dependencies unless `INSTALL_DEPS=1`.
 - It does not tune the ring: the engine arguments are the recipe's, and `LOSSLESS=1` is the only
   variation it offers.
