@@ -70,6 +70,7 @@ struct Store {
     uint64_t used = 0;              // the clock when an operation last used the session
     // spilled: the same blocks at offsets in the disk tier's file, none in the pool
     bool disk = false;
+    bool ram_only = false;  // allocator pressure frees this session instead of writing it
     std::vector<size_t> dpages;
     std::map<int, size_t> dsnaps;
     size_t dend = Pool::kNone;

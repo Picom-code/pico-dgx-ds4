@@ -68,6 +68,7 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStSpill: m.state_spill(o.h); break;
     case kStUnspill: m.state_unspill(o.h); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
+    case kStMarkRamOnly: m.state_mark_ram_only(o.h); break;
     default: die("state: unknown operation %d", o.op);
   }
 }
