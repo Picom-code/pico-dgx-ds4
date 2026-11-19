@@ -333,6 +333,139 @@ void Model::Impl::state_keep(uint64_t gen) {
                 "in %.1f ms\n", n, s.dbytes / 1073741824.0, 1e3 * (t1 - t0), f.size() / 1024.0, 1e3 * (wall_s() - t1));
 }
 
+namespace {
+
+constexpr int32_t kDurablePage = 1, kDurableWindow = 2;
+
+size_t durable_size(const durable::Header& hd) {
+  return sizeof hd + (sizeof(uint64_t) + hd.page_bytes) * hd.pages + sizeof(uint64_t) + hd.window_bytes;
+}
+
+}  // namespace
+
+void Model::Impl::state_durable_config(const std::string& base, size_t bytes, uint64_t run_id) {
+  store_of().durable.configure(base, bytes, run_id);
+}
+
+void Model::Impl::state_mark_ordinary_durable(int h) {
+  Store& s = store_of();
+  const auto it = s.sess.find(h);
+  if (it != s.sess.end() && it->second.ram_only && !it->second.disk) it->second.ordinary_durable = true;
+}
+
+bool Model::Impl::state_durable_save(int h, uint64_t generation, int snap, bool encoder_only) {
+  Store& s = store_of();
+  const auto it = s.sess.find(h);
+  if (it == s.sess.end()) return false;
+  const Store::Sess& ss = it->second;
+  const auto window = ss.snaps.find(snap);
+  const int saved = snap & ~1;
+  if (!ss.ordinary_durable || !ss.ram_only || ss.disk || snap < kSnapRows || snap > opt.max_ctx ||
+      saved > ss.saved || window == ss.snaps.end() || !window->second) return false;
+  const int pages = (saved - 1) / kPagePos + 1;
+  if ((size_t)pages > ss.pages.size()) return false;
+  durable::Header hd;
+  hd.run_id = s.durable.run_id(), hd.generation = generation, hd.rank = rank;
+  hd.page_bytes = kPageBytes, hd.window_bytes = snap_bytes(spec != nullptr);
+  hd.saved = saved, hd.pages = pages, hd.snap = snap, hd.encoder_only = encoder_only;
+  hd.file_bytes = durable_size(hd);
+  hd.checksum = durable::header_checksum(hd);
+
+  return s.durable.save(generation, hd.file_bytes, [&](int fd) {
+    std::vector<uint8_t> staging(std::max(hd.page_bytes, hd.window_bytes));
+    if (!durable::put(fd, &hd, sizeof hd)) return false;
+    const auto copy = [&](const uint8_t* src, size_t bytes) {
+      return cudaMemcpyAsync(staging.data(), src, bytes, cudaMemcpyDeviceToHost, st) == cudaSuccess &&
+             cudaStreamSynchronize(st) == cudaSuccess;
+    };
+    for (int i = 0; i < hd.pages; ++i) {
+      if (!ss.pages[i] || !copy(ss.pages[i], hd.page_bytes)) return false;
+      const int positions = hd.saved - i * kPagePos;
+      if (positions < kPagePos) {
+        // The free part of an allocated page may still contain rows of earlier sessions.
+        for (int k = 0; k < kKvSlots; ++k) {
+          const int ratio = k < 3 ? 2 : 1;
+          for (int a = 0; a < 4; ++a)
+            std::memset(staging.data() + page_off(k, a) + positions / ratio * kArr[a],
+                        0, (kPagePos / ratio - positions / ratio) * kArr[a]);
+        }
+      }
+      if (!durable::put_block(fd, staging.data(), hd.page_bytes,
+                              durable::block_seed(generation, kDurablePage, i))) return false;
+    }
+    if (!copy(window->second, hd.window_bytes)) return false;
+    if (encoder_only) {
+      // CED encoder snapshots only initialize layers before its decoder split.
+      for (int layer = kCedFirstDecoderLayer; layer < kLayers; ++layer) {
+        std::memset(snap_kv(staging.data(), layer), 0, kSnapKv);
+        std::memset(snap_sc(staging.data(), layer), 0, kSnapSc);
+      }
+      if (spec) std::memset(staging.data() + kSnapBytes, 0, hd.window_bytes - kSnapBytes);
+    }
+    return durable::put_block(fd, staging.data(), hd.window_bytes,
+                              durable::block_seed(generation, kDurableWindow, hd.snap));
+  });
+}
+
+bool Model::Impl::state_durable_load(int h, uint64_t generation, int snap, bool encoder_only) {
+  Store& s = store_of();
+  if (h <= 0 || s.sess.count(h) || !s.pool.base) return false;
+  Store::Sess restored;
+  restored.ram_only = true;
+  const bool ok = s.durable.load(generation, [&](int fd, uint64_t bytes) {
+    durable::Header hd;
+    if (bytes < sizeof hd || !durable::transfer(fd, &hd, sizeof hd, false) ||
+        hd.magic != durable::Header{}.magic || hd.checksum != durable::header_checksum(hd) || hd.reserved ||
+        hd.rank != rank || hd.run_id != s.durable.run_id() || hd.generation != generation ||
+        hd.page_bytes != kPageBytes || hd.window_bytes != snap_bytes(spec != nullptr) ||
+        hd.snap != snap || hd.snap < kSnapRows || hd.snap > opt.max_ctx || hd.saved != (hd.snap & ~1) ||
+        hd.pages != (hd.saved - 1) / kPagePos + 1 || hd.encoder_only != encoder_only ||
+        hd.file_bytes != bytes || durable_size(hd) != bytes) return false;
+    const size_t device_bytes = Pool::round(hd.page_bytes) * hd.pages + Pool::round(hd.window_bytes);
+    if (device_bytes > s.pool.size - s.bytes) return false;
+    std::vector<uint8_t> staging(std::max(hd.page_bytes, hd.window_bytes));
+    const auto take = [&](size_t n) {
+      uint8_t* ptr = s.pool.take(n);
+      if (ptr) s.bytes += Pool::round(n);
+      return ptr;
+    };
+    const auto copy = [&](uint8_t* dst, size_t n) {
+      return dst && cudaMemcpyAsync(dst, staging.data(), n, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+             cudaStreamSynchronize(st) == cudaSuccess;
+    };
+    for (int i = 0; i < hd.pages; ++i) {
+      if (!durable::get_block(fd, staging.data(), hd.page_bytes,
+                              durable::block_seed(generation, kDurablePage, i))) return false;
+      restored.pages.push_back(take(hd.page_bytes));
+      if (!copy(restored.pages.back(), hd.page_bytes)) return false;
+    }
+    if (!durable::get_block(fd, staging.data(), hd.window_bytes,
+                            durable::block_seed(generation, kDurableWindow, hd.snap))) return false;
+    uint8_t* window = take(hd.window_bytes);
+    restored.snaps.emplace(hd.snap, window);
+    restored.saved = hd.saved;
+    return copy(window, hd.window_bytes);
+  });
+  if (!ok) {
+    for (auto* page : restored.pages) store_release(page, kPageBytes);
+    for (const auto& [pos, window] : restored.snaps) store_release(window, snap_bytes(spec != nullptr));
+    return false;
+  }
+  // A caller may expose this handle only after all ranks return success.
+  // It is ephemeral and cannot itself create a durable generation.
+  restored.used = s.clock;
+  s.sess.emplace(h, std::move(restored));
+  return true;
+}
+
+void Model::Impl::state_durable_drop(uint64_t generation) {
+  store_of().durable.drop(generation);
+}
+
+bool Model::Impl::state_durable_prune(const std::vector<uint64_t>& committed) {
+  return store_of().durable.prune(committed);
+}
+
 void Model::Impl::state_reserve(size_t bytes) {
   Store& s = store_of();
   if (s.pool.base) die("state: the store's pool is reserved once");
@@ -345,8 +478,8 @@ void Model::Impl::state_reserve(size_t bytes) {
   s.pool.free.emplace(0, bytes);
 }
 
-// A block for session h. While none is free, the least recently used session that the current command
-// does not use is evicted (every rank evicts the same): spilled to the disk tier, or freed without one;
+// A block for session h. Evict an unpinned RAM-only session first; otherwise evict the least recently
+// used unpinned session. Every rank makes the same choice. RAM-only sessions are always freed;
 // nullptr when none is left to evict.
 uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
   Store& s = store_of();
@@ -356,10 +489,14 @@ uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
       return p;
     }
     int victim = -1;
-    uint64_t oldest = UINT64_MAX;
-    for (const auto& [k, ss] : s.sess)
-      if (k != h && !ss.disk && ss.used < oldest && std::find(s.pinned.begin(), s.pinned.end(), k) == s.pinned.end())
-        victim = k, oldest = ss.used;
+    const Store::Sess* selected = nullptr;
+    for (const auto& [k, ss] : s.sess) {
+      if (k == h || ss.disk || std::find(s.pinned.begin(), s.pinned.end(), k) != s.pinned.end()) continue;
+      if (!selected || (ss.ram_only != selected->ram_only ? ss.ram_only : ss.used < selected->used)) {
+        victim = k;
+        selected = &ss;
+      }
+    }
     if (victim < 0) {
       if (rank == 0)
         std::printf("state: no room for %.1f MiB of session %d's state (%.2f of %.2f GiB in use)\n",
@@ -416,6 +553,11 @@ void Model::Impl::state_spill(int h) {
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
   Store::Sess& ss = it->second;
+  if (ss.ram_only) {
+    state_free(h);
+    s.evicted.push_back(h);
+    return;
+  }
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
   std::vector<size_t> dp;
@@ -765,6 +907,9 @@ void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
   Store& s = store_of();
   const auto it = s.sess.find(src);
   if (it == s.sess.end() || src == dst) return;
+  const auto to = s.sess.find(dst);
+  if (it->second.ram_only && (to == s.sess.end() || !to->second.ram_only))
+    die("state: RAM-only session cannot copy snapshots into a spillable session");
   if (it->second.disk) {
     s.pinned.push_back(dst);
     state_unspill(src);
@@ -813,6 +958,11 @@ void Model::state_restore(int h, int pos) { d_->state_restore(h, pos); }
 void Model::state_restore_end(int h) { d_->state_restore_end(h); }
 void Model::state_drop(int h, int from) { d_->state_drop(h, from); }
 void Model::state_free(int h) { d_->state_free(h); }
+void Model::state_mark_ram_only(int h) {
+  Store::Sess& ss = d_->store_of().use(h);
+  if (ss.disk) die("state: session %d is already on disk", h);
+  ss.ram_only = true;
+}
 void Model::state_copy_snaps(int src, int dst, int upto) { d_->state_copy_snaps(src, dst, upto); }
 void Model::state_drop_snap(int h, int pos) { d_->state_drop_snap(h, pos); }
 uint64_t Model::state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes,
@@ -823,6 +973,14 @@ void Model::state_disk(const std::string& base, size_t bytes, size_t staging, bo
   d_->state_disk(base, bytes, staging, reuse, run_id);
 }
 void Model::state_keep(uint64_t gen) { d_->state_keep(gen); }
+void Model::state_durable_config(const std::string& base, size_t bytes, uint64_t run_id) {
+  d_->state_durable_config(base, bytes, run_id);
+}
+void Model::state_mark_ordinary_durable(int h) { d_->state_mark_ordinary_durable(h); }
+bool Model::state_durable_save(int h, uint64_t generation, int snap, bool encoder_only) { return d_->state_durable_save(h, generation, snap, encoder_only); }
+bool Model::state_durable_load(int h, uint64_t generation, int snap, bool encoder_only) { return d_->state_durable_load(h, generation, snap, encoder_only); }
+void Model::state_durable_drop(uint64_t generation) { d_->state_durable_drop(generation); }
+bool Model::state_durable_prune(const std::vector<uint64_t>& committed) { return d_->state_durable_prune(committed); }
 uint64_t Model::state_kept() const { return d_->store_s ? d_->store_s->loaded_gen : 0; }
 std::vector<int> Model::state_sessions() const {
   std::vector<int> v;

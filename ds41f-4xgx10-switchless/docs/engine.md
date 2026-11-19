@@ -498,6 +498,59 @@ requests and one snapshot skipped, every comparison but one equal, and the two f
 short fork's, whose base had been evicted, so it ran cold (same tokens, `cached` 0, a cold CED
 prefill's log-probability); at the defaults it passes 17 of 17, and `--exact` 9 of 9.
 
+**Opt-in image prefix reuse.** Set `DSGB10_ORDINARY_IMAGE_PREFIX_CACHE=1` in both the frontend
+and the engine to reuse completed image histories on the same frontend connection. The matcher
+checks the token prefix and the position, length and encoded BF16 rows of each overlapping
+image span. A changed span limits the usable prefix to text before that image. Retained image
+state is memory-only by default, with limits of four completed entries, 128 MiB of encoded rows and
+five idle minutes. Each request still runs the vision encoder.
+
+The suffix-only rank transfer adapts Thomas Kempka's implementation in
+[PR #9](https://github.com/Picom-code/pico-dgx-ds4/pull/9), commit `b271aa2`.
+
+**Opt-in durable image checkpoints.** Enable this tier only on a dedicated ordinary
+route whose requests may be retained on disk. All clients on that route share the
+disk cache. Keep these settings off on routes that require no retention.
+
+- Set `DSGB10_ORDINARY_IMAGE_PREFIX_CACHE=1` and `DSGB10_ORDINARY_IMAGE_DURABLE=1`
+  in the frontend and all four ranks.
+- Set the same `DSGB10_ORDINARY_IMAGE_DURABLE_BYTES` (a positive decimal byte budget)
+  and `DSGB10_ORDINARY_IMAGE_ASSETS_EPOCH` (a 64-character lowercase hexadecimal
+  digest) on every rank. Choose the digest from the frontend, tokenizer, and vision
+  assets and configuration, and update it whenever any of them changes.
+- Use a service-owned mode-0700 `--disk-dir` (or fleet spill directory) outside any
+  Git tree. The tier has separate files from ordinary session spilling and uses its
+  own byte limit. It keeps at most 128 committed checkpoints per deployment namespace
+  and reserves 50 GiB of free space on each rank when writing payloads.
+
+The server checks the RAM cache first. A disk hit requires an exact token prefix,
+image positions and lengths, and matching SHA-256 digests of the relevant encoded
+image rows. Each request still runs the vision encoder. A durable generation contains
+prompt token IDs, image digests, and model state derived from the prompt. The
+server saves it when idle after a successful request and makes it visible only
+after all four ranks have written their parts. An unavailable checkpoint falls back
+to another eligible checkpoint or recomputation.
+
+The disk tier survives process restarts and has no time-based expiry. It evicts
+older entries as the configured namespace reaches its entry or byte limit.
+Disabling it, changing the namespace, or using the kept-session `forget` command
+does not erase older durable files. To purge a namespace, stop the service and
+remove its `ordinary-image[.<disk-tag>].<namespace>` directory from all ranks'
+disk directories.
+
+Run the CPU regressions from this recipe's directory with a C++20 compiler.
+
+```sh
+test_dir=$(mktemp -d)
+for source in engine/model/tests/durable_state_test.cpp \
+              engine/server/tests/durable_cmd_test.cpp \
+              engine/server/tests/durable_image_index_test.cpp; do
+  name=$(basename "$source" .cpp)
+  c++ -std=c++20 -pthread -Iengine "$source" -o "$test_dir/$name" &&
+    "$test_dir/$name" || exit 1
+done
+```
+
 **The disk tier.** A session that leaves the store is spilled to disk rather than freed (unless
 `--disk-gib 0`). Each rank writes its own slice to its own disk: `rank<r>.spill` in `--disk-dir`,
 by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its USB4 SSD) and `~/dsgb10/spill` on the others (NVMe).

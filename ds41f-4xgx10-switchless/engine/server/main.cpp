@@ -127,6 +127,7 @@
 #include "engram/engram.h"
 #include "model/model.h"
 #include "server/cmd.h"
+#include "server/durable_config.h"
 #include "server/golden.h"
 #include "server/serve.h"
 #include "weights/loader.h"
@@ -742,6 +743,11 @@ int main(int argc, char** argv) {
       std::printf(" GiB, less a margin of %.1f and the Engram cache's %.1f)\n", margin / gib, cache / gib);
     }
   }
+  durable::Config durable_images;
+  if (a.mode == "serve") try {
+    durable_images = durable::configure(m, ring, a.rank, disk_dir, disk_tag,
+        [&] { return run_id(a); }, [&] { return !in_git_tree(disk_dir); });
+  } catch (const std::exception& e) { die("ordinary durable startup refused: %s", e.what()); }
   ring.barrier();
   pin_self(15);
   mem_report(a.rank, ("ready after " + std::to_string((int)(now_s() - t0)) + " s").c_str());
@@ -756,6 +762,9 @@ int main(int argc, char** argv) {
   if (a.mode == "serve") {
     ServeOptions so;
     so.socket = a.socket;
+    so.durable_image_dir = durable_images.directory;
+    so.durable_image_namespace = durable_images.namespace_id;
+    so.durable_image_bytes = durable_images.bytes;
     so.max_ctx = a.max_ctx;
     so.prefill_rows = a.prefill_rows;
     so.small_rows = a.small_rows;
