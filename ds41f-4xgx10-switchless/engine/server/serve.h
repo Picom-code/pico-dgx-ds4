@@ -40,7 +40,7 @@ struct ServeOptions {
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
   int spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
   // --profile-from-req N: request N's first command opens nsys's capture range on every rank
   // (model::kFlagProfile; nsys --capture-range=cudaProfilerApi), until the server stops. 0: never.
   uint64_t profile_from_req = 0;

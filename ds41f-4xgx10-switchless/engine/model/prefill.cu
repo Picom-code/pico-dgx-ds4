@@ -43,6 +43,7 @@ using namespace detail;
 
 void Model::Impl::prefill_alloc(comm::Ring* ring) {
   if (pf) return;
+  dsk::prefill_tune_env(rank);  // DSGB10_PF_TUNE
   size_t free0 = 0, free1 = 0, total = 0;
   CUDA_CHECK(cudaMemGetInfo(&free0, &total));
   pf = std::make_unique<Prefill>();
@@ -657,6 +658,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
                               bool ced) {
   NVTX_RANGE("chunk a=%d M=%d%s%s", a, M, ced ? " ced" : "", sp ? " sample" : "");
   if (!bound) die("model: prefill before bind");
+  dsk::l2pf_tune_poll();  // DSGB10_L2PF=@FILE
   prefill_alloc();
   Prefill& p = *pf;
   if (M < 1 || M > p.cap || a < 0 || a + M > slot_ctx_[cur_slot]) die("model: bad prefill [%d, +%d) in slot %d", a, M, cur_slot);
@@ -664,6 +666,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: prefill runs the whole model");
   if (ced && sp && a + M < kReplay) die("model: CED prefill ending at %d (the replay needs %d positions)", a + M, kReplay);
   drain();  // the decode buffers and the Engram sets are free; earlier steps' state is in place
+  dsk::prefill_tune_poll();  // DSGB10_PF_TUNE=@FILE
   // this chunk's Engram lookups, unless prefill_lookup() started them
   int set = -1;
   for (int k = 0; k < 2; ++k)

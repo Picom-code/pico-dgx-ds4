@@ -101,11 +101,11 @@ struct Cmd {
   float spec_thresh = -1.f;  // verify d_j while survival[j - 1] >= this; < 0: lambda * dC (SpecRate)
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};  // ms: a step of one row, each further row (dC), a draft pass
   int32_t spec_force = -1;   // kCmdRows: draft from this token, not the sampled one (teacher-forced checks)
-  int32_t spec_probe[model::ops::kDrafts] = {-1, -1, -1, -1, -1};  // kCmdRows, EXPERIMENT: SpecCfg::probe
+  int32_t spec_probe[model::ops::kDrafts] = {-1, -1, -1, -1, -1, -1, -1};  // kCmdRows, EXPERIMENT: SpecCfg::probe
   // the gate (model::ops kGate*): kGateThresh uses spec_thresh / spec_cost, the others spec_row_ms, the
   // ms of a step verifying 0..5 drafts with its draft pass (measured at 1k of context, docs/engine.md)
   int32_t spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
   // kCmdDecode: the drafts' rate (SpecRate) to start from: a request decoded in slices goes on with the
   // last slice's (DecodeEnd::spec_tok, spec_ms)
   double spec_tok = 1, spec_ms = 0;

@@ -52,6 +52,26 @@ ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temper
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
 // wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
 // (test_kernels rows16 checks fused == unfused). DSGB10_FUSED16=1 restores the fused prologues.
+// DSGB10_WIDE_SH=1: the wide step's shared expert (moe_prefill phase 2: its w1 + w3 SwiGLU GEMM and its
+// w2 GEMM, 8.9 MB a layer) on the side stream sb from ffn_norm on, beside the gate GEMM (3 CTAs), router_topk (1 CTA) and
+// the bucketing, which today run one after another with the shared expert (9 CTAs) between the router and the routed
+// experts: ~225 us a layer before the routed experts start, with most SMs idle. It needs only the normed, quantised
+// input, not the routes. The same kernels on the same inputs, so every output has the same bits.
+bool wide_sh() {
+  static const bool u = getenv("DSGB10_WIDE_SH") && atoi(getenv("DSGB10_WIDE_SH"));
+  return u;
+}
+
+// DSGB10_WIDE_AR=1: a wide step's all-reduces move 1.31 MB (FFN, fp32) and 0.66 MB (attention, bf16) a
+// rank; k_allreduce_hc_wide has every rank receive the other three's partials whole (3x the payload through its one
+// 200G port: 250 and 150 us a call, 14 % of a 64-row step). comm::allreduce_bulk_* reduces each quarter on one rank and
+// all-gathers the sums (1.5x the payload), then the separate kernels finish: the same sums in the same order and the
+// same hc_post / hc_pre arithmetic (ops.h: allreduce_hc is bit-identical to this chain).
+bool wide_ar() {
+  static const bool u = getenv("DSGB10_WIDE_AR") && atoi(getenv("DSGB10_WIDE_AR"));
+  return u;
+}
+
 bool unfused16() {
   static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
   return u;
@@ -70,6 +90,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   if (opt.l2pf) {
     CUDA_CHECK(cudaStreamCreateWithPriority(&sc, cudaStreamNonBlocking, pri_hi));
     l2s = dalloc<dsk::L2pfState>(1);
+    dsk::l2pf_tune_env(rank);  // DSGB10_L2PF
   }
   CUDA_CHECK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming));
   for (auto& e : ev_join) CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -664,7 +685,13 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   }
   l2pf(4, L, R);
   join(sa);
-  ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
+  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
+    comm::allreduce_bulk_bf16(ch, part, sub, (size_t)R * kDim, st);
+    attn::hc_post(U(sub), U(x), a_post, a_comb, R, U(mid), st);
+    attn::hc_pre(U(mid), a_pre, R, nullptr, U(yraw), nullptr, st);
+  } else {
+    ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
+  }
   if (dumps) {
     dump(sink, L, "attn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "mid", pos0, R, mid, kHcDim * 2);
@@ -691,7 +718,11 @@ void Model::Impl::l2pf(int win, int L, int R) {
       {{w.wqb, w.sqb, w.ix_wqb, w.ix_sqb}, {(size_t)kQ * kQLora, s8(kQ, kQLora), ix, ix ? s8(kIdxQ, kQLora) : 0}},
       {{w.woa, w.soa}, {(size_t)kOPart * kWoaK, s8(kOPart, kWoaK)}},
       {{w.wob, w.sob}, {(size_t)kDim * kOPart, s8(kDim, kOPart)}},
-      {{w.gate}, {(size_t)kExperts * kDim * 2}}};
+      {{w.gate}, {(size_t)kExperts * kDim * 2}},
+      // the shared expert (FP8, this rank's 576 intermediate columns); only a DSGB10_L2PF plan uses them
+      {{w.moe.sh_w1, w.moe.sh_s1, w.moe.sh_w3, w.moe.sh_s3},
+       {(size_t)kInterPart * kDim, s8(kInterPart, kDim), (size_t)kInterPart * kDim, s8(kInterPart, kDim)}},
+      {{w.moe.sh_w2, w.moe.sh_s2}, {(size_t)kDim * kInterPart, s8(kDim, kInterPart)}}};
   fork(sc);
   const bool coll = win != 3;  // the attention's window has no collective to stop it
   dsk::l2pf_window(t, L, win, R, coll ? ch.ready : nullptr, coll ? ch.seq : nullptr, l2s, sc);
@@ -715,6 +746,12 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   const bool wide = R > kDecodeRows;
   if (wide) {  // wide64: the gate as a GEMM, then router_topk and the grouped prefill MoE (one read of the union)
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    if (wide_sh()) {  // the shared expert beside the gate and the router
+      fork(sb);
+      dsk::MoePCfg sh;
+      sh.phases = 2;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, sb, sh);
+    }
     dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
   } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
@@ -736,7 +773,16 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
       dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st);
     else
       dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
-    dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
+    if (wide_sh()) {  // bucketing + routed up, the shared expert's join, then down (+ combine)
+      dsk::MoePCfg mc;
+      mc.phases = 1 | 4;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st, mc);
+      join(sb);
+      mc.phases = 8 | 16;
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st, mc);
+    } else {
+      dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
+    }
   } else {
     dsk::MoeCfg mc{};
     mc.down = R == 1 ? 2 : 4;
@@ -746,7 +792,14 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
-  ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
+    comm::allreduce_bulk_f32(ch, ymoe, ymoe, (size_t)R * kDim, st);
+    ops::f32_to_bf16(ymoe, sub, R * kDim, st);
+    attn::hc_post(U(sub), U(mid), f_post, f_comb, R, U(x), st);
+    attn::hc_pre(U(x), next_pm, R, nullptr, U(yraw), nullptr, st);
+  } else {
+    ops::allreduce_hc(ch, ymoe, true, R, mid, f_post, f_comb, next_pm, x, yraw, dumps ? sub : nullptr, st);
+  }
   if (dumps) {
     dump(sink, L, "ffn_out", pos0, R, sub, kDim * 2);
     dump(sink, L, "route_idx", pos0, R, ridx, kTopK * 4);

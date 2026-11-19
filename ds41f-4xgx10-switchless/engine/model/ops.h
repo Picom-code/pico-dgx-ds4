@@ -16,7 +16,7 @@ using bf16 = __nv_bfloat16;
 // so the next step can be queued while one runs); step_in copies the next slot to device memory first
 // thing, so one captured graph serves every step of its row count.
 constexpr int kInSlots = 4;
-constexpr int kDrafts = 5;  // DSpark's drafts per pass (dspark::kDraft)
+constexpr int kDrafts = 7;  // DSpark's drafts per pass AT MOST (dspark::kDraft; blk7: the passes run dspark::draft_rows())
 enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 // How a spec step chooses the next step's drafts (StepIn::gate; spec.cu k_spec_next):
 // - kGateThresh: draft j while survival[j - 1] >= thresh;
@@ -91,7 +91,7 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
 constexpr int kTopLogprobs = 20;  // top logprobs per row, at most
 constexpr int kCand = 64;         // candidates per rank and row for top-k / top-p / top logprobs
 constexpr int kOutSlots = 4;
-constexpr int kProbeWords = 100;  // sizeof(dspark::ProbeOut) / 4
+constexpr int kProbeWords = 20 * kDrafts;  // sizeof(dspark::ProbeOut) / 4
 struct SampleRow {
   int32_t token;
   float logprob;   // of token under softmax(logits / T) (T = 1 when greedy), before top-k / top-p

@@ -58,14 +58,15 @@ __host__ __device__ inline int spec_batch_layout(StepIn& d, const SpecState* ss,
 // entry order (the compact list; the rest 0); pstab [kMaxSess * kDrafts]: their rows' slot tables, the c-th entry
 // on at rows [kDrafts c, kDrafts c + kDrafts) (pass p takes bent + 3 p and pstab + 3 p * kDrafts; the rest slot
 // 0, never read). Returns S, the entries on (the switch over the passes runs body S - 1).
-__host__ __device__ inline int spec_batch_passes(const StepIn& d, int* bent, int* pstab) {
+// blk7: nd = the batch passes' rows per entry (dspark::draft_rows_batch()), the tables' stride.
+__host__ __device__ inline int spec_batch_passes(const StepIn& d, int* bent, int* pstab, int nd = kDrafts) {
   const int ns = d.nsess < 1 ? 1 : d.nsess > kMaxSess ? kMaxSess : d.nsess;
   int S = 0;
   for (int k = 0; k < ns; ++k)
     if (d.sess_on[k]) bent[S++] = k;
   for (int c = S; c < kMaxSess; ++c) bent[c] = 0;
   for (int c = 0; c < kMaxSess; ++c)
-    for (int j = 0; j < kDrafts; ++j) pstab[c * kDrafts + j] = c < S ? d.sess_slot[bent[c]] : 0;
+    for (int j = 0; j < nd; ++j) pstab[c * nd + j] = c < S ? d.sess_slot[bent[c]] : 0;
   return S;
 }
 

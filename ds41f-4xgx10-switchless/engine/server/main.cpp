@@ -304,11 +304,11 @@ struct Args {
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
-  int spec_drafts = 5;
+  int spec_drafts = -1;  // blk7: -1: the one-session pass's rows (dspark::draft_rows(), DSGB10_DRAFT_MAX; 5 by default)
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
   int spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
 };
 
 Args parse(int argc, char** argv) {
@@ -494,7 +494,8 @@ Args parse(int argc, char** argv) {
        a.chain_every < 0))
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
-  if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
+  if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
+  if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
   for (int k : a.ks) {
@@ -862,6 +863,7 @@ int main(int argc, char** argv) {
                 e.vsteps, (double)e.verified / e.vsteps, (double)e.accepted / e.vsteps,
                 e.verified ? 100.0 * e.accepted / e.verified : 0.0, 1.0 + (double)e.accepted / e.vsteps, e.rows_hist[0],
                 e.rows_hist[1], e.rows_hist[2], e.rows_hist[3], e.rows_hist[4], e.rows_hist[5]);
+    if (e.rows_hist[6] + e.rows_hist[7]) std::printf("  steps verifying 6, 7 drafts: %d %d\n", e.rows_hist[6], e.rows_hist[7]);
     std::printf("  verify-length gate (%s): mean %.3f, min %.3f, max %.3f over %d steps\n",
                 a.spec_gate == model::ops::kGateRatio      ? "ratio; lambda, tokens per ms"
                 : a.spec_gate == model::ops::kGateMarginal ? "marginal; lambda, tokens per ms"

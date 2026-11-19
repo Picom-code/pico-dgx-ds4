@@ -53,9 +53,9 @@ struct SpecCfg {
   int max_drafts = 5;  // 0..5
   int pos_end = 0;
   int force = -1;  // >= 0: draft from this token instead of the step's last sample (teacher-forced checks)
-  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
+  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
   int gate = ops::kGateThresh;
-  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};  // 0..5 drafts
+  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};  // 0..5 drafts
 };
 
 // A batch spec step (docs/batching.md, B3: drafts across sessions; Model::launch_spec_batch and

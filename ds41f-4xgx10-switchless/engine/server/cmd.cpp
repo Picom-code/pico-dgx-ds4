@@ -1,5 +1,6 @@
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include <cstdlib>
+#include "dspark/dspark.h"
 #include "server/cmd.h"
 
 #include <pthread.h>
@@ -272,7 +273,7 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       slog_in.assign(o.next_tok, o.next_tok + std::max(0, std::min<int>(o.next_rows, model::kMaxRows)));
     }
     g_t_late.push_back(now_s());
-    e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kD));
+    e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + dspark::draft_rows()));  // blk7: the block's rows
     if (i > 0) {
       ++e.vsteps, e.verified += o.step_rows - 1, e.accepted += o.rows - 1;
       ++e.rows_hist[std::min(o.step_rows - 1, kD)];
@@ -666,8 +667,9 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     // reach those rows; fewer entries keep the 16-row steps
     static const int wide_s = getenv("DSGB10_WIDE_S") ? atoi(getenv("DSGB10_WIDE_S")) : 6;
     const int rows_cap = S >= wide_s ? m.spec_batch_rows() : model::kDecodeRows;
-    const int cap = !S ? 0 : budget ? std::min({kD, c.spec_drafts, rows_cap - S})
-                                    : std::min({kD, c.spec_drafts, (rows_cap - S) / S});
+    const int kDb = dspark::draft_rows_batch();  // blk7: the batch passes' rows
+    const int cap = !S ? 0 : budget ? std::min({kDb, c.spec_drafts, rows_cap - S})
+                                    : std::min({kDb, c.spec_drafts, (rows_cap - S) / S});
     b.budget = budget ? rows_cap : 0;
     b.n = n;
     b.cfg.max_drafts = std::max(0, std::min(kD, c.spec_drafts));
@@ -733,7 +735,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       const int p0 = o.sess_pos0[k], sr = o.sess_step_rows[k], er = o.sess_rows[k], r0 = o.sess_row0[k];
       if (sr < 1 || er < 1 || er > sr || r0 < 0 || r0 + sr > o.step_rows)
         die("spec batch: entry %d: rows %d (%d emitted) from row %d of %d", k, sr, er, r0, o.step_rows);
-      d.written = std::max(d.written, p0 + std::max(sr, er + kD));
+      d.written = std::max(d.written, p0 + std::max(sr, er + dspark::draft_rows_batch()));  // blk7
       if (ending[k]) {  // its rows behind its end: their KV counts, their tokens do not
         snaps(k, H[k] + 1);
         finish(k, H[k] + 1);

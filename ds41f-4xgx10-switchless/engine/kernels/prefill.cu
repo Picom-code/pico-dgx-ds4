@@ -17,6 +17,13 @@
 #include "common/check.h"
 #include "kernels/common.cuh"
 #include "kernels/dsk.h"
+#include "kernels/prefill_attn.h"
+
+#include <sys/stat.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 namespace dsk {
 
@@ -1486,7 +1493,7 @@ void gemm_fp8_any(const uint8_t* xq, const uint8_t* xs, int M, const Fp8Seg* seg
   const int v = g_tune.fp8;
   if (epi == kEpiSwiglu) {
     if (n_inter % 64) die("gemm_fp8_swiglu_p: N=%d", n_inter);
-    if (g_tune.small) {  // 32 columns of w1 and w3 a tile: one act_quant group
+    if (g_tune.small || M <= g_tune.sh_m) {  // 32 columns of w1 and w3 a tile: one act_quant group
       launch_gemm_fp8<32, 64, 32, 32, 4, kEpiSwiglu>(a, n_inter / 32, st);
       return;
     }
@@ -1545,7 +1552,7 @@ void gemm_bf16_p(const __nv_bfloat16* x, int M, const uint8_t* W, int N, int K, 
   if (M < 1 || K % 64 || N % 32) die("gemm_bf16_p: M=%d N=%d K=%d", M, N, K);
   G16Args a{x, K, M, K, W, nullptr, N, N, y, nullptr, nullptr, nullptr};
   // small-M tiles (the router gate: N = 384 in 12 or 24 CTAs per M tile instead of 3)
-  if (g_tune.small == 1 && N % 32 == 0) return launch_gemm16<32, 32, 32, 16, 4, false>(a, st);
+  if ((g_tune.small == 1 || (N == 384 && M <= g_tune.gate_m)) && N % 32 == 0) return launch_gemm16<32, 32, 32, 16, 4, false>(a, st);
   if (g_tune.small == 2 && N % 16 == 0) return launch_gemm16<16, 16, 16, 16, 4, false>(a, st);
   if (N % 128 == 0) launch_gemm16<128, 128, 64, 32, 3, false>(a, st);
   else if (N % 64 == 0) launch_gemm16<128, 64, 64, 32, 3, false>(a, st);
@@ -1591,6 +1598,73 @@ void gemm_fp8w_f32_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint
 }
 
 void prefill_tuning(const PrefillTuning& t) { g_tune = t; }
+
+namespace {
+std::string g_pf_file, g_pf_text = "\x01";
+long g_pf_stamp = -2;
+int g_pf_rank = -1;
+void pf_apply(const std::string& text) {
+  if (text == g_pf_text) return;
+  g_pf_text = text;
+  int hc = 0, gate = 0, sh = 0, down = 0;
+  size_t i = 0;
+  while (i < text.size()) {
+    size_t j = text.find(',', i);
+    if (j == std::string::npos) j = text.size();
+    std::string tok = text.substr(i, j - i);
+    i = j + 1;
+    while (!tok.empty() && (tok.back() == '\n' || tok.back() == ' ' || tok.back() == '\r')) tok.pop_back();
+    if (tok.empty()) continue;
+    const size_t eq = tok.find('=');
+    const std::string name = tok.substr(0, eq);
+    const int v = eq == std::string::npos ? -1 : std::atoi(tok.c_str() + eq + 1);
+    if (name == "hc") hc = v >= 0 ? v : 344;
+    else if (name == "gate") gate = v >= 0 ? v : 256;
+    else if (name == "sh") sh = v >= 0 ? v : 256;
+    else if (name == "small") gate = sh = v >= 0 ? v : 256;
+    else if (name == "down") down = v >= 0 ? v : 4096;
+    else die("DSGB10_PF_TUNE: unknown item '%s' (hc, gate, sh, small, down)", tok.c_str());
+  }
+  if (hc > 512) die("DSGB10_PF_TUNE: hc=%d (at most 512 rows a rank)", hc);
+  g_tune.gate_m = gate, g_tune.sh_m = sh, g_tune.down_m = down;
+  hc_boundary_split(hc, 0);
+  std::fprintf(stderr, "pf: rank %d: prefill tuning hc %d gate %d sh %d down %d\n", g_pf_rank, hc, gate, sh, down);
+}
+}  // namespace
+
+void prefill_tune_env(int rank) {
+  g_pf_rank = rank;
+  const char* e = std::getenv("DSGB10_PF_TUNE");
+  if (!e || !*e) return;
+  if (*e == '@') {
+    g_pf_file = e + 1;
+    if (g_pf_file.rfind("~/", 0) == 0 && std::getenv("HOME")) g_pf_file = std::string(std::getenv("HOME")) + g_pf_file.substr(1);
+    hc_boundary_split(344, 0), hc_boundary_split(0, 0);  // the split kernel's scratch, once, before the session store is sized
+    prefill_tune_poll();
+  } else {
+    pf_apply(e);
+  }
+}
+
+void prefill_tune_poll() {
+  if (g_pf_file.empty()) return;
+  struct stat sb;
+  long stamp = -1;
+  if (stat(g_pf_file.c_str(), &sb) == 0) stamp = (long)sb.st_mtim.tv_sec * 1000000L + sb.st_mtim.tv_nsec / 1000 + sb.st_size;
+  if (stamp == g_pf_stamp) return;
+  g_pf_stamp = stamp;
+  std::string text;
+  if (stamp >= 0)
+    if (FILE* f = std::fopen(g_pf_file.c_str(), "r")) {
+      char buf[256];
+      const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+      std::fclose(f);
+      text.assign(buf, n);
+      const size_t nl = text.find('\n');
+      if (nl != std::string::npos) text.resize(nl);
+    }
+  pf_apply(text);
+}
 
 size_t moe_prefill_workspace_bytes(int M, int E) { return carve(nullptr, M, E).bytes; }
 
@@ -1648,7 +1722,7 @@ void moe_prefill(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, co
   }
   if (cfg.phases & 1) {
     launch_pdl(k_moe_bucket, dim3(1), dim3(1024), 0, st, true, idx, P, E, b.cnt, b.off, b.cursor, b.ntiles, b.tiles,
-               b.done, ndone, g_tune.tord >= 0 ? g_tune.tord : kTileOrder);
+               b.done, ndone, g_tune.tord >= 0 ? g_tune.tord : g_tune.down_m > 0 && M >= g_tune.down_m ? 1 : kTileOrder);
     launch_pdl(k_moe_scatter, dim3((P + 255) / 256), dim3(256), 0, st, true, idx, wts, P, (const int*)b.off,
                b.cursor, b.perm_tok, b.perm_w, b.pos_of);
     if (!fused)
@@ -1663,7 +1737,7 @@ void moe_prefill(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, co
                dim3(kInterP / 64, maxt), dim3(128), 0, st, true, a);
   if (fork) CUDA_CHECK(cudaStreamWaitEvent(st, ev[1], 0));
   if (cfg.phases & 8) {  // with the combine fused, after the shared expert (above)
-    const int G = g_tune.dgrp >= 0 ? g_tune.dgrp : fused ? kDownGroupF : kDownGroup;
+    const int G = g_tune.dgrp >= 0 ? g_tune.dgrp : fused ? kDownGroupF : g_tune.down_m > 0 && M >= g_tune.down_m ? 10 : kDownGroup;
     if (G > 0)
       launch_down_g(a, G, maxt, fused, h, st);
     else if (fused)

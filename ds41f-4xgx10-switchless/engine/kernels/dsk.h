@@ -299,8 +299,18 @@ struct PrefillTuning {
   int tord = -1;  // tile order: k > 0 one tile of the most-picked experts, then k of the fewest (0: descending; -1: the default)
   int upf = -1;  // up: weights prefetched into L2 this many chunks of 256 k ahead (0: none; -1: the default)
   int dgrp = -1, dring = 3;  // down: column blocks per CTA (0: one, k_moe_down_p; -1: the default), weight steps in flight (3 or 9)
+  // DSGB10_PF_TUNE (all 0 = off = the default tiles; each gives the default tiles' bits):
+  int gate_m = 0;  // the router gate (gemm_bf16_p with N = 384) in 32x32 tiles for calls of up to gate_m rows
+  int sh_m = 0;    // the shared expert's w1/w3 in 32x64 tiles for calls of up to sh_m rows
+  int down_m = 0;  // the down kernel by column groups (dgrp 10) and tile order 1 for chunks of down_m rows or more
 };
 void prefill_tuning(const PrefillTuning& t);
+// DSGB10_PF_TUNE=hc[=ROWS],gate[=M],sh[=M],small[=M],down[=M] (unset or empty: today's kernels). hc: the split mHC boundary
+// (hc_boundary_split) for chunks of up to ROWS rows a rank (default 344); gate / sh / small (= both): the small tiles
+// for calls of up to M rows (default 256); down: dgrp 10 + tord 1 from M rows (default 4096).
+// DSGB10_PF_TUNE=@FILE (tests): the same text read from FILE, re-read by prefill_tune_poll() when the file changes.
+void prefill_tune_env(int rank);
+void prefill_tune_poll();
 struct MoePCfg {
   int phases = 31;               // 1 bucketing, 2 shared expert, 4 routed up, 8 routed down, 16 combine
   cudaStream_t side = nullptr;   // if set, the shared expert's GEMMs run there, beside the routed experts
@@ -324,7 +334,9 @@ void moe_combine_rs(const comm::DevChannel& ch, void* ws, int M, int E, int rq, 
 // step reads next (model::Options::l2pf, on by default). It writes nothing the model reads.
 // A layer's weights the plan may prefetch, in the order its step reads them: wq_a + wkv, wq_b (+ the indexer's
 // wq_b), wo_a, wo_b, the router gate; each up to four tensors (weights, scales; n 0: none).
-enum { kL2pfWqa, kL2pfWqb, kL2pfWoa, kL2pfWob, kL2pfGate, kL2pfTargets };
+// kL2pfSh13, kL2pfSh2 = the shared expert's w1 + w3 and w2 (read by moe_up / moe_down after the gate);
+// only a DSGB10_L2PF plan prefetches them
+enum { kL2pfWqa, kL2pfWqb, kL2pfWoa, kL2pfWob, kL2pfGate, kL2pfSh13, kL2pfSh2, kL2pfTargets };
 struct L2pfTarget {
   const void* p[4];
   size_t n[4];
@@ -339,5 +351,16 @@ struct L2pfState {  // device memory: how far a layer's windows got (they run in
 // prefetch once the window's collective has arrived; nullptr for the attention.
 void l2pf_window(const L2pfTarget (&t)[kL2pfTargets], int layer, int window, int R, const unsigned long long* arrived,
                  const unsigned long long* finished, L2pfState* state, cudaStream_t s);
+// DSGB10_L2PF=SPEC or @FILE (unset: the kernel and launches above, unchanged). With it, every window
+// launches k_l2pf2, which takes its plan (targets) and budgets by row class from device memory, so a running engine
+// can be switched (a paired measurement in one engine start): l2pf_tune_poll() re-reads FILE when it changes.
+// SPEC: items separated by ';' or '/': "off" (the stock plan and budgets, computed on the device), "pace=GBPS", or
+// "cN:key=value,..." for row class N (0: 1 row, 1: 2-8 rows, 2: 9-16 rows, 3: 17+ rows) with keys
+// plan=wqa+wqb+woa+wob+gate+sh13+sh2, w1=A+B, w2=A+B, w3=A+B, w4=A+B (us = A + B (min(R, rcap) - 1)), w3i=US (W3 on the
+// indexer's layers), rcap=N, u1..u4=TARGET (the window prefetches no target after it). A class not named keeps the stock plan and budgets. It writes nothing the model reads.
+void l2pf_tune_env(int rank);
+void l2pf_tune_poll();
+void l2pf_tune_tick();  // every 8th call polls (a decode step's launch, on every rank)
+bool l2pf_tuned();
 
 }  // namespace dsk

@@ -40,7 +40,7 @@ int draft1_min() {
   static const int t = [] {
     const char* e = getenv("DSGB10_DRAFT1");
     const int v = e ? atoi(e) : 0;
-    return v > dspark::kBatchEnts ? std::min(v, (int)dspark::kWideEnts) : 0;
+    return v > dspark::batch_ents() ? std::min(v, (int)dspark::kWideEnts) : 0;
   }();
   return t;
 }
@@ -131,6 +131,12 @@ __global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* b
   for (int i = threadIdx.x; i < dspark::kMainK; i += blockDim.x) d[i] = s[i];
 }
 
+// blk7 (DSGB10_DRAFT_DYN=L): which draft pass this step runs: the long block after a step that accepted at least L
+// drafts (the text is being predicted well), else the model's own 5 rows.
+__global__ void k_spec_dyn(const ops::SpecState* ss, cudaGraphConditionalHandle h, int L) {
+  if (threadIdx.x == 0) cudaGraphSetConditional(h, ss->count - 1 >= L ? 1u : 0u);
+}
+
 // After the draft pass: the drafts the next step verifies, by the gate (ops.h; at most max_drafts, its
 // rows below pos_end); then the step is published.
 __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int* drafts, const float* surv,
@@ -181,7 +187,7 @@ struct IfHandles {
 };
 __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
                                 int* row0, int* stab, int* bent, int* pstab, cudaGraphConditionalHandle hsw,
-                                IfHandles hif, cudaGraphConditionalHandle hpass, IfHandles hchk) {
+                                IfHandles hif, cudaGraphConditionalHandle hpass, IfHandles hchk, int ndb) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   const uint32_t slot = *counter % ops::kInSlots;
   for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -192,7 +198,7 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
     else ops::spec_batch_row0(*d, row0);  // a given step: the host's layout, one row per entry on
     for (int k = 0; k < ops::kMaxSess; ++k)
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
-    const int S = ops::spec_batch_passes(*d, bent, pstab);
+    const int S = ops::spec_batch_passes(*d, bent, pstab, ndb);
     *counter += 1;
     cudaGraphSetConditional(hsw, (unsigned)ops::spec_body(d->rows));  // wide64: a bucket's body past kDecodeRows
     for (int k = 0; k < hif.n; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
@@ -836,7 +842,34 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nunits > 1 ? in_d->slot : nullptr;
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
-  sp.draft->draft(&sp.ss->bonus, st, slot);
+  static const int dynL = getenv("DSGB10_DRAFT_DYN") ? atoi(getenv("DSGB10_DRAFT_DYN")) : 0;
+  if (dynL > 0 && dspark::draft_rows() > dspark::kDraftModel) {  // blk7: a switch over two draft passes (5 rows / the long block)
+    cudaGraphConditionalHandle hd;
+    CUDA_CHECK(cudaGraphConditionalHandleCreate(&hd, g, 0, 0));
+    k_spec_dyn<<<1, 32, 0, st>>>(sp.ss, hd, dynL);
+    CUDA_CHECK(cudaGetLastError());
+    const cudaGraphNode_t* ddeps = nullptr;
+    size_t dn = 0;
+    CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &ddeps, nullptr, &dn));
+    const std::vector<cudaGraphNode_t> dtail(ddeps, ddeps + dn);
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    cudaGraphNodeParams dp{};
+    dp.type = cudaGraphNodeTypeConditional;
+    dp.conditional.handle = hd;
+    dp.conditional.type = cudaGraphCondTypeSwitch;
+    dp.conditional.size = 2;
+    cudaGraphNode_t dsw;
+    CUDA_CHECK(cudaGraphAddNode(&dsw, g, dtail.data(), nullptr, dtail.size(), &dp));
+    for (int b = 0; b < 2; ++b) {
+      CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, dp.conditional.phGraph_out[b], nullptr, nullptr, 0, mode));
+      sp.draft->draft(&sp.ss->bonus, st, slot, b ? dspark::draft_rows() : dspark::kDraftModel);
+      CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    }
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &dsw, nullptr, 1, mode));
+    if (rank == 0 && !sp.quiet) std::printf("spec: draft pass by step (DSGB10_DRAFT_DYN=%d): %d rows after %d accepted drafts, else %d\n", dynL, dspark::draft_rows(), dynL, dspark::kDraftModel);
+  } else {
+    sp.draft->draft(&sp.ss->bonus, st, slot);
+  }
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
     sp.draft->probe(in_d->probe, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
@@ -895,7 +928,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   // the step's rows, the switch's value, the ifs' and the passes' switch's
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
   k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, sp.bent, sp.pstab, hsw, hif, hpass,
-                                     hchk);
+                                     hchk, dspark::draft_rows_batch());
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;
@@ -980,14 +1013,14 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       cudaGraph_t body = pp.conditional.phGraph_out[S - 1];
       CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
       // wide64: DSGB10_DRAFT1=T: T or more entries draft in one pass (Draft::draft_batch_wide), not passes of 3
-      const int per = draft1_min() > 0 && S >= draft1_min() ? S : dspark::kBatchEnts;
+      const int per = draft1_min() > 0 && S >= draft1_min() ? S : dspark::batch_ents();
       for (int c0 = 0; c0 < S; c0 += per) {
         dspark::Draft::BatchPass bp{};
         bp.ent = sp.bent + c0;
         bp.n = std::min(per, S - c0);
         bp.tok = &sp.ss[0].bonus;
         bp.tok_stride = (int)(sizeof(ops::SpecState) / sizeof(int32_t));
-        bp.slot = sp.pstab + (size_t)c0 * ops::kDrafts;
+        bp.slot = sp.pstab + (size_t)c0 * dspark::draft_rows_batch();
         sp.draft->draft_batch(bp, st);
       }
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1105,7 +1138,7 @@ void Model::Impl::spec_use_slot(int s) {
 void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
   in.spec = mode;
   in.thresh = c.thresh;
-  in.max_drafts = std::max(0, std::min(ops::kDrafts, c.max_drafts));
+  in.max_drafts = std::max(0, std::min(dspark::draft_rows(), c.max_drafts));  // blk7: the one-session pass's rows
   in.pos_end = std::min(c.pos_end, opt.max_ctx);
   in.force = c.force;
   std::copy(c.probe, c.probe + ops::kDrafts, in.probe);
@@ -1114,6 +1147,7 @@ void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
 }
 
 uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c) {
+  dsk::l2pf_tune_tick();  // DSGB10_L2PF=@FILE
   if (!spec) die("model: launch_spec without bind_spec");
   const int pos_last = pos0 + R - 1;
   if (R < 1 || R > kMaxSessRows || pos0 < 0 || pos_last >= slot_ctx_[cur_slot])  // the switch has kMaxSessRows bodies
@@ -1144,6 +1178,7 @@ uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const 
 }
 
 uint64_t Model::Impl::launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound) {
+  dsk::l2pf_tune_tick();  // DSGB10_L2PF=@FILE
   if (!spec) die("model: launch_verify without bind_spec");
   if (pos_bound < 0) die("model: launch_verify(%d)", pos_bound);
   const uint64_t n = n_steps;
@@ -1177,7 +1212,7 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     const bool has = k < b.n;
     in.sess_on[k] = has && b.on[k] ? 1 : 0;
     in.sess_slot[k] = has ? unit_of[b.slot[k]] : 0;
-    in.scap[k] = has ? std::max(0, std::min(ops::kDrafts, b.cap[k])) : 0;
+    in.scap[k] = has ? std::max(0, std::min(dspark::draft_rows_batch(), b.cap[k])) : 0;  // blk7: a batch pass's rows
     in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
@@ -1219,6 +1254,7 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
 }
 
 uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
+  dsk::l2pf_tune_tick();  // DSGB10_L2PF=@FILE
   spec_batch_check(b, true);
   const uint64_t n = n_steps;
   if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
@@ -1257,6 +1293,7 @@ uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
 }
 
 uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
+  dsk::l2pf_tune_tick();  // DSGB10_L2PF=@FILE
   spec_batch_check(b, false);
   if (b.pos_bound < 0) die("model: launch_verify_batch(%d)", b.pos_bound);
   const uint64_t n = n_steps;
