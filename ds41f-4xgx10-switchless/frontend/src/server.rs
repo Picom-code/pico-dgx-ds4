@@ -852,8 +852,8 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
 }
 
 /// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
-/// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
-/// never sees, so text requests' prefix reuse is untouched.
+/// their spans, in a session separate from the text table. The ordinary-only engine option can
+/// retain completed image sessions in RAM and match the submitted image rows on a later turn.
 async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
     let Some(addr) = app.cfg.vision_addr.clone() else {
@@ -886,6 +886,11 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         stop_ids.push(info.eos_id);
     }
     let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
+    let cache_flag = if std::env::var("DSGB10_ORDINARY_IMAGE_PREFIX_CACHE").as_deref() == Ok("1") {
+        crate::protocol::FLAG_IMAGE_CACHE
+    } else {
+        0
+    };
     let submit = Submit {
         req_id: 0,
         session_id,
@@ -895,7 +900,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: crate::protocol::FLAG_IMAGES | cache_flag | if p.seed.is_some() { FLAG_SEED } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: 0,
         stop_ids: stop_ids.clone(),
@@ -904,7 +909,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     };
     let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
     eprintln!(
-        "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
+        "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id}",
         ids.len()
     );
     Ok(Gen {

@@ -498,6 +498,16 @@ requests and one snapshot skipped, every comparison but one equal, and the two f
 short fork's, whose base had been evicted, so it ran cold (same tokens, `cached` 0, a cold CED
 prefill's log-probability); at the defaults it passes 17 of 17, and `--exact` 9 of 9.
 
+**Opt-in image prefix reuse.** Set `DSGB10_ORDINARY_IMAGE_PREFIX_CACHE=1` in both the frontend
+and the engine to reuse completed image histories on the same frontend connection. The matcher
+checks the token prefix and the position, length and encoded BF16 rows of each overlapping
+image span. A changed span limits the usable prefix to text before that image. Retained image
+state is memory-only, with limits of four completed entries, 128 MiB of encoded rows and
+five idle minutes. Each request still runs the vision encoder.
+
+The suffix-only rank transfer adapts Thomas Kempka's implementation in
+[PR #9](https://github.com/Picom-code/pico-dgx-ds4/pull/9), commit `b271aa2`.
+
 **The disk tier.** A session that leaves the store is spilled to disk rather than freed (unless
 `--disk-gib 0`). Each rank writes its own slice to its own disk: `rank<r>.spill` in `--disk-dir`,
 by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its USB4 SSD) and `~/dsgb10/spill` on the others (NVMe).
