@@ -39,6 +39,13 @@ __global__ void k_route_copy(const int* ridx, const ops::StepIn* in, int L, Rout
   }
 }
 
+// DSGB10_GATE_SEP=1: a kernel that does nothing, launched without PDL between the router gate's GEMV and
+// the MoE (model.cu ffn). At 2-4 rows the gate's 48 CTAs and moe_up's grid otherwise share the SMs while the gate
+// streams its rows; with the gate ended first a tool step is 0.28 / 0.62 / 0.78 ms shorter at 2 / 3 / 4 rows.
+__global__ void k_gate_sep(const float* gl, int* sink) {
+  if (sink && gl[blockIdx.x * kExperts + threadIdx.x] > 3.0e38f) *sink = 1;
+}
+
 __global__ void route_rotate(float* gl, int shift, int group) {
   __shared__ float s[kExperts];
   float* g = gl + (size_t)blockIdx.x * kExperts;
@@ -165,6 +172,11 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
     std::printf("model: %d session slots, %d of %d positions and %d of %d (%d units)\n", nslots, nbig, opt.max_ctx,
                 nslots - nbig, unit_ctx, nunits);
   use_slot(0);
+  if (const char* e = getenv("DSGB10_GATE_SEP")) {
+    if (std::sscanf(e, "%d,%d,%d", &gate_sep, &gate_sep_lo, &gate_sep_hi) < 1 || gate_sep < 0 || gate_sep > 1)
+      die("model: DSGB10_GATE_SEP=%s (MODE[,LO,HI], MODE 0 or 1)", e);
+    if (rank == 0 && gate_sep) std::printf("model: DSGB10_GATE_SEP=%d in steps of %d..%d rows\n", gate_sep, gate_sep_lo, gate_sep_hi);
+  }
   if (const char* rd = getenv("DSGB10_ROUTE_DUMP"); rd && rank == 0) {
     route_ring = dalloc<RouteRec>(kRouteRing);
     route_f = fopen(rd, "wb");
@@ -795,6 +807,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   } else {
     dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
   }
+  if (!wide && gate_sep == 1 && R >= gate_sep_lo && R <= gate_sep_hi) k_gate_sep<<<R, 128, 0, st>>>(gl, nullptr);  // WOA
   if (route_shift) route_rotate<<<R, 128, 0, st>>>(gl, route_shift, route_group);  // bench only
   if (wide) {
     // wide64: DSGB10_WIDE_OEA=K0,KP (default: DSGB10_OEA's K0,KP when that is set) re-routes the wide step's rows

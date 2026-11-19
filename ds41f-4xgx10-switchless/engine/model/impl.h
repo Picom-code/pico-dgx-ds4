@@ -164,6 +164,9 @@ struct Model::Impl {
   int pos_group = 1;         // its runs of consecutive rows
   int route_shift = 0;       // Model::set_route_shift (bench)
   int route_group = 1;       // its rows per rotation
+  // DSGB10_GATE_SEP=MODE[,LO,HI]: in steps of LO..HI rows (default 2..4) the MoE's first kernel does not
+  // start under the router gate's GEMV: MODE 1 launches a no-op kernel between them. 0 / unset: today's launches.
+  int gate_sep = 0, gate_sep_lo = 2, gate_sep_hi = 4;
   uint64_t n_done = 0;       // known finished
   uint64_t last_n = 0;       // the last step waited for
   cudaEvent_t ev_beg[ops::kOutSlots], ev_end[ops::kOutSlots];
