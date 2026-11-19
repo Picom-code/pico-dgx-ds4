@@ -1097,6 +1097,13 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int rows) {
   dsk::MoeCfg mc{};
   mc.down = 4;
   const size_t rows_bytes = (size_t)nd * kDim * 2;
+  // the pass's prefetch sites (Comm::prefetch; nothing unless DSGB10_L2PF names "d:" budgets)
+  auto pf_attn = [&](int site, const BlockW& w) {  // a block's attention weights, in the order it reads them
+    const void* const p[4] = {w.wq_a, w.wkv, w.wq_b, w.wo_a};
+    const size_t n[4] = {(size_t)320 * kDim, (size_t)128 * kDim, (size_t)8192 * kQLora, (size_t)2048 * 4096};
+    comm_->prefetch(site, p, n, 4, s);
+  };
+  pf_attn(0, w_.b[0]);
   launch(draft_prep_kernel, dim3(nd), dim3(kDim / 8), 0, s, true, token, (const int*)b.start, w_.embed, b.xa,
          b.pos, b.lo, b.hi, b.pre, ids_);
   for (int i = 0; i < kBlocks; ++i) {
@@ -1124,6 +1131,12 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int rows) {
     tap(taps.attn_o[i], b.o, (size_t)nd * 8192 * 2, s);
     dsk::gemv_woa(bf(b.o), nd, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s, b.oq, b.os);
     dsk::gemv_fp8(b.oq, b.os, nd, w.wo_b, w.wo_b_s, kDim, 2048, bf(b.part), cob, s);
+    {  // draft-pass prefetch site 1: the router rows and the shared expert, under the all-reduce and the FFN's mHC front
+      const void* const p[4] = {w.gate_all, w.moe.sh_w1, w.moe.sh_w3, w.moe.sh_w2};
+      const size_t n[4] = {w.gate_all ? (size_t)kExperts * kDim * 2 : 0, (size_t)576 * kDim, (size_t)576 * kDim,
+                           (size_t)kDim * 576};
+      comm_->prefetch(1, p, n, 4, s);
+    }
     comm_->all_reduce(b.part, false, b.sub, (size_t)nd * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
     tap(taps.attn_out[i], b.sub, rows_bytes, s);
     attn::hc_post(b.sub, b.xa, b.post, b.comb, nd, b.xb, s, true);
@@ -1146,6 +1159,13 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int rows) {
     tap(taps.route_idx[i], b.idx, nd * kTopKPad * 4, s);
     tap(taps.route_w[i], b.wts, nd * kTopKPad * 4, s);
     dsk::moe(b.xq, b.xs, nd, b.idx, b.wts, w.moe, b.moe_ws, b.ymoe, mc, s);
+    if (i + 1 < kBlocks) {  // draft-pass prefetch site 2: the next block's attention weights, under the all-reduce and its mHC front
+      pf_attn(2, w_.b[i + 1]);
+    } else {  // draft-pass prefetch site 3: the head the pass reads (the same choice as below)
+      const void* const p[1] = {w_.head4 ? w_.head4 : w_.head8 ? w_.head8 : w_.head_coded ? w_.head_coded : w_.head};
+      const size_t n[1] = {w_.head4 ? (size_t)vrows_ * kDim / 2 : w_.head8 ? (size_t)vrows_ * kDim : (size_t)8 << 20};
+      comm_->prefetch(3, p, n, 1, s);
+    }
     comm_->all_reduce(b.ymoe, true, b.sub, (size_t)nd * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
     tap(taps.ffn_out[i], b.sub, rows_bytes, s);
     attn::hc_post(b.sub, b.xb, b.post, b.comb, nd, b.xa, s, true);
@@ -1183,6 +1203,7 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int rows) {
     launch(cf_mlp_kernel, dim3(1), dim3(32), 0, s, true, (const float*)cf_grec_, (const float*)cf_w_, conf_, cf_dbg_, cf_raw_,
            cf_tail_[0], cf_tail_[1]);
   }
+  comm_->prefetch_join(s);
 }
 
 void Draft::enable_cf(const float* w, int dbg) {

@@ -516,8 +516,30 @@ class RingComm final : public dspark::Comm {
     if (rows < 1 || rows % 2) die("spec: argmax_rows of %d candidates", rows);
     comm::argmax_rows(ch_, reinterpret_cast<const comm::ArgMax*>(src), reinterpret_cast<comm::ArgMax*>(dst), rows, s);
   }
+  // the draft pass's prefetch on the model's L2-prefetch stream (set_pf; without it, nothing)
+  void set_pf(cudaStream_t side) {
+    pf_s_ = side;
+    CUDA_CHECK(cudaEventCreateWithFlags(&pf_fork_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming));
+  }
+  void prefetch(int site, const void* const* p, const size_t* n, int count, cudaStream_t s) override {
+    if (!pf_s_ || !dsk::l2pf_draft_on()) return;
+    CUDA_CHECK(cudaEventRecord(pf_fork_, s));
+    CUDA_CHECK(cudaStreamWaitEvent(pf_s_, pf_fork_, 0));
+    dsk::l2pf_draft(p, n, count, site, pf_s_);
+    pf_used_ = true;
+  }
+  void prefetch_join(cudaStream_t s) override {
+    if (!pf_used_) return;
+    CUDA_CHECK(cudaEventRecord(pf_join_, pf_s_));
+    CUDA_CHECK(cudaStreamWaitEvent(s, pf_join_, 0));
+    pf_used_ = false;
+  }
 
  private:
+  cudaStream_t pf_s_ = nullptr;
+  cudaEvent_t pf_fork_ = nullptr, pf_join_ = nullptr;
+  bool pf_used_ = false;
   static constexpr uint32_t kBlock = 131072;  // wide64: the one-pass drafter's 80 rows of wq_a + wkv (72 KB)
   comm::DevChannel ch_;
   uint32_t *send_, *recv_;
@@ -552,6 +574,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   spec = std::make_unique<Spec>();
   Spec& sp = *spec;
   sp.comm = std::make_unique<RingComm>(ch);
+  if (sc) sp.comm->set_pf(sc);  // DSGB10_L2PF "d:" budgets (default: nothing launched)
   sp.rope = dalloc<float2>((size_t)(opt.max_ctx + 8) * 32);
   attn::rope_table_build(sp.rope, opt.max_ctx + 8, false, st);
   // the drafter's mHC projections and router rows whole on every rank (dspark.h BlockW): 9 collectives fewer

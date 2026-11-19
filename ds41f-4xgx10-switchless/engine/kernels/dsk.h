@@ -361,6 +361,15 @@ void l2pf_window(const L2pfTarget (&t)[kL2pfTargets], int layer, int window, int
 // "cN:key=value,..." for row class N (0: 1 row, 1: 2-8 rows, 2: 9-16 rows, 3: 17+ rows) with keys
 // plan=wqa+wqb+woa+wob+gate+sh13+sh2, w1=A+B, w2=A+B, w3=A+B, w4=A+B (us = A + B (min(R, rcap) - 1)), w3i=US (W3 on the
 // indexer's layers), rcap=N, u1..u4=TARGET (the window prefetches no target after it). A class not named keeps the stock plan and budgets. It writes nothing the model reads.
+// more SPEC keys, all defaulting to today's behaviour: pN=US (window N's prefetch goes on for US after
+// its collective ARRIVED, on the targets from qN on; q1 wqb, q2 woa, q4 sh13 by default; pr=ROWS: only in steps of at
+// most ROWS rows) and the item
+// "d:d0=US,da=US,db=US,dh=US": the one-session DRAFT pass's sites (us of prefetch at the pace; 0 = nothing): d0 block 0's
+// attention weights from the pass's start, da a block's gate + shared expert under its attention all-reduce and mHC
+// front, db the next block's attention weights under the MoE all-reduce and the next mHC front, dh the draft head.
+inline constexpr int kL2pfDraftSites = 4;
+bool l2pf_draft_on();
+bool l2pf_draft(const void* const* p, const size_t* n, int count, int site, cudaStream_t s);
 void l2pf_tune_env(int rank);
 void l2pf_tune_poll();
 void l2pf_tune_tick();  // every 8th call polls (a decode step's launch, on every rank)
