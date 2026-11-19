@@ -5,7 +5,7 @@
 //! matched to a session for prefix reuse, sent to rank 0, and the streamed ids are decoded, checked
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
-use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
+use crate::encoding::{api_tool_name, encode_messages_with_tail, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub default_effort: i64,
     /// The chat encoding: the weights' own encoding.py (V4.1, or 1017's).
     pub encoding: Encoding,
+    /// Enable the experimental tail renderer for unmarked 1017 requests.
+    pub allow_tail_cache_render: bool,
     pub default_thinking: bool,
     pub default_temperature: f32,
     pub default_top_p: f32,
@@ -514,7 +516,9 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
     o.encoding = cfg.encoding;
-    let (prompt, images) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    let tail_cache_render = cfg.allow_tail_cache_render && !r.contains_key("cache_render_format");
+    let (prompt, images) = encode_messages_with_tail(&messages, &o, tail_cache_render)
+        .map_err(|e| format!("cannot encode messages: {e}"))?;
     if images.len() > crate::vision::MAX_IMAGES {
         return Err(format!("at most {} images per request", crate::vision::MAX_IMAGES));
     }
@@ -1117,6 +1121,7 @@ pub(crate) mod tests {
             max_tokens_cap: 32768,
             default_effort: 75,
             encoding: Encoding::V41,
+            allow_tail_cache_render: false,
             default_thinking: false,
             default_temperature: 1.0,
             default_top_p: 0.95,
@@ -1196,6 +1201,145 @@ pub(crate) mod tests {
 
     fn request() -> Value {
         json!({"messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[test]
+    fn tail_cache_keeps_history_and_moves_only_the_active_effort() {
+        use crate::encoding::{ASSISTANT_SP, BOS, EOS, SYSTEM_SP, THINK_END, THINK_START, USER_SP};
+
+        let stock = ServerConfig { encoding: Encoding::V41_1017, ..cfg() };
+        let tail = ServerConfig { allow_tail_cache_render: true, ..stock.clone() };
+        let mut req = json!({
+            "reasoning_effort": "low",
+            "messages": [
+                {"role": "system", "content": "instructions"},
+                {"role": "user", "content": "first user"},
+                {"role": "assistant", "content": "first answer", "reasoning_content": "replayed reasoning"},
+                {"role": "user", "content": "active user"}
+            ]
+        });
+        let effort_hint = |budget| {
+            format!("Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n")
+        };
+        let original = format!(
+            "{BOS}{SYSTEM_SP}{}instructions{USER_SP}first user{ASSISTANT_SP}{THINK_END}\
+             first answer{EOS}{USER_SP}active user{ASSISTANT_SP}{THINK_START}",
+            effort_hint(50),
+        );
+        assert_eq!(prepare(&stock, &req).unwrap().prompt, original);
+
+        let prefix = format!(
+            "{BOS}{SYSTEM_SP}instructions{USER_SP}first user{ASSISTANT_SP}{THINK_START}\
+             replayed reasoning{THINK_END}first answer{EOS}{USER_SP}active user"
+        );
+        for (tier, budget) in [("low", 50), ("max", 100)] {
+            req["reasoning_effort"] = json!(tier);
+            assert_eq!(prepare(&tail, &req).unwrap().prompt, format!(
+                "{prefix}{SYSTEM_SP}{}{ASSISTANT_SP}{THINK_START}", effort_hint(budget),
+            ));
+        }
+        req["thinking"] = json!({"type": "disabled"});
+        assert_eq!(prepare(&tail, &req).unwrap().prompt, format!("{prefix}{ASSISTANT_SP}{THINK_END}"));
+        req["messages"].as_array_mut().unwrap().extend([
+            json!({"role": "assistant", "content": "active answer"}),
+            json!({"role": "user", "content": "third user"}),
+        ]);
+        assert_eq!(prepare(&tail, &req).unwrap().prompt, format!(
+            "{prefix}{ASSISTANT_SP}{THINK_END}active answer{EOS}{USER_SP}third user{ASSISTANT_SP}{THINK_END}"
+        ));
+    }
+
+    #[test]
+    fn tail_cache_uses_stock_for_other_encodings_markers_and_unsupported_history() {
+        let stock = ServerConfig { encoding: Encoding::V41_1017, ..cfg() };
+        let tail = ServerConfig { allow_tail_cache_render: true, ..stock.clone() };
+        let mut req = json!({
+            "reasoning_effort": "high",
+            "messages": [
+                {"role": "user", "content": "first user"},
+                {"role": "assistant", "content": "first answer", "reasoning_content": "replayed reasoning"},
+                {"role": "user", "content": "active user"}
+            ]
+        });
+        let v41_tail = ServerConfig { allow_tail_cache_render: true, ..cfg() };
+        assert_eq!(prepare(&v41_tail, &req).unwrap().prompt, prepare(&cfg(), &req).unwrap().prompt);
+
+        let original = prepare(&stock, &req).unwrap().prompt;
+        for marker in [json!("deepseek-turn-v1"), json!("unknown"), Value::Null, json!(false)] {
+            let mut marked = req.clone();
+            marked["cache_render_format"] = marker;
+            assert_eq!(prepare(&tail, &marked).unwrap().prompt, original);
+        }
+
+        req["messages"][1]["reasoning_content"] = json!({"unsupported": true});
+        assert_eq!(prepare(&tail, &req).unwrap().prompt, prepare(&stock, &req).unwrap().prompt);
+        req["messages"].as_array_mut().unwrap().pop();
+        assert_eq!(prepare(&tail, &req).unwrap().prompt, prepare(&stock, &req).unwrap().prompt);
+    }
+
+    #[test]
+    fn tail_cache_applies_default_effort_after_sorted_tool_results() {
+        use crate::encoding::{ASSISTANT_SP, SYSTEM_SP, THINK_START, USER_SP};
+
+        let stock = ServerConfig { encoding: Encoding::V41_1017, default_thinking: true, default_effort: 62, ..cfg() };
+        let tail = ServerConfig { allow_tail_cache_render: true, ..stock.clone() };
+        let mut req = json!({
+            "tools": [{"type": "function", "function": {"name": "demo::lookup", "parameters": {"type": "object"}}}],
+            "messages": [
+                {"role": "user", "content": "lookup"},
+                {"role": "assistant", "reasoning_content": "lookup rationale", "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "demo::lookup", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "demo::lookup", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_b", "content": "second result"},
+                {"role": "tool", "tool_call_id": "call_a", "content": "first result"}
+            ]
+        });
+        let rendered = prepare(&tail, &req).unwrap();
+        assert_eq!(rendered.mode, ThinkingMode::Thinking);
+        assert!(rendered.prompt.contains("lookup rationale</think>"));
+        assert_eq!(rendered.prompt.matches("invoke name=\"demo::lookup\"").count(), 2);
+        assert!(rendered.prompt.contains(&format!(
+            "{USER_SP}<tool_result>first result</tool_result>\n\n<tool_result>second result</tool_result>\
+             {SYSTEM_SP}Reasoning Effort: 62 "
+        )));
+        assert!(rendered.prompt.ends_with(&format!("\n\n{ASSISTANT_SP}{THINK_START}")));
+        assert_eq!(rendered.prompt.matches("Reasoning Effort:").count(), 1);
+
+        req["messages"][2]["tool_call_id"] = json!("orphaned");
+        assert_eq!(prepare(&tail, &req).unwrap().prompt, prepare(&stock, &req).unwrap().prompt);
+    }
+
+    #[test]
+    fn tail_cache_keeps_stock_images_and_placeholder_order() {
+        use crate::encoding::{ASSISTANT_SP, IMAGE_PLACEHOLDER, SYSTEM_SP, THINK_START, USER_SP};
+
+        let stock = ServerConfig { encoding: Encoding::V41_1017, vision_addr: Some("127.0.0.1:1".into()), ..cfg() };
+        let tail = ServerConfig { allow_tail_cache_render: true, ..stock.clone() };
+        let req = json!({
+            "reasoning_effort": "high",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "first image"},
+                    {"type": "image_url", "image_url": {"url": "synthetic-first"}}
+                ]},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "second image"},
+                    {"type": "image_url", "image_url": {"url": "synthetic-second"}}
+                ]}
+            ]
+        });
+        let rendered = prepare(&tail, &req).unwrap();
+        assert_eq!(rendered.images, prepare(&stock, &req).unwrap().images);
+        assert_eq!(rendered.images, [
+            json!({"type": "image", "url": "synthetic-first"}),
+            json!({"type": "image", "url": "synthetic-second"}),
+        ]);
+        let first_slot = format!("{USER_SP}first image\n\n{IMAGE_PLACEHOLDER}{ASSISTANT_SP}");
+        let second_slot = format!("{USER_SP}second image\n\n{IMAGE_PLACEHOLDER}{SYSTEM_SP}Reasoning Effort: 75 ");
+        assert!(rendered.prompt.find(&first_slot).unwrap() < rendered.prompt.find(&second_slot).unwrap());
+        assert!(rendered.prompt.ends_with(&format!("\n\n{ASSISTANT_SP}{THINK_START}")));
     }
 
     /// A server started with --thinking.
