@@ -128,6 +128,29 @@ void sim_fp8_l2(uint8_t* w, int N, int K, cudaStream_t st);
 // main_hidden [rows][15360] (rows <= kMaxHidden: a step's; accept() reads at most kMaxAcc of them), slot = layer - 37.
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s);
 
+// couple (DSGB10_GCOUPLE; Draft::set_couple): Gumbel-coupled drafts for sampled sessions on the Gumbel path. A session's
+// sampling as the runner's step input holds it (ops::StepSamp's layout; spec.cu asserts it), entry k's at samp[k].
+// For an entry with temperature T > 0 and the kNoiseGumbel bit in top_k, the Markov chain's pick at depth j is
+//   argmax over the WHOLE vocabulary of  dl[j][id] / (T * Td[j]) + g(seed, position of that draft's verify row, id),
+// g the request's own noise (model/sample.cu's hash: the row that verifies the draft adds the same g to the full model's
+// logits). The drafter does not know the full model's kept (top-p) set, so the pick is not restricted to a set; Td < 1
+// sharpens the drafter's distribution instead, which keeps its tail from winning (offline: Td 0.8 is within half a
+// point of a pick restricted to the drafter's own nucleus). Each depth conditions on the coupled pick before it (the
+// chain's token, the Markov embedding the confidence head reads). Every draft is still verified by the sampler: with
+// a given noise the emitted tokens are the same with any drafts; only how many are accepted changes.
+// Other entries (greedy, or not on the Gumbel path) keep the argmax of dl, bit for bit.
+struct NoiseSamp {
+  uint64_t seed;
+  float temperature;
+  float top_p;
+  int32_t top_k;
+  int32_t n_top;
+};
+inline constexpr int32_t kNoiseGumbel = 1 << 30;
+struct CoupleTd {
+  float inv[7];  // 1 / Td per depth (kDraft entries)
+};
+
 // A rank's argmax candidate over its vocab slice (id: the global token id).
 struct Cand {
   float v;
@@ -277,6 +300,10 @@ class Draft {
   // the 5 depths replaces confidence() / survival(). w: kCfWords floats (mu, sd, w1, b1, w2, b2, a), copied. Before any
   // capture of draft(). dbg 1 / 2: survival() carries the margins / the log p instead (measurement only).
   void enable_cf(const float* w, int dbg);
+  // couple: coupled drafts from now on (before any capture of draft() / draft_batch()): samp the device array of the
+  // step's sessions' sampling (entry k's at samp[k]; draft() reads samp[0]), td [kDraft] the drafter temperature
+  // factor per depth (> 0). Never called: the passes are today's (no kernel reads samp).
+  void set_couple(const NoiseSamp* samp, const float* td);
   const float* cf_raw() const { return cf_w_ ? cf_raw_ : nullptr; }  // device [16]: the MLP's inputs of the last draft()
 
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"; ProbeOut): enable_probe() once, before any capture
@@ -320,6 +347,10 @@ class Draft {
   float *cf_w_ = nullptr, *cf_rec_ = nullptr, *cf_grec_ = nullptr, *cf_raw_ = nullptr;  // stack4: the confidence MLP (enable_cf)
   int cf_dbg_ = 0;
   int nd_cur_ = 0;  // blk7: the rows of the draft() being captured (mix())
+  const NoiseSamp* cpl_ = nullptr;  // couple: null = off
+  CoupleTd cpl_td_{};
+  float cpl_cf_[2] = {1.f, 0.f}, cpl_cfb_[2] = {1.f, 0.f};  // couple: the gate's logit for coupled drafts, A lg + B
+  bool cpl_cf_on_ = false, cpl_cfb_on_ = false;
   float cf_tail_[2] = {1.f, 0.f};  // blk7 (DSGB10_CF_TAIL): the gate's logit of drafts past the MLP's depths, A c + B
   Buf* b_;
   int* ids_;

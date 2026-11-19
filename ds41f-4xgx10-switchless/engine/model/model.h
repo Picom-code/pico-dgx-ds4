@@ -27,6 +27,25 @@ struct Sampling {
 };
 using ops::SampleOut;
 
+// couple: which sampled requests go on the Gumbel path (ops::kSampGumbel in Sampling::top_k).
+//   DSGB10_GSAMPLE unset / 0: none: every request is sampled as before this change.
+//   1: sampled requests whose client sent NO seed (there is no earlier text for such a request to be equal to), and
+//      sampled requests without top-p / top-k (their sampler is the Gumbel-max one already; only their drafts change).
+//      A seeded top-p / top-k request keeps today's sampler and today's text.
+//   2: every sampled request (a seeded top-p / top-k request then gives ANOTHER text for its seed than before, from the
+//      same distribution, and the same one again from then on).
+// On the path: a truncated row takes the Gumbel-max winner among today's kept tokens; with DSGB10_GCOUPLE the drafts
+// are picked by the request's own noise. Greedy requests are never on it.
+int gsample_mode();  // model.cu: DSGB10_GSAMPLE, read once
+inline int32_t gsample_top_k(int32_t top_k, float temperature, float top_p, bool seeded) {
+  int32_t k = top_k > 0 ? (top_k < ops::kSampGumbel ? top_k : ops::kSampGumbel - 1) : 0;
+  const int mode = gsample_mode();
+  if (mode <= 0) return top_k > 0 ? k : top_k;
+  const bool trunc = k > 0 || top_p < 1.f;
+  if (temperature > 0.f && (mode >= 2 || !seeded || !trunc)) k |= ops::kSampGumbel;
+  return k;
+}
+
 struct Sink;
 
 // A step of rows from several sessions (docs/batching.md, B2; Model::launch_batch). Row r is position

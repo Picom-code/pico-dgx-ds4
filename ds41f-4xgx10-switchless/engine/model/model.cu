@@ -47,6 +47,19 @@ __global__ void route_rotate(float* gl, int shift, int group) {
   for (int i = threadIdx.x; i < kExperts; i += blockDim.x) g[(i + shift * (blockIdx.x / group)) % kExperts] = s[i];
 }
 
+}  // namespace
+int gsample_mode() {
+  static const int v = [] {
+    const char* e = getenv("DSGB10_GSAMPLE");
+    const int m = e && *e ? atoi(e) : 0;
+    if (m < 0 || m > 2) die("DSGB10_GSAMPLE=%s: 0, 1 or 2", e);
+    if (m) std::fprintf(stderr, "sample: DSGB10_GSAMPLE=%d: %s on the Gumbel path (top-p / top-k rows: Gumbel-max among the kept tokens)\n", m,
+                        m == 1 ? "sampled requests without a client seed" : "every sampled request");
+    return m;
+  }();
+  return v;
+}
+namespace {
 ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
 
 // night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,

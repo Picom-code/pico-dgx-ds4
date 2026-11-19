@@ -828,7 +828,7 @@ int main(int argc, char** argv) {
     c.tokens[0] = tok0;
     c.sp.temperature = a.temp;
     c.sp.top_p = a.top_p;
-    c.sp.top_k = a.top_k;
+    c.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true);  // couple: the tools' seed is a client's
     c.sp.seed = a.seed;
     c.max_new = n;
     c.limit = a.max_ctx;
@@ -1048,7 +1048,7 @@ int main(int argc, char** argv) {
       for (size_t k = 0; k < ss.size(); ++k) {
         BatchEntry& x = e[k];
         x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.max_new = per, x.limit = a.max_ctx;
-        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
         t[k].assign(toks.begin() + ss[k].ctx, toks.begin() + ss[k].ctx + per);
       }
       Cmd c{};
@@ -1097,7 +1097,7 @@ int main(int argc, char** argv) {
       BatchEntry& x = e[k];
       x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.token = ss[k].first;
       x.max_new = a.steps, x.limit = a.max_ctx;
-      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
     }
     Cmd c{};
     c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // B3 (--spec): drafts across the sessions, every one to its end

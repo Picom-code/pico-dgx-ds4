@@ -343,8 +343,29 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
 
 }  // namespace
 
-DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on0) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
+  // couple (DSGB10_BITS_LOG=FILE, measurement only, rank 0; EXACT's format): every token a one-session run emits with the
+  // bits of its logit and of its log-probability, and the step that computed it (0, the step's rows, the row)
+  static FILE* const blog = [] {
+    const char* v = getenv("DSGB10_BITS_LOG");
+    return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
+  }();
+  OnSample onb;
+  if (blog && on0) {
+    std::fprintf(blog, "# req pos0 %d max_new %d temp %.3f seed %llu\n", c.pos0, c.max_new, c.sp.temperature,
+                 (unsigned long long)c.sp.seed);
+    onb = [&](int i, const model::SampleOut& o, int row) {
+      uint32_t vb, lb;
+      std::memcpy(&vb, &o.row[row].value, 4), std::memcpy(&lb, &o.row[row].logprob, 4);
+      std::fprintf(blog, "%d %d %08x %08x %d %d %d\n", i, o.row[row].token, vb, lb, 0, o.step_rows, row);
+      on0(i, o, row);
+    };
+  }
+  const OnSample& on = blog && on0 ? onb : on0;
+  struct BlogFlush {
+    ~BlogFlush() { if (blog) std::fflush(blog); }
+  } blog_flush;
   if (c.spec) return spec_loop(m, c, wd, on);
   auto may_run = [&](int i) { return i <= c.max_new && c.pos0 + i < c.limit; };
   // a step at position pos; the window snapshot at pos first (the ring then holds pos - 128 .. pos - 1)

@@ -33,11 +33,16 @@ constexpr int kLowRows = 8;
 constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : R <= kDecodeRows ? kDecodeRows : kMaxRows; }
 constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
 static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
+// couple (DSGB10_GSAMPLE, model.h gsample_top_k): a sampled session on the Gumbel path carries this bit in StepSamp::top_k
+// (its real top-k in the bits below). Its truncated (top-p / top-k) rows then take the Gumbel-max winner among the SAME kept
+// tokens today's sampler keeps (noise hashed from seed, position and token id, as the untruncated sampler's), and its
+// drafts may be coupled (DSGB10_GCOUPLE, dspark.h). Never set unless DSGB10_GSAMPLE is: every path is then today's.
+constexpr int32_t kSampGumbel = 1 << 30;
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
   float top_p;        // 1: off
-  int32_t top_k;      // 0: off
+  int32_t top_k;      // 0: off; couple: bit kSampGumbel set (with top_k > 0 as an int): the session is on the Gumbel path
   int32_t n_top;      // top logprobs per row, 0..kTopLogprobs
 };
 struct StepIn {

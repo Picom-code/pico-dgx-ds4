@@ -7,6 +7,7 @@
 // them, and spec_next, which picks the next step's drafts by the confidence head's survival and publishes
 // the step. The device decides the next step's rows, tokens and positions, so the host queues it before
 // this one ends; every rank decides the same from the same bits.
+#include <cstddef>
 #include "model/spec.h"
 
 #include <algorithm>
@@ -716,6 +717,30 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
     const int dbg = getenv("DSGB10_CF_DBG") ? atoi(getenv("DSGB10_CF_DBG")) : 0;
     sp.draft->enable_cf(w.data(), dbg);
     std::fprintf(stderr, "spec: rank %d: confidence MLP %s (hash %08x, dbg %d) for one-session drafts\n", rank, path.c_str(), h, dbg);
+  }
+  // couple: DSGB10_GCOUPLE=Td[,Td2,..] (the drafter temperature factor per depth, the last one repeats; unset or 0: off):
+  // sessions on the Gumbel path (DSGB10_GSAMPLE; ops::kSampGumbel) get Gumbel-coupled drafts (dspark.h)
+  if (const char* e = getenv("DSGB10_GCOUPLE"); e && *e && atof(e) > 0.) {
+    static_assert(sizeof(dspark::NoiseSamp) == sizeof(ops::StepSamp) && offsetof(dspark::NoiseSamp, seed) == offsetof(ops::StepSamp, seed) &&
+                  offsetof(dspark::NoiseSamp, temperature) == offsetof(ops::StepSamp, temperature) &&
+                  offsetof(dspark::NoiseSamp, top_k) == offsetof(ops::StepSamp, top_k) && dspark::kNoiseGumbel == ops::kSampGumbel,
+                  "dspark::NoiseSamp is ops::StepSamp");
+    float td[dspark::kDraft];
+    int n = 0;
+    for (const char* p = e; n < dspark::kDraft && *p;) {
+      char* end = nullptr;
+      const float v = std::strtof(p, &end);
+      if (end == p || !(v > 0.f) || v > 4.f) die("spec: DSGB10_GCOUPLE=%s: Td[,Td2,..], each in (0, 4]", e);
+      td[n++] = v;
+      p = *end == ',' ? end + 1 : end;
+      if (*end && *end != ',') die("spec: DSGB10_GCOUPLE=%s", e);
+    }
+    for (int j = n; j < dspark::kDraft; ++j) td[j] = td[n - 1];
+    if (!in_d) die("spec: DSGB10_GCOUPLE before the step input exists");
+    sp.draft->set_couple(reinterpret_cast<const dspark::NoiseSamp*>(in_d->samp), td);
+    if (rank == 0)
+      std::fprintf(stderr, "spec: coupled drafts for sessions on the Gumbel path (DSGB10_GCOUPLE): Td %.3g %.3g %.3g %.3g %.3g %.3g %.3g\n",
+                   td[0], td[1], td[2], td[3], td[4], td[5], td[6]);
   }
   static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);

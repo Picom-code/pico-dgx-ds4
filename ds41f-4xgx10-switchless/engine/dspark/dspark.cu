@@ -48,6 +48,22 @@ const __nv_bfloat16* bf(const uint16_t* p) { return reinterpret_cast<const __nv_
 
 __device__ __forceinline__ bool better(float v, int id, float bv, int bid) { return v > bv || (v == bv && id < bid); }
 
+// couple: the sampler's noise (model/sample.cu: mix64, unit and the two constants must stay the same there and here)
+__device__ __forceinline__ uint64_t nz_mix64(uint64_t x) {
+  x ^= x >> 31;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 29;
+  x *= 0x94D049BB133111EBull;
+  x ^= x >> 32;
+  return x;
+}
+__device__ __forceinline__ float nz_gumbel(uint64_t seed, int pos, int id) {
+  const uint64_t base = nz_mix64(seed) ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ull);
+  const uint64_t h = nz_mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull);
+  const float u = ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+  return -logf(-logf(u));
+}
+
 // ---- kernels ------------------------------------------------------------------------------------------------
 
 // torch's bf16 mean over the 4 copies: an fp32 sum in copy order, times 1/4, rounded. Block (c, r): 256 columns.
@@ -195,7 +211,8 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
                                                      const uint16_t* membed, const uint8_t* mhead,
                                                      const uint8_t* mscale, const float* logits, float* dl,
                                                      float* bias_out, uint16_t* emb, Cand* cta, Cand* cand,
-                                                     unsigned* counter, int vbase, const int* ent) {
+                                                     unsigned* counter, int vbase, const int* ent,
+                                                     const NoiseSamp* nz, const int* start, CoupleTd ctd) {
   __shared__ float e[kMarkov];
   __shared__ Cand red[8];
   __shared__ bool last;
@@ -203,6 +220,7 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = blockIdx.x * 8 + warp;
   const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * g_ndb + j : j, cs = BATCH ? kCandStride : 1;
+  const int en = BATCH ? ent[q] : 0;  // couple: the entry (its sampling, its anchor)
   if constexpr (BATCH) {
     ids += 8 * ent[q];
     cta += q * kMarkovCtas;
@@ -260,6 +278,11 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
     if (bias_out) bias_out[(size_t)jr * kVocabRank + row] = acc;
   }
   int id = vbase + row;
+  if (nz) {  // couple: a sampled entry on the Gumbel path picks by its own noise (the lanes that reach the reduction)
+    const NoiseSamp sp = nz[en];
+    if (sp.temperature > 0.f && sp.top_k > 0 && (sp.top_k & kNoiseGumbel) && (lane & 3) == 0)
+      v = v * (ctd.inv[j] / sp.temperature) + nz_gumbel(sp.seed, start[en] + 1 + j, id);
+  }
 #pragma unroll
   for (int o = 16; o >= 4; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffffffu, v, o);
@@ -308,13 +331,15 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
 template <bool BATCH>
 __global__ void __launch_bounds__(32 * kDraft) conf_kernel(const uint16_t* hx, const uint16_t* emb,
                                                            const uint16_t* w, const Cand* gcand, int* ids,
-                                                           float* conf, const int* ent) {
+                                                           float* conf, const int* ent, const NoiseSamp* nz, float ca,
+                                                           float cb) {
   __shared__ float c[kDraft];
   pdl_trigger();
   pdl_wait();
   const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int q = BATCH ? blockIdx.x : 0, jr = BATCH ? q * g_ndb + j : j, cs = BATCH ? kCandStride : 1;
   const int nd = BATCH ? g_ndb : g_nd1;
+  const int en = BATCH ? ent[q] : 0;
   if constexpr (BATCH) {
     const int e = ent[q];
     ids += 8 * e;
@@ -341,8 +366,14 @@ __global__ void __launch_bounds__(32 * kDraft) conf_kernel(const uint16_t* hx, c
   __syncthreads();
   if (threadIdx.x == 0) {
     float p = 1.f;
+    // couple (DSGB10_GCOUPLE_CFB): a coupled entry's survival from A c + B (conf[] keeps the head's logit)
+    bool cpl = false;
+    if (nz) {
+      const NoiseSamp sp = nz[en];
+      cpl = sp.temperature > 0.f && sp.top_k > 0 && (sp.top_k & kNoiseGumbel);
+    }
     for (int i = 0; i < nd; ++i) {
-      p *= 1.f / (1.f + expf(-c[i]));
+      p *= 1.f / (1.f + expf(-(cpl ? __fmaf_rn(ca, c[i], cb) : c[i])));
       conf[8 + i] = p;
     }
     for (int i = nd; i < kDraft; ++i) conf[8 + i] = 0.f;
@@ -507,10 +538,16 @@ __global__ void __launch_bounds__(1024) cf_scan_kernel(const float* dl, int vbas
 // Every rank's records (gathered in rank order) and the shipped confidence logits -> the MLP's logits in conf[0..4] and
 // their survival in conf[8..12]. One thread, a fixed order of fp32 operations: the same bits on every rank.
 __global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, int dbg, float* rawout, float tail_a,
-                              float tail_b) {
+                              float tail_b, const NoiseSamp* nz, float ca, float cb) {
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x) return;
+  // couple (DSGB10_GCOUPLE_CF): a coupled session's gate logits are A lg + B (the MLP was fitted on argmax drafts)
+  bool cpl = false;
+  if (nz) {
+    const NoiseSamp sp = nz[0];
+    cpl = sp.temperature > 0.f && sp.top_k > 0 && (sp.top_k & kNoiseGumbel);
+  }
   const int nd = g_nd1;  // blk7: the gathered records are [rank][nd]; the MLP covers the first kCfD depths
   float x[kCfIn], raw[kCfIn], c[kDraft];
   for (int j = kCfD; j < nd; ++j) c[j] = conf[j];
@@ -544,14 +581,16 @@ __global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, in
   }
   float p = 1.f;
   for (int j = 0; j < kCfD; ++j) {
-    const float lg = __fmaf_rn(a[j], c[j], out[j]);
+    float lg = __fmaf_rn(a[j], c[j], out[j]);
+    if (cpl) lg = __fmaf_rn(ca, lg, cb);
     p *= 1.f / (1.f + expf(-lg));
     if (dbg == 0) conf[j] = lg, conf[8 + j] = p;
     else conf[8 + j] = raw[dbg * kCfD + j];
   }
   // blk7: the drafts past the MLP's depths: the shipped confidence logit, scaled (DSGB10_CF_TAIL=A,B: A c + B)
   for (int j = kCfD; j < nd; ++j) {
-    const float lg = __fmaf_rn(tail_a, c[j], tail_b);
+    float lg = __fmaf_rn(tail_a, c[j], tail_b);
+    if (cpl) lg = __fmaf_rn(ca, lg, cb);
     p *= 1.f / (1.f + expf(-lg));
     if (dbg == 0) conf[j] = lg, conf[8 + j] = p;
     else conf[8 + j] = 0.f;
@@ -1190,20 +1229,41 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot, int rows) {
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(vrows_ / 64), dim3(256), 0, s,
            true, j, (const int*)ids_, (const Cand*)b.gcand, inject.ids, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.dl, taps.bias, b.emb,
-           b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr);
+           b.cta, b.cand, b.counter, kVocabRank * rank_, (const int*)nullptr, cpl_, (const int*)b.start, cpl_td_);
     comm_->argmax(b.cand + j, b.gcand + j, s);  // COLLECTIVE: argmax over the ranks' candidates
   }
   tap(taps.markov_embed, b.emb, nd * kMarkov * 2, s);
   launch(conf_kernel<false>, dim3(1), dim3(32 * nd), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.emb,
-         w_.conf, (const Cand*)b.gcand, ids_, conf_, (const int*)nullptr);
+         w_.conf, (const Cand*)b.gcand, ids_, conf_, (const int*)nullptr, cpl_cfb_on_ ? cpl_ : nullptr, cpl_cfb_[0],
+         cpl_cfb_[1]);
   if (cf_w_) {  // stack4: the confidence MLP over the chain's scalars
     launch(cf_scan_kernel, dim3(nd), dim3(1024), 0, s, true, (const float*)b.dl, kVocabRank * rank_, cf_rec_);
     const GatherSeg g{cf_rec_, (size_t)nd * 16, cf_grec_, (size_t)nd * 16, (size_t)nd * 16, 1};
     comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' (max, second, sum exp) per depth
     launch(cf_mlp_kernel, dim3(1), dim3(32), 0, s, true, (const float*)cf_grec_, (const float*)cf_w_, conf_, cf_dbg_, cf_raw_,
-           cf_tail_[0], cf_tail_[1]);
+           cf_tail_[0], cf_tail_[1], cpl_cf_on_ ? cpl_ : nullptr, cpl_cf_[0], cpl_cf_[1]);
   }
   comm_->prefetch_join(s);
+}
+
+void Draft::set_couple(const NoiseSamp* samp, const float* td) {
+  if (!samp) die("dspark::Draft: set_couple without the sessions' sampling");
+  for (int j = 0; j < kDraft; ++j) {
+    if (!(td[j] > 0.f)) die("dspark::Draft: set_couple: Td[%d] = %g", j, td[j]);
+    cpl_td_.inv[j] = 1.f / td[j];
+  }
+  cpl_ = samp;
+  auto ab = [](const char* name, float* v) {
+    const char* e = getenv(name);
+    if (!e || !*e) return false;
+    if (std::sscanf(e, "%f,%f", &v[0], &v[1]) != 2) die("%s=%s: A,B", name, e);
+    return !(v[0] == 1.f && v[1] == 0.f);
+  };
+  cpl_cf_on_ = ab("DSGB10_GCOUPLE_CF", cpl_cf_);
+  cpl_cfb_on_ = ab("DSGB10_GCOUPLE_CFB", cpl_cfb_);
+  if (rank_ == 0 && (cpl_cf_on_ || cpl_cfb_on_))
+    std::fprintf(stderr, "dspark: coupled drafts' gate logit A lg + B: one-session MLP %g, %g (DSGB10_GCOUPLE_CF); shipped head %g, %g (DSGB10_GCOUPLE_CFB)\n",
+                 cpl_cf_[0], cpl_cf_[1], cpl_cfb_[0], cpl_cfb_[1]);
 }
 
 void Draft::enable_cf(const float* w, int dbg) {
@@ -1377,11 +1437,11 @@ void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
     launch(w_.markov8 ? markov_kernel<true, true> : markov_kernel<false, true>, dim3(vrows_ / 64, p.n), dim3(256), 0,
            s, true, j, (const int*)b.bids, (const Cand*)b.bgcand, (const int*)nullptr, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl, (float*)nullptr,
-           b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent);
+           b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent, cpl_, (const int*)b.bstart, cpl_td_);
     comm_->argmax_rows(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, s);  // COLLECTIVE
   }
   launch(conf_kernel<true>, dim3(p.n), dim3(32 * ndb), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
-         w_.conf, (const Cand*)b.bgcand, b.bids, b.bconf, p.ent);
+         w_.conf, (const Cand*)b.bgcand, b.bids, b.bconf, p.ent, cpl_cfb_on_ ? cpl_ : nullptr, cpl_cfb_[0], cpl_cfb_[1]);
 }
 
 // wide64, the one-pass drafter: every entry's rows in one pass (up to kWideEnts entries, kWideRows rows), the dense
@@ -1497,10 +1557,11 @@ void Draft::probe(const int* path, cudaStream_t s) {
     launch(w_.markov8 ? markov_kernel<true, false> : markov_kernel<false, false>, dim3(kMarkovCtas), dim3(256), 0, s,
            true, j, (const int*)ids_, (const Cand*)b.gcand, (const int*)b.pr_forced, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.logits, b.pr_dl, nullptr,
-           b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr);
+           b.pr_emb, b.cta, b.pr_cand, b.counter, vbase, (const int*)nullptr, (const NoiseSamp*)nullptr,
+           (const int*)nullptr, CoupleTd{});
   launch(probe_topk_kernel, dim3(nd), dim3(1024), 0, s, true, (const float*)b.pr_dl, path, vbase, b.pr_rec);
   launch(conf_kernel<false>, dim3(1), dim3(32 * nd), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.pr_emb,
-         w_.conf, (const Cand*)b.pr_cand, b.pr_ids, b.pr_conf, (const int*)nullptr);
+         w_.conf, (const Cand*)b.pr_cand, b.pr_ids, b.pr_conf, (const int*)nullptr, (const NoiseSamp*)nullptr, 1.f, 0.f);
   const GatherSeg g{b.pr_rec, kProbeBytes, b.pr_grec, kProbeBytes, kProbeBytes, 1};
   comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' probe records
   launch(probe_merge_kernel, dim3(1), dim3(32), 0, s, true, (const float*)b.pr_grec, path, (const float*)b.pr_conf,
