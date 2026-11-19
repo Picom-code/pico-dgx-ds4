@@ -69,6 +69,7 @@
 #include <random>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -861,10 +862,11 @@ class Server {
 
   // The restart point for continuing session s (its state live or stored) after a common prefix of p,
   // for a prompt of n positions.
-  Plan choose(const Session& s, bool live, int p, int n) const {
+  Plan choose(const Session& s, bool live, int p, int n, bool after_save = false) const {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
-    p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
+    // A stored session's compressed caches go only as far as its saved pages.
+    if (!live && !after_save) p = std::min(p, info.saved);
     auto consider = [&](int q, int how, int snap) {
       if (q > best.q) best = Plan{q, how, snap};
     };
@@ -884,7 +886,10 @@ class Server {
                                                                  : from_ring(end, std::min(p, n - kReplay), lo, clo, w);
     };
     if (live) consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kLive, -1);
-    if (info.end_pos >= 0) consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
+    if (after_save && info.end_pos != (int)s.hist.size())
+      consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kEnd, -1);
+    else if (info.end_pos >= 0)
+      consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
     for (const int sn : info.snaps) {
       const int q = sn & 1 ? sn - 1 : sn;
       if (q <= p && usable(q, std::find(s.enc_snaps.begin(), s.enc_snaps.end(), sn) == s.enc_snaps.end()))
@@ -1018,38 +1023,71 @@ class Server {
     Session* src = S;
     uint64_t src_id = h.session_id;
     if (!S && h.base_session_id) src = find(h.base_session_id), src_id = h.base_session_id;
-    int image_match = 0;
-    if (!resume && image_cache_enabled(f.rq)) {
-      const double now = now_s();
-      for (auto& [id, candidate] : sess_) {
-        if (candidate.image_spans.empty() || candidate.image_owner.lock() != f.rq.conn ||
-            image_prefix::expired(now, candidate.image_used)) continue;
-        const int common_tokens = std::min(lcp(candidate.hist, prompt), n - 1);
-        const int same = (int)image_prefix::common(common_tokens, fe::kImageDim, candidate.image_spans,
-                                                   candidate.image_rows, f.rq.spans, f.rq.img);
-        if (same > image_match || (same > 0 && same == image_match && candidate.used > src->used)) {
-          image_match = same, src = &candidate, src_id = id;
-        }
-      }
-    }
-    // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
-    // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
-    // state goes to the store, and the fork starts from there in a slot of its own.
     const int need = need_clamped(f.rq);
+    const bool image_request = !resume && !f.rq.spans.empty();
+    int p = 0;
     int s = S ? S->slot : -1;
-    if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;  // a small slot: the session moves to a big one
-    if (!S && src && src->slot >= 0) {
-      if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
-      else persist_slot(src->slot, false);
+    Plan pl;
+    if (image_request && image_cache_enabled(f.rq)) {
+      // Preview each candidate without allocating state or disturbing the slots.
+      // An off-slot live source can save its state, but the store can run out of
+      // room. Materialize only the winner, then check what actually survived.
+      auto select = [&](bool allow_save) {
+        const double now = now_s();
+        bool save_best = false;
+        std::tuple<int, int, uint64_t, uint64_t> best_key{};
+        src = nullptr;
+        p = 0, s = -1, pl = Plan{};
+        for (auto& [id, candidate] : sess_) {
+          if (candidate.image_spans.empty() || flying_.count(id) || f.rq.conn->dead ||
+              candidate.image_owner.lock() != f.rq.conn ||
+              image_prefix::expired(now, candidate.image_used)) continue;
+          const int common_tokens = std::min(lcp(candidate.hist, prompt), n - 1);
+          const int same = (int)image_prefix::common(common_tokens, fe::kImageDim, candidate.image_spans,
+                                                    candidate.image_rows, f.rq.spans, f.rq.img);
+          if (same == 0) continue;
+          const bool live = candidate.slot >= 0 && !keep.count(id) && fits(candidate.slot, need);
+          Plan restart = choose(candidate, live, same, n);
+          bool save = false;
+          if (allow_save && !live && candidate.slot >= 0) {
+            const Plan saved = choose(candidate, false, same, n, true);
+            if (saved.q > restart.q) restart = saved, save = true;
+          }
+          if (restart.q == 0) continue;
+          // A live restart avoids loading compressed pages. At equal stored
+          // positions, prefer one that needs no new save before it can load.
+          const int cost = live ? 0 : save ? 2 : 1;
+          const auto key = std::make_tuple(restart.q, -cost, candidate.used, UINT64_MAX - id);
+          if (key <= best_key) continue;
+          best_key = key;
+          src = &candidate, src_id = id, p = same, s = live ? candidate.slot : -1, pl = restart;
+          save_best = save;
+        }
+        return save_best;
+      };
+      if (select(true)) {
+        persist_slot(src->slot, false);
+        forget_evicted();
+        select(false);
+      }
+    } else if (!image_request) {
+      // The session's own slot, or its base's when the base is idle and fits.
+      // A base in flight keeps its slot and saves its state for the fork.
+      if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;
+      if (!S && src && src->slot >= 0) {
+        if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
+        else persist_slot(src->slot, false);
+      }
     }
     if (s < 0) s = pick_slot(keep, need);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
-    const int p = !resume && !f.rq.spans.empty() ? image_match
-                  : src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
-    const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    if (!image_request && src) {
+      p = std::min(lcp(src->hist, prompt), n - 1);
+      pl = choose(*src, src_live, p, n);
+    }
     const int q = pl.q;
-    if (image_match > 0 && q > 0) src->image_used = now_s();
+    if (image_request && q > 0) src->image_used = now_s();
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
       f.q = q, f.pl = pl;
