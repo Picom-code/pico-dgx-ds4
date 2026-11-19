@@ -28,7 +28,12 @@ struct Session {
     /// ends[i] = byte length of the text of ids[..=i]
     ends: Vec<usize>,
     prompt_len: usize,
+    /// The response still owns the transcript, which it records even on client disconnect.
     busy: bool,
+    /// A cancelled response may record its transcript before the engine stops using the state.
+    pending: bool,
+    dependents: usize,
+    retired: bool,
     last_used: u64,
     /// Unix time of its last request: a saved table leaves out what is older than its limit.
     t_used: u64,
@@ -146,7 +151,7 @@ impl SessionTable {
         let now = unix_now();
         let (mut body, mut n) = (Vec::new(), 0u64);
         for (&id, s) in &self.sessions {
-            if s.busy || now.saturating_sub(s.t_used) > max_age_s {
+            if s.busy || s.pending || s.retired || now.saturating_sub(s.t_used) > max_age_s {
                 continue;
             }
             n += 1;
@@ -243,7 +248,7 @@ impl SessionTable {
             if at != text.len() || tok.decode_bytes(&ids) != text.as_bytes() {
                 continue; // another tokenizer's ids
             }
-            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, last_used, t_used });
+            got.insert(id, Session { text: text.to_string(), ids, ends, prompt_len, busy: false, pending: false, dependents: 0, retired: false, last_used, t_used });
         }
         if r.at != body.len() {
             return Err("a bad body".into());
@@ -262,12 +267,15 @@ impl SessionTable {
         id
     }
 
-    /// Choose the session and the token ids for a prompt. The chosen session is busy until
-    /// `finish` or `abandon`. Returns the plan and the sessions to RELEASE on the engine.
+    /// Reserve a destination and pin its fork base until the engine reaches a terminal event
+    /// (or submission fails). Returns the plan and the sessions to RELEASE on the engine.
     pub fn plan(&mut self, text: &str, tok: &Tokenizer, threads: usize) -> (Plan, Vec<u64>) {
         self.clock += 1;
         let mut top: Option<(u64, usize)> = None;
         for (&id, s) in &self.sessions {
+            if s.retired {
+                continue;
+            }
             let n = common_prefix(text.as_bytes(), s.text.as_bytes());
             if n > 0 && top.map_or(true, |(_, bn)| n > bn) {
                 top = Some((id, n));
@@ -297,7 +305,7 @@ impl SessionTable {
                     }
                 }
                 let ids = s.ids[..cut.1].to_vec();
-                let in_place = !s.busy && shared + PROMPT_SLACK >= s.prompt_len;
+                let in_place = !s.busy && !s.pending && s.dependents == 0 && shared + PROMPT_SLACK >= s.prompt_len;
                 let plan = if in_place {
                     Plan { session_id: sid, base_session_id: 0, reused: cut.1, ids, matched: 0, shared: 0, common: 0 }
                 } else {
@@ -313,6 +321,9 @@ impl SessionTable {
             let s = &self.sessions[&sid].ids;
             plan.common = s.iter().zip(&plan.ids).take_while(|(a, b)| a == b).count();
         }
+        if let Some(base) = self.sessions.get_mut(&plan.base_session_id) {
+            base.dependents += 1;
+        }
         let clock = self.clock;
         let s = self.sessions.entry(plan.session_id).or_insert_with(|| Session {
             text: String::new(),
@@ -320,10 +331,14 @@ impl SessionTable {
             ends: Vec::new(),
             prompt_len: 0,
             busy: false,
+            pending: false,
+            dependents: 0,
+            retired: false,
             last_used: clock,
             t_used: 0,
         });
         s.busy = true;
+        s.pending = true;
         s.last_used = clock;
         s.t_used = unix_now();
         let released = self.evict(plan.session_id);
@@ -331,8 +346,10 @@ impl SessionTable {
     }
 
     /// Record what the session holds after a request: the prompt and the generated ids.
-    pub fn finish(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer) {
-        let Some(s) = self.sessions.get_mut(&session_id) else { return };
+    pub fn finish(&mut self, session_id: u64, prompt_text: &str, prompt_ids: &[u32], generated: &[u32], tok: &Tokenizer) -> Vec<u64> {
+        let Some(s) = self.sessions.get_mut(&session_id).filter(|s| !s.retired) else {
+            return Vec::new();
+        };
         let gen_bytes = tok.decode_bytes(generated);
         let mut text = prompt_text.to_string();
         let mut ids = prompt_ids.to_vec();
@@ -353,12 +370,33 @@ impl SessionTable {
         s.ends = ends;
         s.prompt_len = prompt_text.len();
         s.busy = false;
+        self.evict(0)
     }
 
-    /// The request failed: forget the session (the engine's copy is in an unknown state; the
-    /// caller releases it).
-    pub fn abandon(&mut self, session_id: u64) {
-        self.sessions.remove(&session_id);
+    /// Complete engine ownership independently of the client reading its output. A failed
+    /// destination stops matching immediately, but its engine state can still serve older
+    /// fork requests that already selected it.
+    pub fn terminal(&mut self, session_id: u64, base_session_id: u64, failed: bool) -> Vec<u64> {
+        let mut released = Vec::new();
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.pending = false;
+            if failed {
+                s.retired = true;
+                if s.dependents == 0 {
+                    self.sessions.remove(&session_id);
+                    released.push(session_id);
+                }
+            }
+        }
+        if let Some(base) = self.sessions.get_mut(&base_session_id) {
+            base.dependents -= 1;
+            if base.retired && base.dependents == 0 {
+                self.sessions.remove(&base_session_id);
+                released.push(base_session_id);
+            }
+        }
+        released.extend(self.evict(0));
+        released
     }
 
     /// Drop least recently used idle sessions over the limits; returns their ids.
@@ -369,7 +407,7 @@ impl SessionTable {
             if self.sessions.len() <= self.max_sessions && total <= self.max_tokens {
                 return out;
             }
-            let victim = self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id);
+            let victim = self.sessions.iter().filter(|(&id, s)| id != keep && !s.busy && !s.pending && s.dependents == 0).min_by_key(|(_, s)| s.last_used).map(|(&id, _)| id);
             match victim {
                 Some(id) => {
                     self.sessions.remove(&id);
@@ -402,6 +440,7 @@ mod tests {
         // the model spelled "Hi there" in single letters, which BPE would never produce
         let mut gen: Vec<u32> = "Hi there".chars().map(|c| tok.encode(&c.to_string())[0]).collect();
         gen.push(tok.token_id("<｜end▁of▁sentence｜>").unwrap());
+        t.terminal(plan.session_id, plan.base_session_id, false);
         t.finish(plan.session_id, &p1, &plan.ids, &gen, &tok);
         let p2 = format!("{p1}Hi there<｜end▁of▁sentence｜><｜User｜>next<｜Assistant｜></think>");
         let (plan2, _) = t.plan(&p2, &tok, 1);
@@ -432,6 +471,7 @@ mod tests {
         let a = conv("09:14:08 AM", "fix the build");
         let (pa, _) = t.plan(&a, &tok, 1);
         assert_eq!(pa.describe(a.len()), format!("session {}, new: no session shares a byte", pa.session_id));
+        t.terminal(pa.session_id, pa.base_session_id, false);
         t.finish(pa.session_id, &a, &pa.ids, &tok.encode("Done."), &tok);
         // another conversation, a minute later: a fork of the first, which has every id before the time
         let b = conv("09:15:31 AM", "write the tests");
@@ -443,11 +483,13 @@ mod tests {
         let d = pb.describe(b.len());
         assert!(d.starts_with(&format!("session {}, a fork of {}: it shares ", pb.session_id, pa.session_id)), "{d}");
         assert!(d.ends_with(&format!("of {} bytes, {} ids in common", b.len(), pb.common)), "{d}");
+        t.terminal(pb.session_id, pb.base_session_id, false);
         // the next turn of the first: in place
         let a2 = format!("{a}Done.<｜end▁of▁sentence｜><｜User｜>thanks<｜Assistant｜></think>");
         let (pa2, _) = t.plan(&a2, &tok, 1);
         assert_eq!(pa2.session_id, pa.session_id);
         assert!(pa2.describe(a2.len()).starts_with(&format!("session {} in place: it shares ", pa.session_id)));
+        t.terminal(pa2.session_id, pa2.base_session_id, false);
         t.finish(pa2.session_id, &a2, &pa2.ids, &tok.encode("Sure."), &tok);
         // a prompt that shares only the BOS and a few bytes: a new session, which names no base
         let c = "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>";
@@ -471,6 +513,7 @@ mod tests {
         let p1 = "<｜begin▁of▁sentence｜><｜System｜>You are a careful assistant who answers briefly and well.<｜User｜>hello<｜Assistant｜></think>";
         let (plan, _) = t.plan(p1, &tok, 1);
         let gen = tok.encode("Hi there.");
+        t.terminal(plan.session_id, plan.base_session_id, false);
         t.finish(plan.session_id, p1, &plan.ids, &gen, &tok);
         let (busy, _) = t.plan("<｜begin▁of▁sentence｜><｜System｜>Another conversation, still in its request, which is not saved.", &tok, 1);
         let repo = dir.join("repo");

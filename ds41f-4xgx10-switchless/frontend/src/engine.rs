@@ -20,6 +20,16 @@ pub enum Event {
 struct Pending {
     tx: mpsc::UnboundedSender<Event>,
     n_top: u32,
+    on_done: Option<Box<dyn FnOnce(DoneReason) + Send>>,
+}
+
+impl Pending {
+    fn complete(self, done: Done) {
+        if let Some(on_done) = self.on_done {
+            on_done(done.reason);
+        }
+        let _ = self.tx.send(Event::Done(done));
+    }
 }
 
 #[derive(Default)]
@@ -62,13 +72,23 @@ impl EngineClient {
 
     /// Send a request (its req_id is assigned here). Events arrive on the receiver; the last one is
     /// always Done.
-    pub fn submit(&self, mut s: Submit) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+    pub fn submit(&self, s: Submit) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
+        self.submit_with_done(s, None)
+    }
+
+    /// Run cleanup once on terminal delivery or loss of a successfully submitted request,
+    /// even if its event receiver has gone away.
+    pub fn submit_with_done(
+        &self,
+        mut s: Submit,
+        on_done: Option<Box<dyn FnOnce(DoneReason) + Send>>,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<Event>), String> {
         s.req_id = self.inner.next_req.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let mut c = self.inner.conn.lock().unwrap();
         let wtx = c.tx.clone().ok_or("engine not connected")?;
         let req_id = s.req_id;
-        c.pending.insert(req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 } });
+        c.pending.insert(req_id, Pending { tx, n_top: if s.flags & crate::protocol::FLAG_LOGPROBS != 0 { s.n_top_logprobs } else { 0 }, on_done });
         // encoded from the request itself, which is dropped with it: a request with images carries their
         // rows (10 KiB each), and a clone here was one more copy of them
         if wtx.send(Frame::Submit(s).encode()).is_err() {
@@ -105,14 +125,13 @@ async fn run(inner: Arc<Inner>) {
                     Ok(()) => eprintln!("engine: connection closed"),
                     Err(e) => eprintln!("engine: connection lost: {e}"),
                 }
-                inner.info.send_replace(None);
                 let pending = {
                     let mut c = inner.conn.lock().unwrap();
                     c.tx = None;
                     std::mem::take(&mut c.pending)
                 };
                 for (req_id, p) in pending {
-                    let _ = p.tx.send(Event::Done(Done {
+                    p.complete(Done {
                         req_id,
                         reason: DoneReason::Error,
                         prompt_tokens: 0,
@@ -122,7 +141,7 @@ async fn run(inner: Arc<Inner>) {
                         prefill_us: 0,
                         decode_us: 0,
                         error: "engine connection lost".into(),
-                    }));
+                    });
                 }
             }
             Err(e) => {
@@ -160,15 +179,30 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     inner.conn.lock().unwrap().tx = Some(tx);
     inner.info.send_replace(Some(hello));
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(b) = rx.recv().await {
             if wr.write_all(&b).await.is_err() {
                 break;
             }
         }
     });
+    // Terminal callbacks may wait for the session table while another request tokenizes.
+    // Process them in arrival order off the socket reader, with one blocking job at a time.
+    let (cleanup_tx, mut cleanup_rx) = mpsc::unbounded_channel::<(Pending, Done)>();
+    let cleanup = tokio::spawn(async move {
+        while let Some((pending, done)) = cleanup_rx.recv().await {
+            let completion = tokio::task::spawn_blocking(move || pending.complete(done));
+            if completion.await.is_err() {
+                eprintln!("engine: terminal cleanup failed");
+            }
+        }
+    });
     let result = loop {
-        let (ty, p) = match read_frame(&mut rd).await {
+        let incoming = tokio::select! {
+            incoming = read_frame(&mut rd) => incoming,
+            _ = &mut writer => break Err("engine writer closed".into()),
+        };
+        let (ty, p) = match incoming {
             Ok(Some(f)) => f,
             Ok(None) => break Ok(()),
             Err(e) => break Err(e.to_string()),
@@ -187,13 +221,24 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
             Ok(Frame::Done(d)) => {
                 let p = inner.conn.lock().unwrap().pending.remove(&d.req_id);
                 if let Some(p) = p {
-                    let _ = p.tx.send(Event::Done(d));
+                    if p.on_done.is_some() {
+                        if let Err(mpsc::error::SendError((p, d))) = cleanup_tx.send((p, d)) {
+                            inner.conn.lock().unwrap().pending.insert(d.req_id, p);
+                            break Err("terminal cleanup stopped".into());
+                        }
+                    } else {
+                        p.complete(d);
+                    }
                 }
             }
             Ok(f) => break Err(format!("unexpected frame from engine: {f:?}")),
             Err(e) => break Err(e),
         }
     };
+    inner.conn.lock().unwrap().tx = None;
+    inner.info.send_replace(None);
     writer.abort();
+    drop(cleanup_tx);
+    cleanup.await.map_err(|e| e.to_string())?;
     result
 }
