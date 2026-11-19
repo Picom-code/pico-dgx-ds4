@@ -5,6 +5,7 @@
 #include <string>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -1834,6 +1835,65 @@ static void test_head4() {
   cudaFree(nat), cudaFree(x), cudaFree(dnw), cudaFree(y1), cudaFree(y2);
 }
 
+// gemv_bf16_norm_rows with pre (the rows normalised once) against today's kernel, and both against
+// calls of 16 rows, on the recorded head slice, coded and plain, with 64 rows built from the 8 recorded ones.
+static void test_headrg() {
+  Npy w = L("head_w"), x8 = L("head_x"), nw = L("norm_w");
+  const int N = w.shape[0], K = w.shape[1], R = 64;
+  std::vector<uint16_t> hx((size_t)R * K);
+  const uint16_t* h8 = x8.as<uint16_t>();
+  for (int i = 0; i < R; ++i)
+    for (int k = 0; k < K; ++k) hx[(size_t)i * K + k] = h8[(size_t)((i * 3 + 1) % 8) * K + (k + 33 * i) % K];
+  uint16_t* x = dev_alloc<uint16_t>((size_t)R * K);
+  CUDA_CHECK(cudaMemcpy(x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+  const auto* xb = reinterpret_cast<const __nv_bfloat16*>(x);
+  auto* dnw = dev<__nv_bfloat16>(nw);
+  float *y0 = dev_alloc<float>((size_t)R * N), *y1 = dev_alloc<float>((size_t)R * N), *y2 = dev_alloc<float>((size_t)R * N);
+  auto* xnb = reinterpret_cast<__nv_bfloat16*>(dev_alloc<uint16_t>((size_t)R * K));
+  uint8_t* nat = dev_alloc<uint8_t>((size_t)N * K * 2);
+  CUDA_CHECK(cudaMemcpy(nat, w.as<uint16_t>(), (size_t)N * K * 2, cudaMemcpyHostToDevice));
+  uint8_t* W = dev_alloc<uint8_t>((size_t)N * K * 2);
+  dsk::tile_fp8(nat, W, N, 2 * K, 0);
+  size_t bytes = 0;
+  int raw = 0;
+  uint8_t* X = dsk::bf16x_encode(W, N, K, &bytes, &raw, 0);
+  const dsk::GemvCfg cfg{2, 1, 16};
+  printf("head, wide (17..64 rows) with pre-normalised rows: [%d x %d]\n", N, K);
+  for (int coded = 1; coded >= 0; --coded) {
+    const uint8_t* Wc = coded ? X : W;
+    for (int M : {17, 24, 32, 33, 47, 48, 49, 63, 64}) {
+      CUDA_CHECK(cudaMemset(y0, 0xFF, (size_t)R * N * 4));
+      CUDA_CHECK(cudaMemset(y1, 0xFF, (size_t)R * N * 4));
+      CUDA_CHECK(cudaMemset(y2, 0xFF, (size_t)R * N * 4));
+      for (int r0 = 0; r0 < M; r0 += 16) {
+        const int m = std::min(16, M - r0);
+        if (coded) dsk::gemv_bf16x_norm(xb + (size_t)r0 * K, dnw, 1e-6f, m, X, N, K, y0 + (size_t)r0 * N, nullptr, cfg, 0);
+        else dsk::gemv_bf16_norm(xb + (size_t)r0 * K, dnw, 1e-6f, m, W, N, K, y0 + (size_t)r0 * N, nullptr, cfg, 0);
+      }
+      dsk::gemv_bf16_norm_rows(xb, dnw, 1e-6f, M, Wc, coded, N, K, y1, cfg, 0, nullptr);
+      dsk::gemv_bf16_norm_rows(xb, dnw, 1e-6f, M, Wc, coded, N, K, y2, cfg, 0, xnb);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      const size_t d01 = diffd(y0, y1, (size_t)M * N), d12 = diffd(y1, y2, (size_t)M * N);
+      const bool ok = d01 == 0 && d12 == 0;
+      g_fail += !ok;
+      printf("  %-5s %2d rows %s: %zu logits differ 16-row calls vs today's wide kernel, %zu today's vs pre-normalised (of %zu)\n",
+             coded ? "coded" : "plain", M, ok ? "ok  " : "FAIL", d01, d12, (size_t)M * N);
+    }
+    for (int M : {32, 48, 64})
+      for (int rep = 0; rep < 2; ++rep)
+        for (int pre = 0; pre < 2; ++pre) {
+          CUDA_CHECK(cudaDeviceSynchronize());
+          timespec t0, t1;
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+          for (int i = 0; i < 40; ++i) dsk::gemv_bf16_norm_rows(xb, dnw, 1e-6f, M, Wc, coded, N, K, y1, cfg, 0, pre ? xnb : nullptr);
+          CUDA_CHECK(cudaDeviceSynchronize());
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+          printf("  time %-5s %2d rows %-14s %.3f ms per call\n", coded ? "coded" : "plain", M, pre ? "pre-normalised" : "today",
+                 ((t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6) / 40);
+        }
+  }
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // lines reach a log file even if a check aborts
   g_dir = argc > 1 && argv[1][0] ? argv[1] : std::string(getenv("HOME")) + "/dsgb10-data/kerneltests";
@@ -1846,6 +1906,7 @@ int main(int argc, char** argv) {
   if (only.empty() || only == "woa") test_woa();
   if (only.empty() || only == "head") test_head();
   if (only.empty() || only == "head4") test_head4();
+  if (only == "headrg") test_headrg();
   if (only.empty() || only == "norm") test_norm();
   if (only.empty() || only == "norm" || only == "normgemv") test_norm_gemv();
   if (only.empty() || only == "fp8" || only == "fp8p" || only == "pers") test_gemv_fp8p();

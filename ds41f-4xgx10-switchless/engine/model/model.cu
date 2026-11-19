@@ -72,6 +72,29 @@ bool wide_ar() {
   return u;
 }
 
+// DSGB10_WIDE_AR=2: as 1, and the FFN's bulk all-reduce rounds each reduced quarter to bf16 on the rank
+// that sums it, before the all-gather (comm::allreduce_bulk_f32_bf16): the all-gather carries half the bytes and the
+// separate f32_to_bf16 kernel goes. The fp32 sums and the one rounding (__float2bfloat16_rn) are the same.
+bool wide_ar2() {
+  static const bool u = getenv("DSGB10_WIDE_AR") && atoi(getenv("DSGB10_WIDE_AR")) >= 2;
+  return u;
+}
+
+// DSGB10_AR_BULK=F[,A] (needs DSGB10_WIDE_AR): rows from which the FFN (F) and the attention (A)
+// all-reduce run as the bulk chain; unset: kDecodeRows + 1 for both (wide steps only, as before).
+int ar_bulk_min(int attn) {
+  static int m[3] = {0, kDecodeRows + 1, kDecodeRows + 1};
+  if (!m[0]) {
+    if (const char* e = getenv("DSGB10_AR_BULK")) {
+      sscanf(e, "%d,%d", &m[1], &m[2]);
+      for (int i = 1; i < 3; ++i) m[i] = m[i] < 2 ? 2 : m[i];
+      fprintf(stderr, "wide_ar: bulk all-reduce chain from %d rows (FFN), %d rows (attention)\n", m[1], m[2]);
+    }
+    m[0] = 1;
+  }
+  return m[1 + attn];
+}
+
 bool unfused16() {
   static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
   return u;
@@ -685,7 +708,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   }
   l2pf(4, L, R);
   join(sa);
-  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
+  if (wide_ar() && R >= ar_bulk_min(1)) {  // bulk all-reduce + the separate kernels (same bits)
     comm::allreduce_bulk_bf16(ch, part, sub, (size_t)R * kDim, st);
     attn::hc_post(U(sub), U(x), a_post, a_comb, R, U(mid), st);
     attn::hc_pre(U(mid), a_pre, R, nullptr, U(yraw), nullptr, st);
@@ -792,9 +815,13 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
-  if (R > kDecodeRows && wide_ar()) {  // bulk all-reduce + the separate kernels (same bits)
-    comm::allreduce_bulk_f32(ch, ymoe, ymoe, (size_t)R * kDim, st);
-    ops::f32_to_bf16(ymoe, sub, R * kDim, st);
+  if (wide_ar() && R >= ar_bulk_min(0)) {  // bulk all-reduce + the separate kernels (same bits)
+    if (wide_ar2()) {
+      comm::allreduce_bulk_f32_bf16(ch, ymoe, sub, (size_t)R * kDim, st);
+    } else {
+      comm::allreduce_bulk_f32(ch, ymoe, ymoe, (size_t)R * kDim, st);
+      ops::f32_to_bf16(ymoe, sub, R * kDim, st);
+    }
     attn::hc_post(U(sub), U(mid), f_post, f_comb, R, U(x), st);
     attn::hc_pre(U(x), next_pm, R, nullptr, U(yraw), nullptr, st);
   } else {
@@ -1235,7 +1262,10 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
   static const bool headg = !getenv("DSGB10_HEADG") || atoi(getenv("DSGB10_HEADG")) != 0;
   if (cert_cap) cert_head(R);  // stack4: a certified body of the one-session spec graph
   else if (R > kDecodeRows && headg) {
-    dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st);
+    static const bool headpre = getenv("DSGB10_HEADG") && atoi(getenv("DSGB10_HEADG")) >= 2;
+    // hfin [rows][kDim] is otherwise only the dumps' final_hidden
+    dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st,
+                             headpre && !dumps ? hfin : nullptr);
   } else
   for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
     const int m = std::min(kDecodeRows, R - r0);

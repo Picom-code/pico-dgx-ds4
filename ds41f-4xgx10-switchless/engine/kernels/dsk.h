@@ -152,7 +152,10 @@ void gemv_bf16x_norm_masked(const __nv_bfloat16* x, const __nv_bfloat16* norm_w,
 // wide64, the coded-head GEMM: gemv_bf16x_norm (coded) / gemv_bf16_norm over M <= 64 rows, fp32 out, the weights read
 // once for every group of 16 rows; the bits of calls of 16 rows in row order (M <= 16: that call).
 void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,
-                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st);
+                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st,
+                         __nv_bfloat16* pre = nullptr);
+// (pre: a buffer [M][K]; the rows are then normalised once into it by a small kernel instead of in every
+// CTA of the head kernel: the same bits)
 // wo_a: FP8 W [N][K] with [N/32][K/32] scales, widened to bf16 (exact; block scales <= 2^7);
 // block-diagonal: rows [g*group_rows, (g+1)*group_rows) read x[:, g*K:(g+1)*K]. x [M][N/group_rows*K].
 // With q/qs also act_quant(y) (wo_b's input; y may then be null); needs mt * wn = 4.

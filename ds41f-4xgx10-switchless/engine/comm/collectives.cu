@@ -132,6 +132,54 @@ __global__ void __launch_bounds__(kThreads) allreduce_bulk_kernel(DevChannel ch,
   finish_grid(ch, s0 + 2 * nchunks - 1);
 }
 
+// allreduce_bulk_kernel<false> with the reduced quarter rounded to bf16 before its all-gather (collectives.h:
+// allreduce_bulk_f32_bf16). A 16-byte unit of the fp32 chunk becomes an 8-byte unit of the all-gather and of out.
+__global__ void __launch_bounds__(kThreads) allreduce_bulk_f32_bf16_kernel(DevChannel ch, const uint4* in, uint2* out,
+                                                                           size_t nbytes, uint32_t chunk) {
+  const uint64_t s0 = next_seq(ch);
+  const uint32_t t0 = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+  const size_t nchunks = (nbytes + chunk - 1) / chunk;
+  auto len = [&](size_t i) { return (uint32_t)(nbytes - i * chunk < chunk ? nbytes - i * chunk : chunk); };
+  auto scatter = [&](size_t i, uint64_t s) {
+    const uint32_t chunks = len(i) / 16;
+    const uint4* cin = in + i * (chunk / 16);
+    uint4* sb = (uint4*)send_buf(ch, s);
+    for (uint32_t j = t0; j < chunks; j += stride) sb[j] = cin[j];
+    post_grid(ch, s, len(i), kOpReduceScatter);
+  };
+  auto reduce = [&](size_t i, uint64_t s) {
+    const uint32_t qchunks = len(i) / 64;
+    wait_all(ch, s);
+    uint2* red = (uint2*)send_buf(ch, s + 1);
+    const size_t qoff = (size_t)ch.rank * qchunks * 16;
+    for (uint32_t j = t0; j < qchunks; j += stride) {
+      const float4 a = sum4_f32(ch, s, qoff + (size_t)j * 16);
+      __nv_bfloat16 b[4] = {__float2bfloat16_rn(a.x), __float2bfloat16_rn(a.y), __float2bfloat16_rn(a.z),
+                            __float2bfloat16_rn(a.w)};
+      red[j] = *(const uint2*)b;
+    }
+    post_grid(ch, s + 1, len(i) / 8);
+  };
+  auto gather = [&](size_t i, uint64_t s) {
+    const uint32_t qchunks = len(i) / 64;
+    uint2* cout = out + i * (chunk / 16);
+    for (int k = 0; k < kRanks; k++) {
+      const uint2* p = (const uint2*)src(ch, s + 1, k);
+      for (uint32_t j = t0; j < qchunks; j += stride) cout[(size_t)k * qchunks + j] = __ldcv(p + j);
+    }
+  };
+  scatter(0, s0);
+  reduce(0, s0);
+  for (size_t i = 0; i < nchunks; i++) {
+    const uint64_t s = s0 + 2 * i;
+    wait_all(ch, s + 1);
+    if (i + 1 < nchunks) scatter(i + 1, s + 2);
+    gather(i, s);
+    if (i + 1 < nchunks) reduce(i + 1, s + 2);
+  }
+  finish_grid(ch, s0 + 2 * nchunks - 1);
+}
+
 __global__ void __launch_bounds__(kThreads) allgather_kernel(DevChannel ch, const uint4* in, uint4* out, uint32_t nbytes) {
   const uint64_t s = next_seq(ch);
   uint4* sb = (uint4*)send_buf(ch, s);
@@ -452,6 +500,17 @@ void allreduce_bulk_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfl
 
 void allreduce_bulk_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st, int blocks) {
   bulk<false>(ch, in, out, n * 4, st, blocks);
+}
+
+void allreduce_bulk_f32_bf16(const DevChannel& ch, const float* in, __nv_bfloat16* out, size_t n, cudaStream_t st,
+                             int blocks) {
+  const size_t bytes = n * 4;
+  // every chunk's quarter must be whole 16-byte units of bf16: chunks of a multiple of 128 bytes
+  if (bytes % 128 || !bytes) die("comm: bulk all-reduce to bf16 of %zu bytes (a multiple of 128)", bytes);
+  const uint32_t chunk = ch.cap & ~127u;
+  blocks = blocks < 1 ? 1 : blocks > 48 ? 48 : blocks;
+  allreduce_bulk_f32_bf16_kernel<<<blocks, kThreads, 0, st>>>(ch, (const uint4*)in, (uint2*)out, bytes, chunk);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void reduce_scatter_bulk_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfloat16* out, size_t n,

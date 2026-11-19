@@ -119,10 +119,10 @@ int test_correct(Ring& ring, cudaStream_t st) {
   const DevChannel& ch = ring.dev();
   const int r = ring.rank();
   int failures = 0;
-  enum Kind { kArBf16, kArF32, kGather, kRsBf16, kRsF32, kBulkBf16, kBulkF32, kSplitBf16, kRsBulkBf16, kRsBulkF32 };
+  enum Kind { kArBf16, kArF32, kGather, kRsBf16, kRsF32, kBulkBf16, kBulkF32, kSplitBf16, kRsBulkBf16, kRsBulkF32, kBulkF32Bf16 };
   static const char* names[] = {"allreduce bf16", "allreduce f32", "allgather",     "redscatter bf16",
                                 "redscatter f32", "bulk ar bf16",  "bulk ar f32",   "split ar bf16",
-                                "bulk rs bf16",   "bulk rs f32"};
+                                "bulk rs bf16",   "bulk rs f32",   "bulk f32>bf16"};
   const size_t cap = ch.cap;
   struct Case {
     int kind;
@@ -135,6 +135,8 @@ int test_correct(Ring& ring, cudaStream_t st) {
       if (b <= cap && (k < kRsBf16 || b % 64 == 0)) cases.push_back({k, b});
   for (size_t b : {(size_t)64, (size_t)10240, cap, 2 * cap + 4160, 6 * cap})
     for (int k : {kBulkBf16, kBulkF32}) cases.push_back({k, b});
+  for (size_t b : {(size_t)128, (size_t)10240, (size_t)327680, (size_t)1310720, cap, 2 * cap + 4224, 6 * cap})
+    cases.push_back({kBulkF32Bf16, b});
   for (size_t b : {cap + 16, 3 * cap + 4112}) cases.push_back({kGather, b});  // chunked all-gathers
   for (size_t b : {(size_t)256, (size_t)10240, cap, 2 * cap + 4160, 6 * cap + 192})
     for (int k : {kRsBulkBf16, kRsBulkF32}) cases.push_back({k, b});
@@ -178,16 +180,22 @@ int test_correct(Ring& ring, cudaStream_t st) {
       case kSplitBf16: split_allreduce_bf16(ch, d_in, d_out, bytes, st); break;
       case kRsBulkBf16: comm::reduce_scatter_bulk_bf16(ch, bi, bo, n, st); break;
       case kRsBulkF32: comm::reduce_scatter_bulk_f32(ch, fi, fo, n, st); break;
+      case kBulkF32Bf16: comm::allreduce_bulk_f32_bf16(ch, fi, bo, n, st); break;
     }
     const size_t out_n = kind == kGather ? 4 * n : rs ? n / 4 : n;
     const size_t first = rs ? r * (n / 4) : 0;  // element of the full vector that out[0] is
-    const size_t out_bytes = out_n * (bf16 ? 2 : 4);
+    const size_t out_bytes = out_n * (bf16 || kind == kBulkF32Bf16 ? 2 : 4);
     CUDA_CHECK(cudaMemcpyAsync(h_out.data(), d_out, out_bytes, cudaMemcpyDeviceToHost, st));
     sync_or_die(ring, st, 30, "correct");
     size_t bad = 0;
     for (size_t o = 0; o < out_n; o++) {
       const size_t i = first + o;
-      if (bf16) {
+      if (kind == kBulkF32Bf16) {  // the fp32 sum in rank order, rounded once
+        float acc = test_value(0, i, salt);
+        for (int k = 1; k < 4; k++) acc += test_value(k, i, salt);
+        __nv_bfloat16 want = __float2bfloat16_rn(acc);
+        if (memcmp(&want, h_out.data() + 2 * o, 2)) bad++;
+      } else if (bf16) {
         float acc = __bfloat162float(__float2bfloat16(test_value(0, i, salt)));
         for (int k = 1; k < 4; k++) acc += __bfloat162float(__float2bfloat16(test_value(k, i, salt)));
         __nv_bfloat16 want = __float2bfloat16_rn(acc);
@@ -662,6 +670,34 @@ void test_bulk(Ring& ring, cudaStream_t st, size_t max_bytes, int blocks) {
 // Two channels at once: each half of the payload is a bulk all-reduce on its own Ring (own QPs,
 // region and proxy core), on its own stream, so one channel's GPU copies overlap the other's
 // network time.
+// The wide step's all-reduces at their sizes (rows x 5120 elements a rank): fp32 all-exchange, fp32 bulk, fp32 bulk
+// rounded to bf16 before the all-gather, bf16 bulk (attention's).
+void test_bulkfb(Ring& ring, cudaStream_t st, int blocks) {
+  const DevChannel& ch = ring.dev();
+  const size_t max_bytes = 64 * 5120 * 4;
+  void *d_in, *d_out;
+  CUDA_CHECK(cudaMalloc(&d_in, max_bytes));
+  CUDA_CHECK(cudaMalloc(&d_out, max_bytes));
+  CUDA_CHECK(cudaMemset(d_in, 0, max_bytes));
+  if (ring.rank() == 0)
+    std::printf("  %5s %10s %14s %12s %16s %12s   (us per collective, %d blocks)\n", "rows", "f32 bytes", "allreduce f32",
+                "bulk f32", "bulk f32>bf16", "bulk bf16", blocks);
+  for (int rows : {16, 24, 32, 48, 64}) {
+    const size_t n = (size_t)rows * 5120;
+    double ta = time_graph(ring, st, 10, 20, [&] { comm::allreduce_f32(ch, (const float*)d_in, (float*)d_out, n, st); });
+    double tb = time_graph(ring, st, 10, 20, [&] { comm::allreduce_bulk_f32(ch, (const float*)d_in, (float*)d_out, n, st, blocks); });
+    double tc = time_graph(ring, st, 10, 20, [&] {
+      comm::allreduce_bulk_f32_bf16(ch, (const float*)d_in, (__nv_bfloat16*)d_out, n, st, blocks);
+    });
+    double td = time_graph(ring, st, 10, 20, [&] {
+      comm::allreduce_bulk_bf16(ch, (const __nv_bfloat16*)d_in, (__nv_bfloat16*)d_out, n, st, blocks);
+    });
+    if (ring.rank() == 0) std::printf("  %5d %10zu %14.1f %12.1f %16.1f %12.1f\n", rows, n * 4, ta, tb, tc, td);
+  }
+  cudaFree(d_in);
+  cudaFree(d_out);
+}
+
 void test_bulk2(Ring& a, Ring& b, cudaStream_t st, size_t max_bytes, int blocks) {
   cudaStream_t st2;
   CUDA_CHECK(cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking));
@@ -1090,6 +1126,8 @@ int main(int argc, char** argv) {
     else if (a == "--relay-domain" && i + 1 < argc) o.relay_domain = atoi(argv[++i]);
     else if (a == "--rs-slow-pct" && i + 1 < argc) o.rs_slow_pct = atoi(argv[++i]);
     else if (a == "--direct" && i + 1 < argc) o.direct = atoi(argv[++i]);
+    else if (a == "--rs-bal" && i + 1 < argc) o.rs_bal = atoi(argv[++i]);
+    else if (a == "--comm-stats" && i + 1 < argc) o.stats_s = atoi(argv[++i]);
     else if (a == "--bulk-blocks" && i + 1 < argc) bulk_blocks = atoi(argv[++i]);
     else if (a == "--bootstrap-timeout" && i + 1 < argc) o.bootstrap_timeout_s = atoi(argv[++i]);
     else if (a == "--idle-backoff-ms" && i + 1 < argc) o.idle_backoff_ms = atoi(argv[++i]);
@@ -1115,6 +1153,7 @@ int main(int argc, char** argv) {
     else if (t == "integrity") failures += test_integrity(ring, st, integrity_n);
     else if (t == "latency") test_latency(ring, st);
     else if (t == "bulk") test_bulk(ring, st, bulk_max, bulk_blocks);
+    else if (t == "bulkfb") test_bulkfb(ring, st, bulk_blocks);
     else if (t == "bulk2") {
       comm::Options o2 = o;
       o2.port = o.port + 1;

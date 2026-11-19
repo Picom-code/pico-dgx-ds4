@@ -400,7 +400,27 @@ constexpr auto gemv16_kernel() {
 // every group's MMAs run on it; each row keeps the 16-row kernel's chain (its warp's k slice, the MMA order, the
 // rows' 1/rms from rmsnorm_scale<16> over its own group, the fixed-order split-K sum), so the outputs are those of
 // G calls of at most 16 rows, bit for bit, for 1/G of the weight bytes.
-template <int FMT, int MT, int G>
+// the rows of a wide head call normalised once (gemv_bf16_norm_rows with pre): CTA q (of the head
+// kernel's shape, so rmsnorm_scale<16> adds a row's squares in the same order) computes group q's 1/rms and writes
+// rmsnorm8 of every 8 values of its rows to xn [M][K]. PRE = true below then loads xn instead of computing both in
+// every CTA.
+__global__ void __launch_bounds__(512, 1) k_gemv16_prenorm(NormIn nin, int M, int K, __nv_bfloat16* __restrict__ xn) {
+  constexpr int RB = kMaxRows;
+  __shared__ float red[256 + RB];
+  pdl_launch_dependents();
+  pdl_wait();
+  const int q = blockIdx.x, mg = min(RB, M - RB * q), nc = K / 8;
+  const __nv_bfloat16* x = nin.x + (size_t)RB * q * K;
+  rmsnorm_scale<RB>(x, K, mg, K, nin.eps, red);
+  for (int idx = threadIdx.x; idx < mg * nc; idx += blockDim.x) {
+    const int m = idx / nc, c = idx - m * nc;
+    const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x + (size_t)m * K + 8 * c));
+    const uint4 wv = __ldg(reinterpret_cast<const uint4*>(nin.w + 8 * c));
+    *reinterpret_cast<uint4*>(xn + (size_t)(RB * q + m) * K + 8 * c) = rmsnorm8(xv, wv, red[256 + m]);
+  }
+}
+
+template <int FMT, int MT, int G, bool PRE>
 __global__ void __launch_bounds__(512, 1) k_gemv16_rg(NormIn nin, int M, const uint8_t* __restrict__ W, int N, int K,
                                                        float* __restrict__ yf, int wn, int wk) {
   static_assert(FMT == kBF16 || FMT == kBF16X, "bf16 heads");
@@ -472,12 +492,18 @@ __global__ void __launch_bounds__(512, 1) k_gemv16_rg(NormIn nin, int M, const u
           if ((int)h >= 0) w[i] = bf16x_dec(w[i].x, w[i].y, w[i].z, h);
         }
       }
-      const uint4 wn8 = __ldg(reinterpret_cast<const uint4*>(nwrow + k0));
+      uint4 wn8 = make_uint4(0, 0, 0, 0);
+      if constexpr (!PRE) wn8 = __ldg(reinterpret_cast<const uint4*>(nwrow + k0));
 #pragma unroll
       for (int q = 0; q < G; ++q) {
         uint4 a = make_uint4(0, 0, 0, 0), a2 = a;
-        if (g < mg[q]) a = rmsnorm8(__ldg(reinterpret_cast<const uint4*>(xp(q, g) + k0)), wn8, rr[q]);
-        if (g + 8 < mg[q]) a2 = rmsnorm8(__ldg(reinterpret_cast<const uint4*>(xp(q, g + 8) + k0)), wn8, rr2[q]);
+        if constexpr (PRE) {  // nin.x is the normalised copy (k_gemv16_prenorm)
+          if (g < mg[q]) a = __ldg(reinterpret_cast<const uint4*>(xp(q, g) + k0));
+          if (g + 8 < mg[q]) a2 = __ldg(reinterpret_cast<const uint4*>(xp(q, g + 8) + k0));
+        } else {
+          if (g < mg[q]) a = rmsnorm8(__ldg(reinterpret_cast<const uint4*>(xp(q, g) + k0)), wn8, rr[q]);
+          if (g + 8 < mg[q]) a2 = rmsnorm8(__ldg(reinterpret_cast<const uint4*>(xp(q, g + 8) + k0)), wn8, rr2[q]);
+        }
 #pragma unroll
         for (int i = 0; i < MT; ++i) {
           mma_bf16(c[q][i], a.x, a2.x, a.y, a2.y, w[i].x, w[i].y);
@@ -490,11 +516,16 @@ __global__ void __launch_bounds__(512, 1) k_gemv16_rg(NormIn nin, int M, const u
   load(ba, p0);
   pdl_launch_dependents();
   pdl_wait();
+  if constexpr (!PRE) {
 #pragma unroll
-  for (int q = 0; q < G; ++q) {  // each group's 1/rms as the 16-row kernel computes it
-    rmsnorm_scale<RB>(nin.x + (size_t)RB * q * K, K, mg[q], K, nin.eps, red);
-    rr[q] = red[256 + (g < mg[q] ? g : 0)], rr2[q] = red[256 + (g + 8 < mg[q] ? g + 8 : 0)];
-    __syncthreads();
+    for (int q = 0; q < G; ++q) {  // each group's 1/rms as the 16-row kernel computes it
+      rmsnorm_scale<RB>(nin.x + (size_t)RB * q * K, K, mg[q], K, nin.eps, red);
+      rr[q] = red[256 + (g < mg[q] ? g : 0)], rr2[q] = red[256 + (g + 8 < mg[q] ? g + 8 : 0)];
+      __syncthreads();
+    }
+  } else {
+#pragma unroll
+    for (int q = 0; q < G; ++q) rr[q] = rr2[q] = 0.f;
   }
   for (int p = p0; p < p1; p += 2 * KU) {
     if (p + KU < p1) load(bb, p + KU);
@@ -530,31 +561,31 @@ __global__ void __launch_bounds__(512, 1) k_gemv16_rg(NormIn nin, int M, const u
   }
 }
 
-template <int FMT, int MT, int G>
+template <int FMT, int MT, int G, bool PRE>
 void launch16rg(const NormIn& nin, int M, const uint8_t* W, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st) {
   const int rows_cta = cfg.wn * 8 * MT;
   if (N % rows_cta) die("gemv16 (groups): N=%d not a multiple of %d", N, rows_cta);
   const size_t smem = (size_t)std::max(cfg.wk * kMaxRows * rows_cta, 256 + kMaxRows) * sizeof(float);
   static bool attr = false;
   if (!attr && smem > 48 * 1024) {
-    CUDA_CHECK(cudaFuncSetAttribute(k_gemv16_rg<FMT, MT, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    CUDA_CHECK(cudaFuncSetAttribute(k_gemv16_rg<FMT, MT, G, PRE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     attr = true;
   }
-  launch_pdl(k_gemv16_rg<FMT, MT, G>, dim3(N / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st, cfg.pdl, nin, M, W, N, K,
+  launch_pdl(k_gemv16_rg<FMT, MT, G, PRE>, dim3(N / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st, cfg.pdl, nin, M, W, N, K,
              yf, cfg.wn, cfg.wk);
 }
 
-template <int FMT>
+template <int FMT, bool PRE>
 void dispatch16rg(const NormIn& nin, int M, const uint8_t* W, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st) {
   const int G = (M + kMaxRows - 1) / kMaxRows;
   if (cfg.mt != 2 && cfg.mt != 1) die("gemv16 (groups): mt=%d", cfg.mt);
   switch (G * 4 + cfg.mt) {
-    case 2 * 4 + 1: launch16rg<FMT, 1, 2>(nin, M, W, N, K, yf, cfg, st); break;
-    case 2 * 4 + 2: launch16rg<FMT, 2, 2>(nin, M, W, N, K, yf, cfg, st); break;
-    case 3 * 4 + 1: launch16rg<FMT, 1, 3>(nin, M, W, N, K, yf, cfg, st); break;
-    case 3 * 4 + 2: launch16rg<FMT, 2, 3>(nin, M, W, N, K, yf, cfg, st); break;
-    case 4 * 4 + 1: launch16rg<FMT, 1, 4>(nin, M, W, N, K, yf, cfg, st); break;
-    case 4 * 4 + 2: launch16rg<FMT, 2, 4>(nin, M, W, N, K, yf, cfg, st); break;
+    case 2 * 4 + 1: launch16rg<FMT, 1, 2, PRE>(nin, M, W, N, K, yf, cfg, st); break;
+    case 2 * 4 + 2: launch16rg<FMT, 2, 2, PRE>(nin, M, W, N, K, yf, cfg, st); break;
+    case 3 * 4 + 1: launch16rg<FMT, 1, 3, PRE>(nin, M, W, N, K, yf, cfg, st); break;
+    case 3 * 4 + 2: launch16rg<FMT, 2, 3, PRE>(nin, M, W, N, K, yf, cfg, st); break;
+    case 4 * 4 + 1: launch16rg<FMT, 1, 4, PRE>(nin, M, W, N, K, yf, cfg, st); break;
+    case 4 * 4 + 2: launch16rg<FMT, 2, 4, PRE>(nin, M, W, N, K, yf, cfg, st); break;
     default: die("gemv16 (groups): %d rows", M);
   }
 }
@@ -923,7 +954,7 @@ void gemv_bf16x_norm_masked(const __nv_bfloat16* x, const __nv_bfloat16* norm_w,
 }
 
 void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,
-                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st) {
+                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st, __nv_bfloat16* pre) {
   if (M <= kMaxRows) {
     if (coded) gemv_bf16x_norm(x, norm_w, eps, M, W, N, K, yf, nullptr, cfg, st);
     else gemv_bf16_norm(x, norm_w, eps, M, W, N, K, yf, nullptr, cfg, st);
@@ -931,8 +962,17 @@ void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, fl
   }
   if (M > 4 * kMaxRows || cfg.wn * cfg.wk > 16 || K % 256) die("gemv_bf16_norm_rows: unsupported call M=%d K=%d", M, K);
   const NormIn nin{x, norm_w, eps, nullptr, nullptr, nullptr};
-  if (coded) dispatch16rg<kBF16X>(nin, M, W, N, K, yf, cfg, st);
-  else dispatch16rg<kBF16>(nin, M, W, N, K, yf, cfg, st);
+  if (pre) {  // the rows normalised once, by a CTA of the head kernel's shape per group of 16
+    __nv_bfloat16* xn = pre;  // [M][K], the caller's (no allocation here: this may run inside a graph capture)
+    const int G = (M + kMaxRows - 1) / kMaxRows;
+    launch_pdl(k_gemv16_prenorm, dim3(G), dim3(32 * cfg.wn * cfg.wk), 0, st, cfg.pdl, nin, M, K, xn);
+    const NormIn nin2{xn, norm_w, eps, nullptr, nullptr, nullptr};
+    if (coded) dispatch16rg<kBF16X, true>(nin2, M, W, N, K, yf, cfg, st);
+    else dispatch16rg<kBF16, true>(nin2, M, W, N, K, yf, cfg, st);
+    return;
+  }
+  if (coded) dispatch16rg<kBF16X, false>(nin, M, W, N, K, yf, cfg, st);
+  else dispatch16rg<kBF16, false>(nin, M, W, N, K, yf, cfg, st);
 }
 
 void gemv_woa(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, int group_rows,

@@ -514,6 +514,20 @@ void Model::Impl::attention_p(int L, int a, int M, const std::vector<std::pair<i
 // ---- FFN ---------------------------------------------------------------------------------------------
 
 // On entry y / yq / ys hold this rank's rows' normed input and f_post / f_comb their mixes.
+// DSGB10_PF_RSB=CB[,RB[,AB]] (unset: kCombRsBlocks, kRsBlocks, kRsBlocks)
+static const int* pf_rsb() {
+  static int b[4] = {0, kCombRsBlocks, kRsBlocks, kRsBlocks};
+  if (!b[0]) {
+    if (const char* e = std::getenv("DSGB10_PF_RSB")) {
+      std::sscanf(e, "%d,%d,%d", &b[1], &b[2], &b[3]);
+      for (int i = 1; i < 4; ++i) b[i] = b[i] < 1 ? 1 : b[i] > 48 ? 48 : b[i];
+      std::fprintf(stderr, "pf: combine-rs blocks %d, reduce-scatter blocks %d, all-to-all blocks %d\n", b[1], b[2], b[3]);
+    }
+    b[0] = 1;
+  }
+  return b;
+}
+
 void Model::Impl::ffn_p(int L, int M) {
   NVTX_RANGE("ffn L%02d", L);
   Prefill& p = *pf;
@@ -552,9 +566,9 @@ void Model::Impl::ffn_p(int L, int M) {
     cs_after(p, st, c);
     if (fuses)
       comm::reduce_scatter_rows_f32(ch, p.ymoe + mc.col0, kDim, p.ysum + mc.col0, kDim, Q, kGroupCols, p.cs,
-                                    kRsBlocks);
+                                    pf_rsb()[2]);
     else
-      dsk::moe_combine_rs(ch, p.moe_ws, M, kExperts, Q, mc.col0, kGroupCols, p.sub, kDim, p.cs, kCombRsBlocks);
+      dsk::moe_combine_rs(ch, p.moe_ws, M, kExperts, Q, mc.col0, kGroupCols, p.sub, kDim, p.cs, pf_rsb()[1]);
   }
   rs_join(p, st);
   if (n == 0) return;

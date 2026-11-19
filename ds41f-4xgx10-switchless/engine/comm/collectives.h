@@ -30,6 +30,13 @@ void allreduce_bulk_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfl
                          int blocks = 16);
 void allreduce_bulk_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st, int blocks = 16);
 
+// The same sums as allreduce_bulk_f32, rounded to bf16 (round to nearest even, as __float2bfloat16_rn) on the rank
+// that reduces each quarter, BEFORE the all-gather: out gets what allreduce_bulk_f32 followed by a conversion of every
+// element gives, bit for bit, but the all-gather carries 2 bytes an element instead of 4 and nothing converts
+// afterwards. n * 4 must be a multiple of 128; in and out must not overlap.
+void allreduce_bulk_f32_bf16(const DevChannel& ch, const float* in, __nv_bfloat16* out, size_t n, cudaStream_t st,
+                             int blocks = 16);
+
 // Reduce-scatter of any size: in has n elements on every rank, four quarters (quarter k for rank k),
 // out gets this rank's quarter summed as reduce_scatter_bf16/f32 does (bit-identical). Pipelined one
 // deep in posts of up to ch.cap bytes (a piece of every quarter each), in one kernel of `blocks`
