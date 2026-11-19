@@ -33,6 +33,12 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     /// Default and cap for max_tokens (the kit's DSV41_MAX_NEW_TOKENS).
     pub max_tokens_cap: u32,
+    /// Copy drafts (`--prediction`): pass a request's `prediction` text to the engine as token ids (drafts
+    /// only: the engine verifies every token, so the reply is the same with or without it). Off: the
+    /// field is ignored, as it always was.
+    pub prediction: bool,
+    /// The most prediction tokens sent (`--prediction-max`); a longer one is cut there.
+    pub prediction_max: usize,
     /// Reasoning effort budget when the request names none.
     pub default_effort: i64,
     /// The chat encoding: the weights' own encoding.py (V4.1, or 1017's).
@@ -274,6 +280,38 @@ pub struct Prepared {
     /// vision: this request's share of the image rows in flight (`hold_image_rows`), given back when
     /// the request ends, however it ends; None for text
     pub rows_held: Option<crate::vision::RowsHeld>,
+    /// copy drafts: the texts of the request's `prediction` (OpenAI's predicted outputs), in order; empty
+    /// for none or for a shape this server does not know
+    pub prediction: Vec<String>,
+}
+
+/// The request's `prediction` as texts: `{"type": "content", "content": "text"}` or `"content": [{"type":
+/// "text", "text": "..."}, ...]` (OpenAI's predicted-outputs shape). It only ever drafts, so anything else
+/// (another type, wrong value types, empty or oversized text) is no prediction rather than an error.
+pub fn prediction_texts(v: Option<&Value>) -> Vec<String> {
+    const MAX_BYTES: usize = 4 << 20;
+    let Some(p) = v.and_then(Value::as_object) else { return Vec::new() };
+    if p.get("type").and_then(Value::as_str) != Some("content") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    match p.get("content") {
+        Some(Value::String(s)) => out.push(s.clone()),
+        Some(Value::Array(a)) => {
+            for part in a {
+                match (part.get("type").and_then(Value::as_str), part.get("text").and_then(Value::as_str)) {
+                    (Some("text"), Some(t)) => out.push(t.to_string()),
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        _ => {}
+    }
+    out.retain(|s| !s.is_empty());
+    if out.iter().map(String::len).sum::<usize>() > MAX_BYTES {
+        out.clear();
+    }
+    out
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
@@ -566,6 +604,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         stops,
         stop_ids,
         ignore_eos,
+        prediction: if cfg.prediction { prediction_texts(r.get("prediction")) } else { Vec::new() },
         images,
         rows_held: None,
     })
@@ -776,12 +815,26 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     if !p.images.is_empty() {
         return start_images(app, p, pass, info).await;
     }
-    let (plan, released) = {
+    let (plan, released, prediction) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
+        let parts = p.prediction.clone();
         tokio::task::spawn_blocking(move || {
+            // copy drafts: the prediction's ids, its parts kept apart by an id the engine never drafts
+            let mut pred: Vec<u32> = Vec::new();
+            for part in &parts {
+                if pred.len() >= app2.cfg.prediction_max {
+                    break;
+                }
+                if !pred.is_empty() {
+                    pred.push(u32::MAX);
+                }
+                pred.extend(app2.tok.encode_parallel(part, app2.cfg.tokenize_threads));
+            }
+            pred.truncate(app2.cfg.prediction_max);
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            let (plan, released) = t.plan(&text, &app2.tok, app2.cfg.tokenize_threads);
+            (plan, released, pred)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -812,12 +865,15 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP
+            | if p.seed.is_some() { FLAG_SEED } else { 0 }
+            | if prediction.is_empty() { 0 } else { crate::protocol::FLAG_PREDICTION },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
         prompt: plan.ids.clone(),
         images: None,
+        prediction,
     };
     let (req_id, rx) = match app.engine.submit(submit) {
         Ok(x) => x,
@@ -901,6 +957,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         stop_ids: stop_ids.clone(),
         prompt: ids.clone(),
         images: Some(crate::vision::payload(&starts, enc)), // the encoder's buffer itself, not a copy
+        prediction: Vec::new(),
     };
     let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
     eprintln!(
@@ -1115,6 +1172,8 @@ pub(crate) mod tests {
             model_name: "m".into(),
             api_key: None,
             max_tokens_cap: 32768,
+            prediction: true,
+            prediction_max: 65536,
             default_effort: 75,
             encoding: Encoding::V41,
             default_thinking: false,
@@ -1129,6 +1188,42 @@ pub(crate) mod tests {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,
         }
+    }
+
+    #[test]
+    fn predictions() {
+        let m = json!([{"role": "user", "content": "hi"}]);
+        let p = |pred: Value| prepare(&cfg(), &json!({"messages": m, "prediction": pred})).unwrap().prediction;
+        assert_eq!(p(json!({"type": "content", "content": "abc"})), vec!["abc".to_string()]);
+        assert_eq!(
+            p(json!({"type": "content", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": ""}, {"type": "text", "text": "b"}]})),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // anything else is no prediction, never an error
+        for bad in [
+            json!(null),
+            json!("text"),
+            json!(7),
+            json!([1, 2]),
+            json!({}),
+            json!({"type": "content"}),
+            json!({"type": "content", "content": 5}),
+            json!({"type": "content", "content": ""}),
+            json!({"type": "other", "content": "abc"}),
+            json!({"content": "abc"}),
+            json!({"type": "content", "content": [{"type": "image", "text": "a"}]}),
+            json!({"type": "content", "content": [{"type": "text"}]}),
+            json!({"type": "content", "content": ["a"]}),
+            json!({"type": "content", "content": {"text": "a"}}),
+        ] {
+            assert!(p(bad.clone()).is_empty(), "{bad}");
+        }
+        // off (the default): the field is ignored
+        let mut c = cfg();
+        c.prediction = false;
+        let off = prepare(&c, &json!({"messages": m, "prediction": {"type": "content", "content": "abc"}})).unwrap();
+        assert!(off.prediction.is_empty());
+        assert!(prepare(&cfg(), &json!({"messages": m})).unwrap().prediction.is_empty());
     }
 
     #[test]
