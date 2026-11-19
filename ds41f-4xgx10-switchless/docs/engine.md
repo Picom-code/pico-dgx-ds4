@@ -614,6 +614,13 @@ Either way the result is bit-reproducible:
 
 ### Scheduling: time-slicing and batching
 
+Set `DSGB10_ORDINARY_PREFILL_DECODE=1` on rank 0 to let an already-streaming text request
+generate one token between chunks of another text request's prefill. With several resident
+streams, the scheduler rotates through their slots. This can shorten pauses for those streams
+at the cost of a longer wait for the incoming request's first token. The option is off by
+default. It applies to new text requests, including ones with a cached prefix, and skips image
+requests and flights resuming after slot displacement.
+
 One thread runs the requests ([serve.cpp](../engine/server/serve.cpp); [batching.md](batching.md) has
 the design, steps B1 and B2).
 

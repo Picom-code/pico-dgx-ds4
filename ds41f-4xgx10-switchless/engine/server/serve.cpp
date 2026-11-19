@@ -60,6 +60,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -922,6 +923,33 @@ class Server {
     }
   }
 
+  static bool prefill_decode_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_PREFILL_DECODE");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  // Choose one resident peer in slot order, without changing the decode queue's order.
+  std::deque<Flight>::iterator prefill_peer(int prefill_slot) {
+    auto peer = rot_.end();
+    const int slots = (int)slot_.size();
+    int closest = slots;
+    for (auto it = rot_.begin(); it != rot_.end(); ++it) {
+      const Session* session = find(it->rq.h.session_id);
+      if (!session || session->slot < 0 || session->slot == prefill_slot ||
+          slot_[session->slot] != it->rq.h.session_id || !it->rq.spans.empty() ||
+          it->out.empty() || Io::cancelled(it->rq)) continue;
+      const int distance = (session->slot + slots - next_prefill_peer_slot_) % slots;
+      if (distance < closest) {
+        peer = it;
+        closest = distance;
+      }
+    }
+    return peer;
+  }
+
   // Flight f's prompt run in a slot: the request's first (resume false), or the resume of a request whose
   // session lost its slot, which runs the prompt and the tokens sent so far (the session holds them: it
   // restarts at their last position, exact continuation, one row; `keep`: the sessions whose slots it may
@@ -1068,6 +1096,7 @@ class Server {
     model::SampleOut first{};
     int first_row = 0;
     bool cancelled = false;
+    const bool allow_peer_decode = !resume && f.rq.spans.empty() && prefill_decode_enabled();
     while (pos < n) {
       if (Io::cancelled(f.rq)) {
         cancelled = true;
@@ -1075,6 +1104,8 @@ class Server {
       }
       const int R = std::min(o_.prefill_rows, n - pos);
       const bool last = pos + R == n;
+      const bool chunk_path = ced || R > o_.small_rows;
+      const auto peer = allow_peer_decode && !last && chunk_path ? prefill_peer(s) : rot_.end();
       Cmd c{};
       c.slot = s;
       c.pos0 = pos;
@@ -1100,7 +1131,9 @@ class Server {
         c.op = kCmdPrefill;
         c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
         const int rest = n - pos - R;
-        c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
+        // Do not stage another chunk's Engram lookups across a decode on another slot.
+        if (peer == rot_.end() && (rest > o_.small_rows || (ced && rest > 0)))
+          c.next = std::min(o_.prefill_rows, rest);
         for (int i = 0; i < c.n_snaps; ++i)
           if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
         issue(c);
@@ -1115,6 +1148,18 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+      if (peer != rot_.end() && !Io::cancelled(f.rq)) {
+        next_prefill_peer_slot_ = (find(peer->rq.h.session_id)->slot + 1) % (int)slot_.size();
+        peer->paused_s += now_s() - peer->t_paused;
+        const uint32_t why = Io::cancelled(peer->rq) ? fe::kCancelled : decode_one(*peer, false, 1);
+        peer->t_paused = now_s();
+        if (why != kPaused && why != kTurn) {
+          // This chunk has drained. Normal completion may free the peer's slot;
+          // the current prefill stays in flight and remains pinned in every command.
+          finish(*peer, why);
+          rot_.erase(peer);
+        }
+      }
     }
     if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
       Cmd c{};
@@ -1276,7 +1321,7 @@ class Server {
 
   // Flight f's run alone, in its slot: the decode loop (speculative with drafts, unless --no-spec) from its
   // next token on. Its end (fe::k*), or kPaused / kTurn.
-  uint32_t decode_one(Flight& f, bool turns) {
+  uint32_t decode_one(Flight& f, bool turns, int token_budget = 0) {
     const fe::SubmitHeader& h = f.rq.h;
     Session* S = find(h.session_id);
     const int pos = (int)(f.rq.prompt.size() + f.out.size()) - 1, max_new = (int)h.max_new_tokens;
@@ -1289,6 +1334,7 @@ class Server {
     c.tokens[0] = f.out.back();
     c.sp = f.sp;
     c.max_new = turns ? std::min(left, o_.slice) : left;  // a turn while others wait for a slot
+    if (token_budget) c.max_new = std::min(c.max_new, token_budget);
     c.limit = m_.slot_ctx(S->slot);
     c.n_stop = (int)f.rq.stop.size();
     std::copy(f.rq.stop.begin(), f.rq.stop.end(), c.stop);
@@ -1317,7 +1363,7 @@ class Server {
       }
       tokens(f.rq, o, row);  // a paused request's last tokens too: the session holds them
       f.out.push_back(o.row[row].token);
-      if (!ctl && io_.submit_waiting() && admissible()) {  // a new request: this one pauses for its prefill
+      if (!token_budget && !ctl && io_.submit_waiting() && admissible()) {  // a new request's prefill
         m_.set_ctl(1);
         ctl = pause = true;
       }
@@ -1557,6 +1603,7 @@ class Server {
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
+  int next_prefill_peer_slot_ = 0;
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
