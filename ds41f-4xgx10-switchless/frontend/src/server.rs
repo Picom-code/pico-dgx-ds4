@@ -11,7 +11,7 @@ use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
 use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
-use crate::session::SessionTable;
+use crate::session::{Plan, SessionTable};
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -100,6 +100,17 @@ impl App {
             Ok(n) => format!("session table: {n} sessions saved to {}", path.display()),
             Err(e) => format!("session table: NOT saved: {e}"),
         }
+    }
+
+    fn release_sessions(&self, ids: Vec<u64>) {
+        for id in ids {
+            self.engine.release(id);
+        }
+    }
+
+    fn text_terminal(&self, session_id: u64, base_session_id: u64, failed: bool) {
+        let released = self.sessions.lock().unwrap().terminal(session_id, base_session_id, failed);
+        self.release_sessions(released);
     }
 
     fn random_hex(&self, n: usize) -> String {
@@ -606,6 +617,21 @@ impl Usage {
     }
 }
 
+/// Owns a plan until its terminal callback is registered with a successful submission.
+struct PlannedText {
+    app: Arc<App>,
+    plan: Plan,
+    submitted: bool,
+}
+
+impl Drop for PlannedText {
+    fn drop(&mut self) {
+        if !self.submitted {
+            self.app.text_terminal(self.plan.session_id, self.plan.base_session_id, true);
+        }
+    }
+}
+
 /// One request in flight on the engine: decodes, stops, guards and parses its token stream.
 struct Gen {
     app: Arc<App>,
@@ -613,6 +639,7 @@ struct Gen {
     _pass: Pass,
     req_id: u64,
     session_id: u64,
+    is_image: bool,
     prompt_text: String,
     prompt_ids: Vec<u32>,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
@@ -688,8 +715,9 @@ impl Gen {
                 EngineEvent::Done(d) => {
                     self.done = true;
                     if d.reason == DoneReason::Error {
-                        self.app.sessions.lock().unwrap().abandon(self.session_id);
-                        self.app.engine.release(self.session_id);
+                        if self.is_image {
+                            self.app.engine.release(self.session_id);
+                        }
                         return Some(Err(if d.error.is_empty() { "engine error".into() } else { d.error }));
                     }
                     if self.stopped.is_none() {
@@ -711,7 +739,7 @@ impl Gen {
                         Some(te) if self.parser_was_thinking() => kept.iter().position(|&x| x == te).unwrap_or(kept.len()),
                         _ => 0,
                     };
-                    self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+                    self.remember_session();
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
@@ -740,6 +768,16 @@ impl Gen {
         }
     }
 
+    fn remember_session(&self) {
+        if self.is_image {
+            return;
+        }
+        let released = self.app.sessions.lock().unwrap().finish(
+            self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok,
+        );
+        self.app.release_sessions(released);
+    }
+
     /// Pass on the text still held by the decoder and the stop matcher.
     fn flush(&mut self, out: &mut Vec<Delta>) {
         let mut rest = String::new();
@@ -763,7 +801,7 @@ impl Drop for Gen {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
             self.app.engine.cancel(self.req_id);
-            self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
+            self.remember_session();
         }
     }
 }
@@ -776,22 +814,20 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     if !p.images.is_empty() {
         return start_images(app, p, pass, info).await;
     }
-    let (plan, released) = {
-        let app2 = app.clone();
+    let mut reservation = {
+        let app = app.clone();
         let text = p.prompt.clone();
         tokio::task::spawn_blocking(move || {
-            let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            let (plan, released) = app.sessions.lock().unwrap().plan(&text, &app.tok, app.cfg.tokenize_threads);
+            app.release_sessions(released);
+            PlannedText { app, plan, submitted: false }
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
     };
-    for s in released {
-        app.engine.release(s);
-    }
+    let plan = &mut reservation.plan;
     let ctx = info.max_context as usize;
     if plan.ids.len() >= ctx {
-        app.sessions.lock().unwrap().abandon(plan.session_id);
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "invalid_request_error".into(),
@@ -819,13 +855,16 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         prompt: plan.ids.clone(),
         images: None,
     };
-    let (req_id, rx) = match app.engine.submit(submit) {
-        Ok(x) => x,
-        Err(e) => {
-            app.sessions.lock().unwrap().abandon(plan.session_id);
-            return Err(unavailable(e));
+    let app_for_done = Arc::downgrade(app);
+    let session_id = plan.session_id;
+    let base_session_id = plan.base_session_id;
+    let on_done = move |reason| {
+        if let Some(app) = app_for_done.upgrade() {
+            app.text_terminal(session_id, base_session_id, reason == DoneReason::Error);
         }
     };
+    let (req_id, rx) = app.engine.submit_with_done(submit, Some(Box::new(on_done))).map_err(unavailable)?;
+    reservation.submitted = true;
     // where it starts (counts only); rank 0's "serve: req N restart:" line says what the engine found
     eprintln!("req {req_id} plan: {}", plan.describe(p.prompt.len()));
     Ok(Gen {
@@ -833,8 +872,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         _pass: pass,
         req_id,
         session_id: plan.session_id,
+        is_image: false,
         prompt_text: p.prompt.clone(),
-        prompt_ids: plan.ids,
+        prompt_ids: std::mem::take(&mut plan.ids),
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
@@ -912,6 +952,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         _pass: pass,
         req_id,
         session_id,
+        is_image: true,
         prompt_text: p.prompt.clone(),
         prompt_ids: ids,
         rx,
@@ -1109,6 +1150,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("fork_wire_test.rs");
 
     pub(crate) fn cfg() -> ServerConfig {
         ServerConfig {
