@@ -345,8 +345,8 @@ void Model::Impl::state_reserve(size_t bytes) {
   s.pool.free.emplace(0, bytes);
 }
 
-// A block for session h. While none is free, the least recently used session that the current command
-// does not use is evicted (every rank evicts the same): spilled to the disk tier, or freed without one;
+// A block for session h. Evict an unpinned RAM-only session first; otherwise evict the least recently
+// used unpinned session. Every rank makes the same choice. RAM-only sessions are always freed;
 // nullptr when none is left to evict.
 uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
   Store& s = store_of();
@@ -356,10 +356,14 @@ uint8_t* Model::Impl::store_alloc(int h, size_t bytes) {
       return p;
     }
     int victim = -1;
-    uint64_t oldest = UINT64_MAX;
-    for (const auto& [k, ss] : s.sess)
-      if (k != h && !ss.disk && ss.used < oldest && std::find(s.pinned.begin(), s.pinned.end(), k) == s.pinned.end())
-        victim = k, oldest = ss.used;
+    const Store::Sess* selected = nullptr;
+    for (const auto& [k, ss] : s.sess) {
+      if (k == h || ss.disk || std::find(s.pinned.begin(), s.pinned.end(), k) != s.pinned.end()) continue;
+      if (!selected || (ss.ram_only != selected->ram_only ? ss.ram_only : ss.used < selected->used)) {
+        victim = k;
+        selected = &ss;
+      }
+    }
     if (victim < 0) {
       if (rank == 0)
         std::printf("state: no room for %.1f MiB of session %d's state (%.2f of %.2f GiB in use)\n",
@@ -416,6 +420,11 @@ void Model::Impl::state_spill(int h) {
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || it->second.disk) return;
   Store::Sess& ss = it->second;
+  if (ss.ram_only) {
+    state_free(h);
+    s.evicted.push_back(h);
+    return;
+  }
   const bool sp = spec != nullptr;
   const double t0 = wall_s();
   std::vector<size_t> dp;
@@ -765,6 +774,9 @@ void Model::Impl::state_copy_snaps(int src, int dst, int upto) {
   Store& s = store_of();
   const auto it = s.sess.find(src);
   if (it == s.sess.end() || src == dst) return;
+  const auto to = s.sess.find(dst);
+  if (it->second.ram_only && (to == s.sess.end() || !to->second.ram_only))
+    die("state: RAM-only session cannot copy snapshots into a spillable session");
   if (it->second.disk) {
     s.pinned.push_back(dst);
     state_unspill(src);
@@ -813,6 +825,11 @@ void Model::state_restore(int h, int pos) { d_->state_restore(h, pos); }
 void Model::state_restore_end(int h) { d_->state_restore_end(h); }
 void Model::state_drop(int h, int from) { d_->state_drop(h, from); }
 void Model::state_free(int h) { d_->state_free(h); }
+void Model::state_mark_ram_only(int h) {
+  Store::Sess& ss = d_->store_of().use(h);
+  if (ss.disk) die("state: session %d is already on disk", h);
+  ss.ram_only = true;
+}
 void Model::state_copy_snaps(int src, int dst, int upto) { d_->state_copy_snaps(src, dst, upto); }
 void Model::state_drop_snap(int h, int pos) { d_->state_drop_snap(h, pos); }
 uint64_t Model::state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes,

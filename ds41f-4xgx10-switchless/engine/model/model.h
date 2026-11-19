@@ -277,6 +277,7 @@ class Model {
   void state_restore_end(int h);               // the end snapshot -> ring and carries
   void state_drop(int h, int from);            // forget what session h holds from position `from` on
   void state_free(int h);
+  void state_mark_ram_only(int h);  // before this handle receives state; pressure frees it instead of spilling
   void state_copy_snaps(int src, int dst, int upto);  // session src's window snapshots at <= upto -> dst
   void state_drop_snap(int h, int pos);
   // The store's disk tier: base.spill of `bytes` (the same on every rank; an earlier file is removed

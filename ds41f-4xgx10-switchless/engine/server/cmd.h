@@ -41,6 +41,7 @@ enum : int32_t {
   kStSpill,        // state_spill(h)
   kStUnspill,      // state_unspill(h)
   kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
+  kStMarkRamOnly,  // state_mark_ram_only(h)
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;
