@@ -37,12 +37,14 @@ __global__ void k_router_topk(const float* __restrict__ logits, const float* __r
 // batch's core (every row's top k0), then each row's picks preferring the core among its top kp.
 __global__ void __launch_bounds__(1024) k_router_topk_oea(const float* __restrict__ logits, const float* __restrict__ bias,
                                                           int E, int M, int* __restrict__ idx, float* __restrict__ wts,
-                                                          float route_scale, int k0, int kp) {
+                                                          float route_scale, int k0, int kp, const int* sess,
+                                                          const int* rows) {
   __shared__ uint32_t cmask[16];
   const int tid = threadIdx.x, lane = tid & 31;
   pdl_launch_dependents();
   pdl_wait();
   if (tid < 16) cmask[tid] = 0;
+  const bool multi = !sess || sess[min(max(*rows, 1), M) - 1] != sess[0];
   __syncthreads();
   for (int r = tid >> 5; r < M; r += blockDim.x >> 5) {
     int id;
@@ -54,7 +56,8 @@ __global__ void __launch_bounds__(1024) k_router_topk_oea(const float* __restric
   for (int r = tid >> 5; r < M; r += blockDim.x >> 5) {
     int id;
     float w;
-    router_row_oea(logits + (size_t)r * E, bias, E, route_scale, cmask, k0, kp, id, w);
+    if (multi) router_row_oea(logits + (size_t)r * E, bias, E, route_scale, cmask, k0, kp, id, w);
+    else router_row(logits + (size_t)r * E, bias, E, route_scale, id, w);  // exact: one session's rows: router_topk's
     if (lane < kTopK) idx[r * kTopK + lane] = id, wts[r * kTopK + lane] = w;
   }
 }
@@ -62,15 +65,15 @@ __global__ void __launch_bounds__(1024) k_router_topk_oea(const float* __restric
 }  // namespace
 
 void router_topk_oea(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale, int k0,
-                     int kp, cudaStream_t st) {
+                     int kp, cudaStream_t st, const int* sess, const int* rows) {
   if (E > 512 || k0 < 1 || k0 >= kTopK || kp < kTopK || kp > 16) die("router_topk_oea: E=%d k0=%d kp=%d", E, k0, kp);
-  launch_pdl(k_router_topk_oea, dim3(1), dim3(1024), 0, st, true, logits, bias, E, M, idx, wts, route_scale, k0, kp);
+  launch_pdl(k_router_topk_oea, dim3(1), dim3(1024), 0, st, true, logits, bias, E, M, idx, wts, route_scale, k0, kp, sess, rows);
 }
 
 void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float eps, __nv_bfloat16* y, uint8_t* q,
-             uint8_t* s, cudaStream_t st) {
-  if (D % 256 || D > 8192) die("rmsnorm: D=%d", D);
-  launch_pdl(k_rmsnorm, dim3(M), dim3(D / 8), 0, st, true, x, w, D, eps, y, q, s);
+             uint8_t* s, cudaStream_t st, int threads) {
+  if (D % 256 || D > 8192 || threads < 0 || threads % 32 || threads > 1024) die("rmsnorm: D=%d threads=%d", D, threads);
+  launch_pdl(k_rmsnorm, dim3(M), dim3(threads ? threads : D / 8), 0, st, true, x, w, D, eps, y, q, s);
 }
 
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,

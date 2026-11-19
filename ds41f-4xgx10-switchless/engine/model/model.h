@@ -93,6 +93,11 @@ struct SpecBatch {
   SpecCfg cfg;
   int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
   int budget = 0;     // night T2/T4: > 0: the next step's rows across the entries, at most (StepIn::rbudget)
+  // copy drafts (ops.h CopyWin; launch_verify_batch with Model::spec_copy()): copy_on, the windows (ent < 0 or
+  // n < 2: none), their tokens and the step's rows at most once a window is used
+  int copy_on = 0, copy_cap = 0;
+  ops::CopyWin copy[ops::kCopyWin] = {};
+  int32_t copy_tok[ops::kCopyTok] = {};
 };
 
 // One step, as rank 0 decided it (the golden and bench modes: every rank receives the same).
@@ -234,6 +239,15 @@ class Model {
   int spec_batch_rows() const;
   uint64_t launch_spec_batch(const SpecBatch& b);
   uint64_t launch_verify_batch(const SpecBatch& b);
+  // Copy drafts (ops.h CopyWin; DSGB10_COPY=1 with session slots). spec_copy(): on. spec_layout(): batch verify
+  // step n's rows as the device lays them out, from ss [kMaxSess] (each entry's next_rows, next_pos0 and next_tok
+  // as the step before it reported them): its StepIn copied to *d and laid out (rows, tokens, pos, sess), ncopy
+  // [kMaxSess] the drafts each entry takes from a window; returns the rows. For the rows' Engram lookups
+  // (engram_late_rows), before the step is waited for and before four more are launched.
+  // history(): the token ids of slot s's sequence so far (set_tokens and the steps' rows).
+  bool spec_copy() const;
+  int spec_layout(uint64_t n, const ops::SpecState* ss, ops::StepIn* d, int* ncopy) const;
+  const std::vector<int32_t>& history(int slot) const;
   unsigned spec_batch_mismatches() const;
   // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
   // order, each its next_s* of the step before): their tokens, positions and slots.

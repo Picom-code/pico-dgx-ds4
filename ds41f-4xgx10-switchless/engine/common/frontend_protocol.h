@@ -40,6 +40,10 @@ enum SubmitFlags : uint32_t {
   // vision (docs/vision.md): after prompt[], uint32 n_images, ImageSpan spans[n_images], then the spans' rows,
   // bf16 [sum rows][5120] in span order. Only image requests set it; a text SUBMIT is unchanged.
   kFlagImages = 8,
+  // copy drafts (docs/copy.md): the client's `prediction` as token ids: SubmitHeader::reserved of them follow
+  // prompt[] (before the image part). Drafts only: the engine verifies every token. Only requests with a prediction
+  // set it, and only a front-end started with --prediction; other SUBMITs are unchanged.
+  kFlagPrediction = 16,
 };
 
 // An image's span of the prompt: positions [start, start + rows), every id 129264 (<｜deepseek_image｜>);
@@ -69,7 +73,7 @@ struct SubmitHeader {
   uint32_t prefix_hint;      // prompt tokens the front-end expects to match the session (advisory)
   uint32_t n_stop_ids;       // ids that end generation (EOS is in here)
   uint32_t n_prompt;         // >= 1
-  uint32_t reserved;
+  uint32_t reserved;         // kFlagPrediction: the prediction's token ids after prompt[]; else 0
 };
 
 struct Cancel {

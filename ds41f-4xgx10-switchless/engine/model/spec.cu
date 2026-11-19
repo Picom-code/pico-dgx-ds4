@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 
 #include "model/nvtx.h"
@@ -36,6 +37,14 @@ int spec_wide_rows() {
   return w;
 }
 int spec_row_cap() { return spec_wide_rows() ? spec_wide_rows() : kDecodeRows; }
+// copy drafts (spec.h, server/copy.h): DSGB10_COPY=1
+bool spec_copy_env() {
+  static const bool on = [] {
+    const char* e = getenv("DSGB10_COPY");
+    return e && atoi(e) > 0;
+  }();
+  return on;
+}
 // wide64: DSGB10_DRAFT1=T (> dspark::kBatchEnts): batch steps of T or more entries draft them in one pass
 int draft1_min() {
   static const int t = [] {
@@ -188,7 +197,8 @@ struct IfHandles {
 };
 __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
                                 int* row0, int* stab, int* bent, int* pstab, cudaGraphConditionalHandle hsw,
-                                IfHandles hif, cudaGraphConditionalHandle hpass, IfHandles hchk, int ndb) {
+                                IfHandles hif, cudaGraphConditionalHandle hpass, IfHandles hchk, int ndb, int xmask,
+                                int xbase, int cgm) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   const uint32_t slot = *counter % ops::kInSlots;
   for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -201,7 +211,27 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
     const int S = ops::spec_batch_passes(*d, bent, pstab, ndb);
     *counter += 1;
-    cudaGraphSetConditional(hsw, (unsigned)ops::spec_body(d->rows));  // wide64: a bucket's body past kDecodeRows
+    int body = ops::spec_body(d->rows);  // wide64: a bucket's body past kDecodeRows
+    // copy drafts (DSGB10_EXACT_SOLO): a wide step of ONE entry's rows (a copy step) takes its bucket's exact body
+    if (cgm) {  // the copy graph: bodies 0 .. xbase - 1 run 1 .. xbase rows, then the exact buckets of the mask
+      if (d->rows <= xbase) {
+        body = d->rows - 1;
+      } else {  // the smallest exact bucket that holds the rows (the layout keeps a copy step to those: copy_fit)
+        int bi = d->rows > kDecodeRows ? body - kDecodeRows : 0, top = 0;
+        for (int i = 0; i < ops::kNumWideBuckets; ++i)
+          if ((xmask >> i) & 1) top = i;
+        while (bi < top && !((xmask >> bi) & 1)) ++bi;
+        if (bi > top) bi = top;
+        int j = 0;
+        for (int i = 0; i < bi; ++i) j += (xmask >> i) & 1;
+        body = xbase + j;
+      }
+    } else if (xmask && S == 1 && d->rows > kDecodeRows && ((xmask >> (body - kDecodeRows)) & 1)) {
+      int j = 0;
+      for (int i = 0; i < body - kDecodeRows; ++i) j += (xmask >> i) & 1;
+      body = xbase + j;
+    }
+    cudaGraphSetConditional(hsw, (unsigned)body);
     for (int k = 0; k < hif.n; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
     cudaGraphSetConditional(hpass, (unsigned)(S - 1));
     for (int k = 0; k < hchk.n; ++k) cudaGraphSetConditional(hchk.h[k], d->sess_on[k] ? 1u : 0u);
@@ -316,6 +346,82 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
   o.next_spos0[k] = P;
   for (int j = 0; j < ops::kSessTok; ++j) o.next_stok[k][j] = s.next_tok[j];
   __threadfence_system();
+}
+
+// ---- copy drafts (spec.h) ------------------------------------------------------------------------------
+// The next chunk of final rows the loop accepts into the draft module's windows: the entries on in order, each its
+// final rows before its last dspark::kMaxAcc (those are its own accept's), kMaxAcc at a time, into lp (spec.h clp).
+__device__ __forceinline__ bool copy_chunk(const ops::StepIn* in, const ops::SpecState* ss, const int* row0, int* lp) {
+  int k = lp[4], done = lp[5];
+  const int ns = min(max(in->nsess, 1), ops::kMaxSess);
+  for (; k < ns; ++k, done = 0) {
+    if (!in->sess_on[k]) continue;
+    const int left = ss[k].count - dspark::kMaxAcc - done;
+    if (left <= 0) continue;
+    const int n = min(left, (int)dspark::kMaxAcc);
+    lp[0] = n, lp[1] = ss[k].pos0 + done, lp[2] = row0[k] + done;
+    for (int j = 0; j < dspark::kMaxAcc; ++j) lp[8 + j] = in->sess_slot[k];
+    lp[4] = k, lp[5] = done + n;
+    return true;
+  }
+  lp[4] = ns, lp[5] = 0;
+  return false;
+}
+// After the verdicts: each entry's accept (acc: its last kMaxAcc final rows; an entry of at most kMaxAcc final rows:
+// all of them, as before), and the loop's first chunk and condition.
+__global__ void k_copy_acc(const ops::StepIn* in, const ops::SpecState* ss, const int* row0, int* acc, int* lp,
+                           cudaGraphConditionalHandle hw) {
+  if (threadIdx.x != 0) return;
+  for (int k = 0; k < ops::kMaxSess; ++k) {
+    const int c = ss[k].count, over = c > dspark::kMaxAcc ? c - dspark::kMaxAcc : 0;
+    acc[k] = c - over, acc[ops::kMaxSess + k] = ss[k].pos0 + over, acc[2 * ops::kMaxSess + k] = row0[k] + over;
+  }
+  lp[4] = 0, lp[5] = 0;
+  cudaGraphSetConditional(hw, copy_chunk(in, ss, row0, lp) ? 1u : 0u);
+}
+__global__ void k_copy_next(const ops::StepIn* in, const ops::SpecState* ss, const int* row0, int* lp,
+                            cudaGraphConditionalHandle hw) {
+  if (threadIdx.x != 0) return;
+  cudaGraphSetConditional(hw, copy_chunk(in, ss, row0, lp) ? 1u : 0u);
+}
+// A wide body's rows' ratio-2 projections and scores (block r: row r) into save [2][kMaxRows][kHead].
+__global__ void k_copy_save(const float* kv, const float* sc, float* save) {
+  const int r = blockIdx.x;
+  for (int c = threadIdx.x; c < kHead; c += blockDim.x) {
+    save[(size_t)r * kHead + c] = kv[(size_t)r * kHead + c];
+    save[((size_t)kMaxRows + r) * kHead + c] = sc[(size_t)r * kHead + c];
+  }
+}
+// After the verdicts of a wide step: an entry with more than 16 rows left each ratio-2 carry holding its last 16
+// rows by position (attn's carry_row), rejected ones among them; its last 16 final rows go back in, so that the
+// next step's first row finds the projection of the position before it. Block (j, y): the entry's final row
+// count - 1 - j, kv source y. carry: the three sources' kv and score, a unit `stride` floats.
+struct CopyCarry {
+  float* kv[3];
+  float* sc[3];
+  size_t stride;
+};
+__global__ void k_copy_repair(const ops::StepIn* in, const ops::SpecState* ss, const int* row0, const float* save,
+                              CopyCarry carry) {
+  const int j = blockIdx.x, y = blockIdx.y;
+  const int ns = min(max(in->nsess, 1), ops::kMaxSess);
+  if (in->rows <= kDecodeRows) return;
+  for (int k = 0; k < ns; ++k) {
+    if (!in->sess_on[k]) continue;
+    int sr = 0;
+    for (int r = row0[k]; r < in->rows && in->sess[r] == k; ++r) ++sr;
+    if (sr <= 16) continue;
+    const int q = ss[k].count - 1 - j;
+    if (q < 0) continue;
+    const int row = row0[k] + q, slot = (ss[k].pos0 + q) & 15;
+    const float* s = save + (size_t)y * 2 * kMaxRows * kHead;
+    float* dkv = carry.kv[y] + (size_t)in->sess_slot[k] * carry.stride + (size_t)slot * kHead;
+    float* dsc = carry.sc[y] + (size_t)in->sess_slot[k] * carry.stride + (size_t)slot * kHead;
+    for (int c = threadIdx.x; c < kHead; c += blockDim.x) {
+      dkv[c] = s[(size_t)row * kHead + c];
+      dsc[c] = s[((size_t)kMaxRows + row) * kHead + c];
+    }
+  }
 }
 
 // DIAGNOSTICS (Options::bgraph_check): one entry's drafts from the one-session draft() (a: ids [6], conf [5]
@@ -550,6 +656,7 @@ class RingComm final : public dspark::Comm {
 Spec::~Spec() {
   for (auto& g : graphs) cudaGraphExecDestroy(g.second);
   for (auto& g : bgraphs) cudaGraphExecDestroy(g.second);
+  for (auto& g : cgraphs) cudaGraphExecDestroy(g.second);
   for (void* p : whole) cudaFree(p);
   cudaFree(rope);
   cudaFree(mh);
@@ -559,6 +666,9 @@ Spec::~Spec() {
   cudaFree(bent);
   cudaFree(pstab);
   cudaFree(mism);
+  cudaFree(acc);
+  cudaFree(clp);
+  cudaFree(csave);
   cudaFree(pf_mh);
   cudaFree(pf_acc);
   cudaFreeHost(pf_acc_h);
@@ -758,6 +868,17 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   sp.pstab = dalloc<int>((size_t)ops::kMaxSess * ops::kDrafts);
   sp.mism = dalloc<unsigned>(1);
   if (sp.bents >= 2) sp.draft->enable_batch();
+  sp.copy = spec_copy_env() && sp.bents >= 2;  // copy drafts (spec.h)
+  if (sp.copy) {
+    sp.acc = dalloc<int>(3 * (size_t)ops::kMaxSess);
+    sp.clp = dalloc<int>(16);
+    sp.csave = dalloc<float>((size_t)3 * 2 * kMaxRows * kHead);
+    CUDA_CHECK(cudaMemsetAsync(sp.clp, 0, 16 * sizeof(int), st));
+    CUDA_CHECK(cudaMemsetAsync(sp.csave, 0, (size_t)3 * 2 * kMaxRows * kHead * sizeof(float), st));
+    if (rank == 0)
+      std::printf("spec: copy drafts on (DSGB10_COPY): batch spec steps take copy windows, up to %d rows a step\n",
+                  spec_row_cap());
+  }
   // the prefill's seed rows, sized for a 4096-row chunk with snapshots every 1024 (768 rows in 96
   // groups, 384 on the last rank), so that a prefill rarely has to grow them (which synchronises)
   sp.pf_rows = kSpecPfRows + 2 * kSnapRows, sp.pf_groups = 128;
@@ -770,6 +891,13 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
 void Model::Impl::spec_head_coded() {
   if (!spec->graphs.empty()) die("model: code_head after a spec step was captured");
   if (!opt.draft_fp8 && !opt.draft_head4) spec->draft->set_head_coded(head);  // dspark's Weights::head is this slot too
+}
+
+void Model::Impl::spec_copy_save(int k, int R, cudaStream_t s) {
+  if (!spec || !spec->copy || k < 0 || k > 2) return;
+  if (exact_solo() && !g_ctail) return;  // copy drafts: the copy graph's bodies only
+  k_copy_save<<<R, 128, 0, s>>>(ckvf, cscf, spec->csave + (size_t)k * 2 * kMaxRows * kHead);
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void Model::Impl::spec_hidden(int L, int R) {
@@ -945,10 +1073,17 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
 // entries and the publication. The passes run one after the other (they share the draft module's batch
 // buffers, and the ring's collectives run in one order on every rank). Captured only with Options::slots
 // > 1; the one-session graph above is not touched.
-cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
+cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx, bool cg) {
   Spec& sp = *spec;
-  const auto it = sp.bgraphs.find(ctx);
-  if (it != sp.bgraphs.end()) return it->second;
+  // copy drafts: with DSGB10_EXACT_SOLO the batch step graph is the graph of a build without copy drafts, node for node, and
+  // verify steps that carry a copy window (one entry on) run a graph of their own (cg): the bodies such a step can
+  // take (1..kLowRows rows; the exact wide buckets) and the copy tail. Without the variable: one graph, as before.
+  const bool two = sp.copy && exact_solo() != 0;
+  if (!two) cg = false;
+  const bool copyt = sp.copy && (!two || cg);  // this graph holds the copy tail
+  auto& gmap = cg ? sp.cgraphs : sp.bgraphs;
+  const auto it = gmap.find(ctx);
+  if (it != gmap.end()) return it->second;
   if (sp.bents < 2) die("model: a batch spec step needs Options::slots > 1");
   const clock_t t0 = clock();
   size_t free0 = 0, free1 = 0, total = 0;
@@ -967,6 +1102,13 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   const int wide = spec_wide_rows();
   const int nwide = wide > kDecodeRows ? ops::spec_body(wide) - kDecodeRows + 1 : 0;
   const int bodies = opt.bgraph_bodies > 0 ? std::min(kDecodeRows, opt.bgraph_bodies) : kDecodeRows + nwide;
+  // copy drafts (DSGB10_EXACT_SOLO): after them, an exact body for each wide bucket of the mask (one-entry steps)
+  const int xall = (1 << nwide) - 1;
+  const int xmask = (opt.bgraph_bodies > 0 || nwide == 0 || (two && !cg)) ? 0 : (exact_solo() & xall);
+  const int pb = cg ? (int)dsk::kLowRows : bodies;  // the bodies of exact row counts (the copy graph: 1..kLowRows rows)
+  int xbodies = 0, xrows[ops::kNumWideBuckets] = {};
+  for (int i = 0; i < ops::kNumWideBuckets; ++i)
+    if ((xmask >> i) & 1) xrows[xbodies++] = ops::wide_bucket_rows(i);
   const bool noif = opt.bgraph_noif, check = opt.bgraph_check;
   IfHandles hif{}, hchk{};
   hif.n = noif ? 0 : sp.bents;  // a handle per if node, no more: a handle no node uses is an error at instantiate
@@ -976,7 +1118,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   // the step's rows, the switch's value, the ifs' and the passes' switch's
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
   k_spec_in_batch<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, sp.row0, sp.stab, sp.bent, sp.pstab, hsw, hif, hpass,
-                                     hchk, dspark::draft_rows_batch());
+                                     hchk, dspark::draft_rows_batch(), xmask, pb, cg ? 1 : 0);
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;
@@ -989,14 +1131,17 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   cp.type = cudaGraphNodeTypeConditional;
   cp.conditional.handle = hsw;
   cp.conditional.type = cudaGraphCondTypeSwitch;
-  cp.conditional.size = bodies;
+  cp.conditional.size = pb + xbodies;
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int b = 0; b < bodies; ++b) {  // body b: b + 1 rows, or a wide bucket's rows (pad rows past the step's)
-    const int R = b < kDecodeRows ? b + 1 : ops::wide_bucket_rows(b - kDecodeRows);
+  for (int b = 0; b < pb + xbodies; ++b) {  // body b: b + 1 rows, or a wide bucket's rows (pad rows past the step's)
+    const int R = b >= pb ? xrows[b - pb] : b < kDecodeRows ? b + 1 : ops::wide_bucket_rows(b - kDecodeRows);
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[b], nullptr, nullptr, 0, mode));
+    g_xbody = b >= pb;  // copy drafts: the exact kernels (DSGB10_NORM_EXACT, DSGB10_WIDE_EXACT) in these bodies only
+    g_ctail = copyt;
     forward_rows(R, ctx, 0, nullptr, 0);
+    g_xbody = false, g_ctail = false;
     // the verdicts, per entry: the sampler's grid by the body's rows (16 rows: the launch of before wide64)
     ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss,
                 R > kDecodeRows ? kMaxRows : kDecodeRows);
@@ -1004,7 +1149,13 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int b = 0; b < bodies; ++b) {
+  if (xbodies && rank == 0 && gmap.empty()) {
+    std::fprintf(stderr, "model: DSGB10_EXACT_SOLO=%d: %d exact bodies (", xmask, xbodies);
+    for (int i = 0; i < xbodies; ++i) std::fprintf(stderr, "%s%d", i ? ", " : "", xrows[i]);
+    std::fprintf(stderr, " rows) for wide steps of one entry%s; every other step runs the bodies of before\n",
+                 cg ? ", in the copy step graph (verify steps that carry a copy window)" : "");
+  }
+  for (int b = 0; b < pb + xbodies; ++b) {
     size_t k = 0;
     CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[b], nullptr, &k));
     nodes += k;
@@ -1013,6 +1164,23 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
   std::vector<cudaGraphNode_t> tail(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  // copy drafts (spec.h): the entries' accepts and the loop's first chunk; a wide step's carries
+  cudaGraphConditionalHandle hw{};
+  if (copyt) {
+    CUDA_CHECK(cudaGraphConditionalHandleCreate(&hw, g, 0, 0));
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
+    k_copy_acc<<<1, 32, 0, st>>>(in_d, sp.ss, sp.row0, sp.acc, sp.clp, hw);
+    if (wide > kDecodeRows) {
+      CopyCarry cc{};
+      for (int y = 0; y < 3; ++y) cc.kv[y] = kvs0[y].carry_kv, cc.sc[y] = kvs0[y].carry_sc;
+      cc.stride = KvSrc::kCarryStride;
+      k_copy_repair<<<dim3(16, 3), 128, 0, st>>>(in_d, sp.ss, sp.row0, sp.csave, cc);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
+    tail.assign(deps, deps + nd);
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+  }
   // the entries' accepts, each under its if: entry k's final rows from its row0 into its slot's windows,
   // its anchor into the draft module's batch_start()[k] (what the pass reads)
   std::vector<cudaGraph_t> ifbody;
@@ -1032,7 +1200,11 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
     }
     const int* slot = sp.stab + (size_t)k * dspark::kMaxAcc;
-    sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k, sp.draft->batch_start() + k);
+    if (copyt)  // its last kMaxAcc final rows (k_copy_acc); the anchor is the last final row either way
+      sp.draft->accept(sp.mh, sp.acc + k, sp.acc + ops::kMaxSess + k, st, slot, sp.acc + 2 * ops::kMaxSess + k,
+                       sp.draft->batch_start() + k);
+    else
+      sp.draft->accept(sp.mh, &sp.ss[k].count, &sp.ss[k].pos0, st, slot, sp.row0 + k, sp.draft->batch_start() + k);
     if (!noif) {
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
       size_t kn = 0;
@@ -1045,6 +1217,26 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
       tail.assign(deps, deps + nd);
       CUDA_CHECK(cudaStreamEndCapture(st, &cap));
     }
+  }
+  // copy drafts: the loop over the final rows before the entries' last kMaxAcc, a chunk an iteration
+  if (copyt) {
+    cudaGraphNodeParams wp{};
+    wp.type = cudaGraphNodeTypeConditional;
+    wp.conditional.handle = hw;
+    wp.conditional.type = cudaGraphCondTypeWhile;
+    wp.conditional.size = 1;
+    cudaGraphNode_t wn;
+    CUDA_CHECK(cudaGraphAddNode(&wn, g, tail.data(), nullptr, tail.size(), &wp));
+    cudaGraph_t body = wp.conditional.phGraph_out[0];
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
+    sp.draft->accept(sp.mh, sp.clp, sp.clp + 1, st, sp.clp + 8, sp.clp + 2, sp.clp + 3);
+    k_copy_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.row0, sp.clp, hw);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    size_t kn = 0;
+    CUDA_CHECK(cudaGraphGetNodes(body, nullptr, &kn));
+    nodes += kn;
+    tail.assign(1, wn);
   }
   // the draft passes over the entries on, after the last accept: a switch over their number S (the
   // device's: k_spec_in_batch sets S - 1), body S - 1 running passes of at most kBatchEnts entries over
@@ -1104,7 +1296,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     ifbody.push_back(body);
     tail.assign(1, node);
   }
-  sp.bnodes = nodes;
+  if (!cg) sp.bnodes = nodes;
   // the gates, one kernel over the entries on, then the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, tail.data(), nullptr, tail.size(), mode));
   static_assert(ops::kMaxSess <= 32, "k_spec_gate_batch_all: a thread per entry");
@@ -1139,7 +1331,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     CUDA_CHECK(ie);
   }
   CUDA_CHECK(cudaGraphDestroy(g));
-  sp.bgraphs.emplace(ctx, e);
+  gmap.emplace(ctx, e);
+  if (cg) sp.cnodes = nodes;
   CUDA_CHECK(cudaMemGetInfo(&free1, &total));
   if (rank == 0 && !sp.quiet)
     std::printf("spec: the batch step graph of context %d (%d entries, %zu nodes in its bodies) in %.2f s (CPU), %.1f "
@@ -1171,8 +1364,19 @@ void Model::Impl::spec_graphs() {
   spec->quiet = true;
   for (int p = 0; p < opt.max_ctx; p += kCtxBucket) spec_batch_graph(scan_ctx(p));
   spec_batch_graph(scan_ctx(opt.max_ctx - 1));
-  spec->quiet = false;
   CUDA_CHECK(cudaMemGetInfo(&free2, &total));
+  if (spec->copy && exact_solo()) {  // copy drafts: the copy step graphs
+    const clock_t t2 = clock();
+    for (int p = 0; p < opt.max_ctx; p += kCtxBucket) spec_batch_graph(scan_ctx(p), true);
+    spec_batch_graph(scan_ctx(opt.max_ctx - 1), true);
+    size_t free3 = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free3, &total));
+    if (rank == 0)
+      std::printf("spec: %zu copy step graph%s (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB of device memory\n",
+                  spec->cgraphs.size(), spec->cgraphs.size() == 1 ? "" : "s", spec->cnodes,
+                  (double)(clock() - t2) / CLOCKS_PER_SEC, ((double)free2 - (double)free3) / 1073741824.0);
+  }
+  spec->quiet = false;
   if (rank == 0)
     std::printf("spec: %zu batch step graph%s of up to %d entries (%zu nodes in its bodies) in %.1f s (CPU), %.2f GiB "
                 "of device memory\n", spec->bgraphs.size(), spec->bgraphs.size() == 1 ? "" : "s", spec->bents,
@@ -1273,6 +1477,19 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     return c;
   }();
   for (int i = 0; i < 4; ++i) in.wcost[i] = wc[i];
+  // copy drafts: the host's windows, for a verify step of a graph captured with them
+  in.copy_on = spec->copy && mode == ops::kSpecVerify && b.copy_on ? 1 : 0;
+  if (in.copy_on) {  // copy drafts: a one-entry step's rows fit a body that is exact (spec_batch.h copy_fit)
+    int S = 0;
+    for (int k = 0; k < ops::kMaxSess; ++k) S += in.sess_on[k] ? 1 : 0;
+    if (S == 1) in.copy_on |= exact_solo() << 8;
+    else if (exact_solo()) in.copy_on = 0;  // the copy step graph holds one-entry bodies only: no window in a shared step
+  }
+  in.copy_cap = std::max(1, std::min(b.copy_cap, spec_row_cap()));
+  if (in.copy_on) {
+    std::copy(b.copy, b.copy + ops::kCopyWin, in.copy);
+    std::copy(b.copy_tok, b.copy_tok + ops::kCopyTok, in.copy_tok);
+  }
 }
 
 // The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its
@@ -1367,7 +1584,8 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
     late.on = true, late.any = true, late.batch = true;
     late.pos0 = -1, late.R = 0, late.seq[0] = seq[0], late.seq[1] = seq[1];
   }
-  const cudaGraphExec_t e = spec_batch_graph(scan_ctx(std::min(b.pos_bound, opt.max_ctx - 1)));
+  // copy drafts: a step that carries a copy window runs the copy step graph (DSGB10_EXACT_SOLO), every other the batch step graph
+  const cudaGraphExec_t e = spec_batch_graph(scan_ctx(std::min(b.pos_bound, opt.max_ctx - 1)), in.copy_on != 0);
   const int slot = (int)(n % ops::kOutSlots);
   CUDA_CHECK(cudaEventRecord(ev_beg[slot], st));
   CUDA_CHECK(cudaGraphLaunch(e, st));
@@ -1384,6 +1602,18 @@ const uint16_t* Model::mh_dump(uint64_t n) const {
 void Model::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) { d_->bind_spec(wf, draft); }
 int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }
 int Model::spec_batch_rows() const { return detail::spec_row_cap(); }
+bool Model::spec_copy() const { return d_->spec && d_->spec->copy; }
+int Model::spec_layout(uint64_t n, const ops::SpecState* ss, ops::StepIn* d, int* ncopy) const {
+  if (n >= d_->n_steps || n + ops::kInSlots < d_->n_steps) die("model: spec_layout of step %llu", (unsigned long long)n);
+  std::memcpy(d, &d_->in_h[n % ops::kInSlots], sizeof(ops::StepIn));
+  if (!d->sbatch || d->spec != ops::kSpecVerify) die("model: spec_layout of a step that is no batch verify step");
+  int row0[ops::kMaxSess];
+  return ops::spec_batch_layout(*d, ss, row0, ncopy);
+}
+const std::vector<int32_t>& Model::history(int slot) const {
+  if (slot < 0 || slot >= d_->nslots) die("model: history of slot %d", slot);
+  return d_->hist_of(d_->unit_of[slot]);
+}
 unsigned Model::spec_batch_mismatches() const {
   if (!d_->spec || !d_->spec->mism) return 0;
   unsigned n = 0;

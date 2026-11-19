@@ -15,6 +15,8 @@
 #include "kernels/common.cuh"
 #include "kernels/dsk.h"
 
+#include <algorithm>
+
 namespace dsk {
 
 namespace {
@@ -52,6 +54,11 @@ struct Params {
   int* ctr;
   // night T3 (EXPERIMENT): batch-aware re-routing (common.cuh router_row_oea) for calls of at least oea_min rows
   int oea_k0 = 0, oea_kp = 0, oea_min = 1 << 30;
+  // exact: the step's row -> session table and row count (device memory, read when the kernel runs); given, the
+  // re-routing applies only to a call whose rows are of two or more sessions (rows [oea_row0, ..) of the step)
+  const int* oea_sess = nullptr;
+  const int* oea_rows = nullptr;
+  int oea_row0 = 0;
 };
 
 // The sorted union of the experts picked by M <= RB rows, with each row's routing weight.
@@ -75,7 +82,11 @@ __device__ void build_union(Union<RB>& U, const Params& a, int M) {
   const int tid = threadIdx.x, ne = M * kTopK;
   if (tid < kMaskWords) U.mask[tid] = 0;
   if (tid < RB * kTopK) U.rows[tid] = 0;
-  const bool oea = a.logits && a.oea_k0 > 0 && M >= a.oea_min;  // uniform over the CTA
+  bool oea = a.logits && a.oea_k0 > 0 && M >= a.oea_min;  // uniform over the CTA
+  if (oea && a.oea_sess) {  // exact: one session's rows are never re-routed (its text must not depend on its step's width)
+    const int n = min(max(*a.oea_rows - a.oea_row0, 1), M);
+    oea = a.oea_sess[a.oea_row0 + n - 1] != a.oea_sess[a.oea_row0];
+  }
   if (oea) {
     if (tid < kMaskWords) U.cmask[tid] = 0;
     __syncthreads();
@@ -1199,6 +1210,498 @@ __global__ void __launch_bounds__(32 * W, 1) k_moe_down_r16(Params a) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// exact wide: the MoE of a wide step (17..64 rows) with the decode kernels' arithmetic and one read of every expert.
+// The union is taken over all the step's rows; an expert's rows (those that picked it) are packed into the MMAs' 16
+// row slots, in groups of 16 when more than 16 rows picked it, each group's MMAs on the weights already in registers.
+// Per (row, expert) the sums are k_moe_up_r16's (WK = 4 slices of w1 / w3 in step order, the fixed-order sum, bf16,
+// SwiGLU, the routing weight, bf16, act_quant per 32) and k_moe_down_r16's (one chain of 9 steps, bf16; per row the
+// experts folded in fp32 in expert-id order, the shared expert last): the bits of moe() on any 1..16 of the rows.
+// The router's picks come in idx / wts (router_topk). Workspace: hq [kWPicks + kWRows][576] (slot = the pick's index
+// row * 6 + k; the shared expert's row m at kWPicks + m), then hs [..][18].
+constexpr int kWRows = 64, kWPicks = kWRows * kTopK;
+
+struct UnionW {
+  int n;                                 // experts in the union
+  int id[kWPicks];                       // sorted
+  int off[kWPicks + 1];                  // expert r's picks: pk[off[r] .. off[r + 1])
+  uint16_t pk[kWPicks];                  // pick indices (row * 6 + k) by expert, rows ascending
+  uint32_t rlo[kWPicks], rhi[kWPicks];   // bit m: row m picked the expert
+  uint32_t mask[kMaskWords];
+  int pre[kMaskWords];
+  float w[kWPicks];                      // routing weights by pick index
+};
+
+// All threads of the CTA (a multiple of 32). idx / wts through L2 (an earlier kernel wrote them).
+__device__ void build_union_w(UnionW& U, const Params& a, int M) {
+  const int tid = threadIdx.x, nt = blockDim.x, ne = M * kTopK;
+  if (tid < kMaskWords) U.mask[tid] = 0;
+  for (int i = tid; i < kWPicks; i += nt) U.rlo[i] = 0, U.rhi[i] = 0, U.off[i + 1] = 0;
+  if (tid == 0) U.off[0] = 0;
+  __syncthreads();
+  for (int i = tid; i < ne; i += nt) {
+    const int id = __ldcg(a.idx + i);
+    U.w[i] = __ldcg(a.wts + i);
+    atomicOr(&U.mask[id >> 5], 1u << (id & 31));
+  }
+  __syncthreads();
+  if (tid < 32) {
+    int c = tid < kMaskWords ? __popc(U.mask[tid]) : 0, incl = c;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      int v = __shfl_up_sync(0xffffffffu, incl, o);
+      if (tid >= o) incl += v;
+    }
+    if (tid < kMaskWords) U.pre[tid] = incl - c;
+    if (tid == 31) U.n = incl;
+  }
+  __syncthreads();
+  for (int i = tid; i < ne; i += nt) {
+    const int id = __ldcg(a.idx + i);
+    const int r = U.pre[id >> 5] + __popc(U.mask[id >> 5] & ((1u << (id & 31)) - 1));
+    const int m = i / kTopK;
+    U.id[r] = id;
+    atomicAdd(&U.off[r + 1], 1);
+    if (m < 32) atomicOr(&U.rlo[r], 1u << m);
+    else atomicOr(&U.rhi[r], 1u << (m - 32));
+  }
+  __syncthreads();
+  if (tid == 0)
+    for (int r = 0; r < U.n; ++r) U.off[r + 1] += U.off[r];
+  __syncthreads();
+  for (int i = tid; i < ne; i += nt) {
+    const int id = __ldcg(a.idx + i);
+    const int r = U.pre[id >> 5] + __popc(U.mask[id >> 5] & ((1u << (id & 31)) - 1));
+    const int m = i / kTopK;
+    const int below = m < 32 ? __popc(U.rlo[r] & ((1u << m) - 1)) : __popc(U.rlo[r]) + __popc(U.rhi[r] & ((1u << (m - 32)) - 1));
+    U.pk[U.off[r] + below] = (uint16_t)i;
+  }
+  __syncthreads();
+}
+
+// moe_up: k_moe_up_r16<2, 4, 2>'s tasks (expert, 32 intermediate rows), weight loads and MMAs. GQ: the groups of 16
+// row slots whose sums a pass over the task's weights keeps in registers (an expert picked by more rows takes another
+// pass over its weights, from L2).
+template <int GQ, bool CS>
+__global__ void __launch_bounds__(256, 1) k_moe_up_rg(Params a) {
+  constexpr int NT = 2, WN = 2, WK = 4, KU = 2, RB = kMaxRows;
+  static_assert(!CS || (kP1 % WK == 0 && kP1 / WK <= 32 && 2 * KU < 32), "no scale-code build");
+  __shared__ UnionW U;
+  __shared__ float red[WK][RB][64];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int wi_n = warp % WN, wi_k = warp / WN;
+  const int p0 = kP1 * wi_k / WK, p1 = kP1 * (wi_k + 1) / WK;
+  const int M = a.M;
+  const bool odd = lane & 1, lo = t < 2;
+  pdl_wait();
+  build_union_w(U, a, M);
+  pdl_launch_dependents();
+  const int ntask = kJB * (1 + U.n);
+#pragma unroll 1
+  for (int task = blockIdx.x; task < ntask; task += (int)gridDim.x) {
+    const bool sh = task < kJB;
+    const int u = sh ? 0 : task / kJB - 1, jb = task % kJB;
+    const int o0 = sh ? 0 : U.off[u], cnt = sh ? M : U.off[u + 1] - o0;
+#pragma unroll 1
+    for (int s0 = 0; s0 < cnt; s0 += GQ * RB) {
+      int ra[GQ], rb[GQ];  // this lane's rows of each group (slots s0 + 16 q + g and + 8), -1: none
+#pragma unroll
+      for (int q = 0; q < GQ; ++q) {
+        const int sa = s0 + RB * q + g, sb = sa + 8;
+        ra[q] = sa < cnt ? (sh ? sa : U.pk[o0 + sa] / kTopK) : -1;
+        rb[q] = sb < cnt ? (sh ? sb : U.pk[o0 + sb] / kTopK) : -1;
+      }
+      const int ng = min(GQ, (cnt - s0 + RB - 1) / RB);  // groups of this pass
+      float c[GQ][NT][2][4];
+#pragma unroll
+      for (int q = 0; q < GQ; ++q)
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+          for (int h = 0; h < 2; ++h) c[q][i][h][0] = c[q][i][h][1] = c[q][i][h][2] = c[q][i][h][3] = 0.f;
+      // activation fragments of step p for group q: rows ra (the MMA's lower half) and rb (upper); o8: FP8 k order
+      auto frag = [&](uint2 (&av)[2], uint2 (&av2)[2], uint32_t (&sfa)[2], int q, int p, bool o8) {
+        const int ko = o8 ? 16 * (t & 1) + 8 * (t >> 1) : 8 * t;
+        const bool live = ra[q] >= 0, live2 = rb[q] >= 0, slive = odd ? live2 : live;
+        const uint8_t* arow = a.xq + (size_t)(live ? ra[q] : 0) * kDim + ko;
+        const uint8_t* arow2 = a.xq + (size_t)(live2 ? rb[q] : 0) * kDim + ko;
+        const uint8_t* srowm = a.xs + (size_t)(odd ? (live2 ? rb[q] : 0) : (live ? ra[q] : 0)) * kKB1;
+        act_frag2(av, av2, sfa, arow, arow2, srowm, p, live, live2, slive);
+      };
+      if (sh) {
+        const uint8_t* w8[NT][2];
+        const uint8_t* sr8[NT];
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+          const int ti = wi_n * NT + i, tile = 2 * jb + (ti & 1);
+          const uint8_t* Wm = ti < 2 ? a.w.sh_w1 : a.w.sh_w3;
+          w8[i][0] = Wm + (size_t)(2 * tile) * 8 * kDim + g * 64 + 16 * t;
+          w8[i][1] = w8[i][0] + 8 * kDim;
+          sr8[i] = (ti < 2 ? a.w.sh_s1 : a.w.sh_s3) + (size_t)jb * kKB1;
+        }
+        uint4 c8a[NT][2], c8b[NT][2];
+        uint32_t s8a[NT], s8b[NT];
+        auto load8 = [&](uint4 (&b)[NT][2], uint32_t (&s)[NT], int p) {
+#pragma unroll
+          for (int i = 0; i < NT; ++i) {
+            b[i][0] = ldg_stream128(w8[i][0] + p * 512);
+            b[i][1] = ldg_stream128(w8[i][1] + p * 512);
+            s[i] = __ldg(reinterpret_cast<const uint16_t*>(sr8[i] + 2 * p));
+          }
+        };
+        auto comp8 = [&](const uint4 (&b)[NT][2], const uint32_t (&s)[NT], int p) {
+#pragma unroll
+          for (int q = 0; q < GQ; ++q) {
+            if (q >= ng) break;
+            uint2 av[2], av2[2];
+            uint32_t sfa[2];
+            frag(av, av2, sfa, q, p, true);
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+              mma8h(c[q][i][0], av, av2, sfa, b[i][0], s[i], lo);
+              mma8h(c[q][i][1], av, av2, sfa, b[i][1], s[i], lo);
+            }
+          }
+        };
+        load8(c8a, s8a, p0);
+        for (int p = p0; p < p1; p += 2) {
+          if (p + 1 < p1) load8(c8b, s8b, p + 1);
+          comp8(c8a, s8a, p);
+          if (p + 1 >= p1) break;
+          if (p + 2 < p1) load8(c8a, s8a, p + 2);
+          comp8(c8b, s8b, p + 1);
+        }
+      } else {
+        const int e = U.id[u];
+        const uint8_t* w4[NT];
+        const uint8_t* sr4[NT];
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+          const int ti = wi_n * NT + i, tile = 2 * jb + (ti & 1);
+          w4[i] = (ti < 2 ? a.w.w1 : a.w.w3) + (size_t)e * kW13 + (size_t)tile * (kP1 * 512) + lane * 16;
+          sr4[i] = (ti < 2 ? a.w.s1 : a.w.s3) + (size_t)e * kS13 + (size_t)tile * (kP1 * 32) + g * 4;
+        }
+        uint4 ba[KU][NT], bb[KU][NT];
+        uint32_t sa[KU][NT], sb[KU][NT];
+        const uint32_t* cw[NT];  // CS: the tiles' code blocks, raw flags of steps p0.., the pair's base
+        uint32_t fl[NT], b4[NT];
+        if constexpr (CS) {
+#pragma unroll
+          for (int i = 0; i < NT; ++i) {
+            const int ti = wi_n * NT + i, tile = 2 * jb + (ti & 1);
+            const ScaleCode& kc = ti < 2 ? a.w.c1 : a.w.c3;
+            cw[i] = kc.code + ((size_t)e * kT13 + tile) * kB13;
+            b4[i] = kc.base4;
+            fl[i] = code_flags_up(cw[i], p0);
+          }
+        }
+        auto comp4 = [&](const uint4 (&b)[KU][NT], const uint32_t (&s)[KU][NT], int p) {
+#pragma unroll
+          for (int x = 0; x < KU; ++x)
+            if (p + x < p1) {
+#pragma unroll
+              for (int q = 0; q < GQ; ++q) {
+                if (q >= ng) break;
+                uint2 av[2], av2[2];
+                uint32_t sfa[2];
+                frag(av, av2, sfa, q, p + x, false);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                  const uint4 w = b[x][i];
+                  uint32_t sc = s[x][i];
+                  if constexpr (CS) sc = fl[i] >> (p + x - p0) & 1u ? sc : ((sc >> g) & 0x01010101u) + b4[i];
+                  mma4h(c[q][i][0], av[0], av2[0], w.x, sfa[0], sc & 0xFFu);
+                  mma4h(c[q][i][0], av[1], av2[1], w.y, sfa[1], (sc >> 8) & 0xFFu);
+                  mma4h(c[q][i][1], av[0], av2[0], w.z, sfa[0], (sc >> 16) & 0xFFu);
+                  mma4h(c[q][i][1], av[1], av2[1], w.w, sfa[1], sc >> 24);
+                }
+              }
+            }
+        };
+        if constexpr (CS) {  // k_moe_up_r16's schedule: a step's word is its code word or, flagged, the raw one
+          auto load4c = [&](uint4 (&b)[KU][NT], uint32_t (&s)[KU][NT], int p, const uint32_t (&f)[NT]) {
+#pragma unroll
+            for (int x = 0; x < KU; ++x)
+              if (p + x < p1)
+#pragma unroll
+                for (int i = 0; i < NT; ++i) b[x][i] = ldg_stream128(w4[i] + (p + x) * 512);
+#pragma unroll
+            for (int x = 0; x < KU; ++x)
+              if (p + x < p1)
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+                  s[x][i] = ldg_stream32_sel(f[i] >> (p - p0), 1u << x, sr4[i] + (p + x) * 32, cw[i] + p + x);
+          };
+          const uint32_t none[NT] = {};
+          load4c(ba, sa, p0, none);
+          if (p0 + KU < p1) load4c(bb, sb, p0 + KU, none);
+#pragma unroll
+          for (int i = 0; i < NT; ++i)
+            if (fl[i] & ((1u << 2 * KU) - 1u))
+#pragma unroll
+              for (int x = 0; x < 2 * KU; ++x)
+                if (p0 + x < p1 && (fl[i] >> x & 1u)) {
+                  const uint32_t v = ldg_stream32(sr4[i] + (p0 + x) * 32);
+                  if (x < KU) sa[x][i] = v;
+                  else sb[x - KU][i] = v;
+                }
+          for (int p = p0; p < p1; p += 2 * KU) {
+            comp4(ba, sa, p);
+            if (p + KU >= p1) break;
+            if (p + 2 * KU < p1) load4c(ba, sa, p + 2 * KU, fl);
+            comp4(bb, sb, p + KU);
+            if (p + 3 * KU < p1) load4c(bb, sb, p + 3 * KU, fl);
+          }
+        } else {
+          auto load4 = [&](uint4 (&b)[KU][NT], uint32_t (&s)[KU][NT], int p) {
+#pragma unroll
+            for (int x = 0; x < KU; ++x)
+              if (p + x < p1)
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                  b[x][i] = ldg_stream128(w4[i] + (p + x) * 512);
+                  s[x][i] = ldg_stream32(sr4[i] + (p + x) * 32);
+                }
+          };
+          load4(ba, sa, p0);
+          for (int p = p0; p < p1; p += 2 * KU) {
+            if (p + KU < p1) load4(bb, sb, p + KU);
+            comp4(ba, sa, p);
+            if (p + KU >= p1) break;
+            if (p + 2 * KU < p1) load4(ba, sa, p + 2 * KU);
+            comp4(bb, sb, p + KU);
+          }
+        }
+      }
+      // each group through k_moe_up_r16's reduction and epilogue; rows 0..31 of the task are w1 (gate), 32..63 w3 (up)
+#pragma unroll
+      for (int q = 0; q < GQ; ++q) {
+        if (q >= ng) break;
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int r = 16 * (wi_n * NT + i) + 8 * h + 2 * t;
+            if (ra[q] >= 0) red[wi_k][g][r] = c[q][i][h][0], red[wi_k][g][r + 1] = c[q][i][h][1];
+            if (rb[q] >= 0) red[wi_k][g + 8][r] = c[q][i][h][2], red[wi_k][g + 8][r + 1] = c[q][i][h][3];
+          }
+        __syncthreads();
+        for (int m = warp; m < RB; m += WN * WK) {
+          const int sl = s0 + RB * q + m;
+          if (sl >= cnt) continue;
+          float gs = 0.f, us = 0.f;
+#pragma unroll
+          for (int k = 0; k < WK; ++k) gs += red[k][m][lane], us += red[k][m][32 + lane];
+          float gt = __bfloat162float(__float2bfloat16_rn(gs)), up = __bfloat162float(__float2bfloat16_rn(us));
+          up = fminf(fmaxf(up, -10.f), 10.f);
+          gt = fminf(gt, 10.f);
+          float h = gt / (1.0f + expf(-gt)) * up;
+          int slot = kWPicks + sl;
+          if (!sh) {
+            slot = U.pk[o0 + sl];
+            h = U.w[slot] * h;
+          }
+          h = __bfloat162float(__float2bfloat16_rn(h));
+          const uint32_t e = act_scale_byte(warp_max(fabsf(h)));
+          a.hq[(size_t)slot * kInter + 32 * jb + lane] = (uint8_t)quant_e4m3(h, e);
+          if (lane == 0) a.hs[(size_t)slot * kJB + jb] = (uint8_t)e;
+        }
+        __syncthreads();
+      }
+    }
+  }
+}
+
+// moe_down: k_moe_down_r16<8, 4>'s units, rounds and fold; a unit's rows in groups of 16 slots on the weights in its
+// warp's registers, its outputs (bf16) by row. CS: w2's scales from their 1-bit code, as k_moe_down_r16.
+template <bool CS>
+__global__ void __launch_bounds__(256, 1) k_moe_down_rg(Params a) {
+  constexpr int W = 8, R = 4, RB = kMaxRows, kOut = (kWRows * 16 * R + 32 * W - 1) / (32 * W);  // outputs per thread
+  __shared__ __nv_bfloat16 outs[2][W][kWRows][16];  // a round's outputs: [its units][row][the unit's tile's columns]
+  __shared__ UnionW U;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int M = a.M;
+  const bool odd = lane & 1, lo = t < 2;
+  const int tile0 = blockIdx.x * R;
+  build_union_w(U, a, M);  // the router finished before moe_up let this grid start
+  const int nr = U.n * R, nunits = nr + 2 * R, nround = (nunits + W - 1) / W;
+  __shared__ uint32_t sfl[CS ? kWPicks * R : 1];  // CS: the routed units' raw flags
+  if constexpr (CS) {
+#pragma unroll 1
+    for (int q = warp + W * lane; q < nr; q += 32 * W)
+      sfl[q] = __ldg(a.w.c2.code + ((size_t)U.id[q / R] * kT2 + tile0 + q % R) * kB2 + kP2);
+    __syncwarp();
+  }
+
+  auto loadw = [&](uint4 (&b)[kP2], int q) {
+    if (q < nr) {
+      const int u = q / R, tile = tile0 + q % R;
+      const size_t e = U.id[u];
+      const uint8_t* w = a.w.w2 + e * kW2 + (size_t)tile * (kP2 * 512) + lane * 16;
+#pragma unroll
+      for (int p = 0; p < kP2; ++p) b[p] = ldg_stream128(w + p * 512);
+    } else {
+      const int qq = q - nr, tile = tile0 + qq / 2, nt = 2 * tile + (qq & 1);
+      const uint8_t* w = a.w.sh_w2 + (size_t)nt * 8 * kInter + g * 64 + 16 * t;
+#pragma unroll
+      for (int p = 0; p < kP2; ++p) b[p] = ldg_stream128(w + p * 512);
+    }
+  };
+  auto load = [&](uint4 (&b)[kP2], uint32_t (&s)[kP2], int q) {
+    loadw(b, q);
+    if (q < nr) {
+      const int u = q / R, tile = tile0 + q % R;
+      const uint8_t* sr = a.w.s2 + (size_t)U.id[u] * kS2 + (size_t)tile * (kP2 * 32) + g * 4;
+#pragma unroll
+      for (int p = 0; p < kP2; ++p) s[p] = ldg_stream32(sr + p * 32);
+    } else {
+      const int tile = tile0 + (q - nr) / 2;
+      const uint8_t* sr = a.w.sh_s2 + (size_t)(tile / 2) * kKB2;
+#pragma unroll
+      for (int p = 0; p < kP2; ++p) s[p] = __ldg(reinterpret_cast<const uint16_t*>(sr + 2 * p));
+    }
+  };
+  auto load_cs = [&](uint4 (&b)[kP2], uint32_t& x, uint32_t& y, int q) {
+    loadw(b, q);
+    if (q < nr) {
+      const int u = q / R, tile = tile0 + q % R;
+      const size_t e = U.id[u];
+      code_load_down(a.w.c2.code + (e * kT2 + tile) * kB2, a.w.s2 + e * kS2 + (size_t)tile * (kP2 * 32), sfl[CS ? q : 0], lane, x, y);
+    } else {
+      const int tile = tile0 + (q - nr) / 2;
+      x = __ldg(reinterpret_cast<const uint16_t*>(a.w.sh_s2 + (size_t)(tile / 2) * kKB2) + min(lane, kP2 - 1));
+    }
+  };
+  // unit q's outputs (bf16) into o [row][column of its tile]. routed(step): calls step(p, scale word) for its 9 steps
+  // in order; shared(p): the shared expert's scale word of step p.
+  auto comp = [&](const uint4 (&b)[kP2], int q, __nv_bfloat16 (&o)[kWRows][16], auto&& routed, auto&& shared) {
+    const bool sh = q >= nr;
+    const int u = sh ? 0 : q / R;
+    const int o0 = sh ? 0 : U.off[u], cnt = sh ? M : U.off[u + 1] - o0;
+    const int col = sh ? 8 * ((q - nr) & 1) + 2 * t : 2 * t;  // the shared expert: one 8-row half per unit
+#pragma unroll 1
+    for (int s0 = 0; s0 < cnt; s0 += RB) {
+      float c[2][4] = {};
+      const int sa = s0 + g, sb = sa + 8;
+      const bool live = sa < cnt, live2 = sb < cnt, slive = odd ? live2 : live;
+      const int pa = live ? (sh ? kWPicks + sa : U.pk[o0 + sa]) : 0, pb = live2 ? (sh ? kWPicks + sb : U.pk[o0 + sb]) : 0;
+      const int ko = sh ? 16 * (t & 1) + 8 * (t >> 1) : 8 * t;
+      const uint8_t* arow = a.hq + (size_t)pa * kInter + ko;
+      const uint8_t* arow2 = a.hq + (size_t)pb * kInter + ko;
+      const uint8_t* srowm = a.hs + (size_t)(odd ? pb : pa) * kJB;
+      if (!sh) {
+        routed([&](int p, uint32_t sc) {
+          uint2 av[2], av2[2];
+          uint32_t sfa[2];
+          act_frag2(av, av2, sfa, arow, arow2, srowm, p, live, live2, slive);
+          mma4h(c[0], av[0], av2[0], b[p].x, sfa[0], sc & 0xFFu);
+          mma4h(c[0], av[1], av2[1], b[p].y, sfa[1], (sc >> 8) & 0xFFu);
+          mma4h(c[1], av[0], av2[0], b[p].z, sfa[0], (sc >> 16) & 0xFFu);
+          mma4h(c[1], av[1], av2[1], b[p].w, sfa[1], sc >> 24);
+        });
+      } else {
+#pragma unroll
+        for (int p = 0; p < kP2; ++p) {
+          uint2 av[2], av2[2];
+          uint32_t sfa[2];
+          act_frag2(av, av2, sfa, arow, arow2, srowm, p, live, live2, slive);
+          mma8h(c[0], av, av2, sfa, b[p], shared(p), lo);
+        }
+      }
+      const int ma = sh ? sa : pa / kTopK, mb = sh ? sb : pb / kTopK;  // the slots' rows
+      if (live) {
+        o[ma][col] = __float2bfloat16_rn(c[0][0]), o[ma][col + 1] = __float2bfloat16_rn(c[0][1]);
+        if (!sh) o[ma][col + 8] = __float2bfloat16_rn(c[1][0]), o[ma][col + 9] = __float2bfloat16_rn(c[1][1]);
+      }
+      if (live2) {
+        o[mb][col] = __float2bfloat16_rn(c[0][2]), o[mb][col + 1] = __float2bfloat16_rn(c[0][3]);
+        if (!sh) o[mb][col + 8] = __float2bfloat16_rn(c[1][2]), o[mb][col + 9] = __float2bfloat16_rn(c[1][3]);
+      }
+    }
+  };
+  auto comp_raw = [&](const uint4 (&b)[kP2], const uint32_t (&s)[kP2], int q, __nv_bfloat16 (&o)[kWRows][16]) {
+    comp(b, q, o,
+         [&](auto&& step) {
+#pragma unroll
+           for (int p = 0; p < kP2; ++p) step(p, s[p]);
+         },
+         [&](int p) { return s[p]; });
+  };
+  auto comp_cs = [&](const uint4 (&b)[kP2], uint32_t x, uint32_t y, int q, __nv_bfloat16 (&o)[kWRows][16]) {
+    comp(b, q, o,
+         [&](auto&& step) {
+           code_steps_down(sfl[CS ? q : 0], x, y, g, a.w.c2.base4,
+                           a.w.s2 + (size_t)U.id[q / R] * kS2 + (size_t)(tile0 + q % R) * (kP2 * 32), step);
+         },
+         [&](int p) { return __shfl_sync(~0u, x, p); });
+  };
+  // round k's units folded into this thread's sums: per output, its tile's routed units of the round in order (rows
+  // that picked the expert), then the shared expert's unit if it is in the round (k_moe_down_r16's fold)
+  float v[kOut];
+#pragma unroll
+  for (int j = 0; j < kOut; ++j) v[j] = 0.f;
+  auto fold = [&](int k, const __nv_bfloat16 (&ob)[W][kWRows][16]) {
+#pragma unroll
+    for (int j = 0; j < kOut; ++j) {
+      const int o = threadIdx.x + 32 * W * j;
+      if (o >= M * 16 * R) break;
+      const int m = o / (16 * R), col = o % (16 * R), tile = col / 16, c16 = col % 16;
+      float x = v[j];
+      for (int jj = tile; jj < W; jj += R) {
+        const int q = k * W + jj;
+        if (q >= nr) break;
+        const int uu = q / R;
+        if (m < 32 ? (U.rlo[uu] >> m & 1u) : (U.rhi[uu] >> (m - 32) & 1u)) x += __bfloat162float(ob[jj][m][c16]);
+      }
+      const int js = nr + 2 * tile + (c16 >> 3) - k * W;
+      if (js >= 0 && js < W) x += __bfloat162float(ob[js][m][c16]);
+      v[j] = x;
+    }
+  };
+
+  uint4 ba[kP2], bb[kP2];
+  int q = warp;
+  if constexpr (CS) {
+    uint32_t xa = 0, ya = 0, xb = 0, yb = 0;
+    if (q < nunits) load_cs(ba, xa, ya, q);
+    pdl_wait();
+    pdl_launch_dependents();
+    for (int k = 0; k < nround; k += 2, q += 2 * W) {
+      if (q + W < nunits) load_cs(bb, xb, yb, q + W);
+      if (q < nunits) comp_cs(ba, xa, ya, q, outs[0][warp]);
+      __syncthreads();
+      fold(k, outs[0]);
+      if (k + 1 >= nround) break;
+      if (q + 2 * W < nunits) load_cs(ba, xa, ya, q + 2 * W);
+      if (q + W < nunits) comp_cs(bb, xb, yb, q + W, outs[1][warp]);
+      __syncthreads();
+      fold(k + 1, outs[1]);
+    }
+  } else {
+    uint32_t sa[kP2], sb[kP2];
+    if (q < nunits) load(ba, sa, q);
+    pdl_wait();
+    pdl_launch_dependents();
+    for (int k = 0; k < nround; k += 2, q += 2 * W) {
+      if (q + W < nunits) load(bb, sb, q + W);
+      if (q < nunits) comp_raw(ba, sa, q, outs[0][warp]);
+      __syncthreads();
+      fold(k, outs[0]);
+      if (k + 1 >= nround) break;
+      if (q + 2 * W < nunits) load(ba, sa, q + 2 * W);
+      if (q + W < nunits) comp_raw(bb, sb, q + W, outs[1][warp]);
+      __syncthreads();  // also: every thread's fold of round k is done before round k + 2 rewrites outs[0]
+      fold(k + 1, outs[1]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kOut; ++j) {
+    const int o = threadIdx.x + 32 * W * j;
+    if (o >= M * 16 * R) break;
+    a.y[(size_t)(o / (16 * R)) * kDim + 16 * tile0 + o % (16 * R)] = v[j];
+  }
+}
+
 // natural [N][K/2] packed e2m1 + [N][K/32] scales -> [N/16][K/64][32 lanes][16 B] + [N/16][K/64][8][4 B]
 __global__ void k_tile_fp4(const uint8_t* __restrict__ w, const uint8_t* __restrict__ s, uint8_t* __restrict__ wt,
                            uint8_t* __restrict__ st, int N, int K) {
@@ -1440,9 +1943,34 @@ void moe(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, const floa
   run_moe(p, cfg, st);
 }
 
+size_t moe_rows_workspace_bytes() { return (size_t)(kWPicks + kWRows) * (kInter + kJB); }
+
+void moe_rows(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, const float* wts, const MoeWeights& w, void* ws,
+              float* y, cudaStream_t st, int gq) {
+  if (M < 1 || M > kWRows) die("moe_rows: M=%d", M);
+  uint8_t* hq = static_cast<uint8_t*>(ws);
+  Params p{xq, xs, idx, wts, M, w, hq, hq + (size_t)(kWPicks + kWRows) * kInter, y};
+  const bool raw = gq & 16;  // bit 16: the raw scales even when the weights carry their code
+  gq &= 15;
+  if (gq != 2 && gq != 4) gq = M <= 2 * kMaxRows ? 2 : 4;
+  const bool csu = !raw && w.c1.code && w.c3.code, csd = !raw && w.c2.code;
+  static const int res[4] = {resident_ctas(k_moe_up_rg<2, false>, 256, 0), resident_ctas(k_moe_up_rg<4, false>, 256, 0),
+                             resident_ctas(k_moe_up_rg<2, true>, 256, 0), resident_ctas(k_moe_up_rg<4, true>, 256, 0)};
+  const int max_tasks = kJB * (1 + kTopK * M);
+  const int grid = std::min(res[(gq == 4) + 2 * csu], max_tasks);
+  switch ((gq == 4) + 2 * csu) {
+    case 0: launch_pdl(k_moe_up_rg<2, false>, dim3(grid), dim3(256), 0, st, true, p); break;
+    case 1: launch_pdl(k_moe_up_rg<4, false>, dim3(grid), dim3(256), 0, st, true, p); break;
+    case 2: launch_pdl(k_moe_up_rg<2, true>, dim3(grid), dim3(256), 0, st, true, p); break;
+    default: launch_pdl(k_moe_up_rg<4, true>, dim3(grid), dim3(256), 0, st, true, p); break;
+  }
+  if (csd) launch_pdl(k_moe_down_rg<true>, dim3(kDim / 16 / 4), dim3(256), 0, st, true, p);
+  else launch_pdl(k_moe_down_rg<false>, dim3(kDim / 16 / 4), dim3(256), 0, st, true, p);
+}
+
 void moe_routed(const uint8_t* xq, const uint8_t* xs, int M, const float* logits, const float* bias, int E,
                 float route_scale, const MoeWeights& w, void* ws, float* y, MoeCfg cfg, cudaStream_t st, int* idx_out,
-                float* wts_out) {
+                float* wts_out, const int* oea_sess, const int* oea_rows, int oea_row0) {
   if (M < 1 || M > kMaxRows || E < kTopK || E > 32 * kMaskWords) die("moe_routed: M=%d E=%d", M, E);
   if (!idx_out != !wts_out) die("moe_routed: idx_out and wts_out go together");
   uint8_t* hq = static_cast<uint8_t*>(ws);
@@ -1464,6 +1992,7 @@ void moe_routed(const uint8_t* xq, const uint8_t* xs, int M, const float* logits
     return v;
   }();
   p.oea_k0 = oea[0], p.oea_kp = oea[1], p.oea_min = oea[2];
+  p.oea_sess = oea_sess, p.oea_rows = oea_rows, p.oea_row0 = oea_row0;
   run_moe(p, cfg, st);
 }
 

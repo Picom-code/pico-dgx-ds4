@@ -19,10 +19,32 @@
 
 #include "common/check.h"
 #include "model/nvtx.h"
+#include "model/spec_batch.h"
+#include "server/copy.h"
 
 namespace srv {
 
 std::vector<double> g_t_wait, g_t_late, g_t_launch;
+
+// ---- copy drafts (server/copy.h) --------------------------------------------------------------------
+namespace {
+CopyCorpus g_corpus[model::kMaxSlots];         // each slot's prompt, kept between requests
+std::vector<int32_t> g_pred[model::kMaxSlots];  // each slot's prediction
+// slot's copy state for a run from `token` at pos0: the sequence before it is the model's history of the slot
+// (every rank holds it whole with DSGB10_COPY: serve sends the prompt from position 0)
+bool copy_init(model::Model& m, int slot, int pos0, int32_t token, CopySrc& s) {
+  const std::vector<int32_t>& h = m.history(slot);
+  if (slot < 0 || slot >= model::kMaxSlots || pos0 < 1 || (int)h.size() < pos0) return false;
+  g_corpus[slot].set(h.data(), pos0);
+  s.init(&g_corpus[slot], h.data(), pos0, token, g_pred[slot]);
+  return true;
+}
+}  // namespace
+
+void set_prediction(int slot, const int32_t* t, int n) {
+  if (slot < 0 || slot >= model::kMaxSlots) return;
+  g_pred[slot].assign(t, t + std::max(0, n));
+}
 
 double now_s() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -163,7 +185,10 @@ float SpecRate::thresh(const Cmd& c) const {
 namespace {
 
 // decode_loop with DSpark (cmd.h)
-DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+// cs (copy drafts, decode_loop): the request's copy state, fed every token; once `enter` tokens in a row repeat a
+// source the loop ends with kEndSwitch, as a stop does (the request goes on in copy steps)
+DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on, CopySrc* cs = nullptr,
+                    int enter = 0, int enter_after = 0) {
   constexpr int kD = model::ops::kDrafts;
   DecodeEnd e;
   e.written = c.pos0;
@@ -222,6 +247,8 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   if (slog) std::fprintf(slog, "{\"req\":1,\"pos0\":%d,\"max_new\":%d,\"temp\":%.3f,\"n_top\":%d}\n", c.pos0, c.max_new, c.sp.temperature, c.sp.n_top);
   const uint64_t first = m.launch_spec(1, c.pos0, c.tokens, c.sp, cfg);
   int launched = 1, prev_rows = 1;
+  const bool sw_on = cs && CopyKnobs::get().sw;  // copy drafts
+  bool sw_wait = false;
   if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kD), ++launched;
   for (int i = 0;; ++i) {
     wd.started = now_s();
@@ -291,17 +318,27 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       if (on) on(e.sampled, o, j);
       ++e.sampled, ++u;
       toks.push_back(t);
+      if (cs) cs->feed(t);
       if (o.ctl) stop = true, e.why = kEndCancel;
       for (int k = 0; !stop && k < c.n_stop; ++k)
         if (t == c.stop[k]) stop = true, e.why = kEndStop;
       if (!stop && e.sampled >= c.max_new) stop = true, e.why = kEndLength;
     }
     if (!stop && o.next_pos0 >= pos_end) stop = true, e.why = kEndContext;
+    if (!stop && cs && e.sampled >= enter_after && cs->ready(enter)) {
+      // copy drafts (DSGB10_COPY_SW): the step queued behind this one runs and its tokens count; the change comes after it
+      // (if the source still matches then), with nothing queued
+      if (sw_on && i + 1 < launched) sw_wait = true;
+      else stop = true, e.why = kEndSwitch;
+    } else {
+      sw_wait = false;
+    }
     // positions o.pos0 .. F hold their final KV; the history now ends at H (F + 1: the token after them,
     // whose KV the next step's first row makes)
     const int F = o.pos0 + o.rows - 1, H = o.pos0 + u;
     bool next_ran = false;
-    if (stop && i + 1 == launched && H > F && H <= feed) {  // the step that feeds the last token
+    // (copy drafts: not at a change of step kind: the other loop's first row is that token)
+    if (stop && i + 1 == launched && H > F && H <= feed && !(sw_on && e.why == kEndSwitch)) {  // the step that feeds the last token
       verify(H), ++launched;
       m.engram_late(o.next_pos0, o.next_rows, o.next_tok);
     }
@@ -335,18 +372,100 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
       m.engram_late(o.next_pos0, o.next_rows, o.next_tok);
     }
     // the step after it starts at most at next_pos0 + next_rows (every draft accepted)
-    if (c.ahead && launched == i + 2 && o.next_pos0 + o.next_rows <= feed)
+    if (c.ahead && !sw_wait && launched == i + 2 && o.next_pos0 + o.next_rows <= feed)
       verify(o.next_pos0 + o.next_rows + kD), ++launched;
     g_t_launch.push_back(now_s());
   }
+}
+
+// decode_loop with DSpark and copy drafts (server/copy.h): the speculative loop while the reply is new text; once it
+// repeats a source for CopyKnobs::enter tokens, batch spec steps of this one request (spec_batch_loop, solo), whose
+// rows may be copy windows; back after CopyKnobs::exit steps without a copy. Each change ends one loop as a stop
+// does and starts the other from the last token, as a request's slices do. One DecodeEnd for the whole run.
+int g_bits_mode = 0;  // exact (DSGB10_BITS_LOG): 0 the speculative loop, 1 batch spec steps of one request (copy steps)
+DecodeEnd copy_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on) {
+  const CopyKnobs& kn = CopyKnobs::get();
+  CopySrc cs;
+  if (c.max_new < 1 || c.pos0 >= c.limit || !copy_init(m, m.slot(), c.pos0, c.tokens[0], cs)) return spec_loop(m, c, wd, on);
+  DecodeEnd tot;
+  tot.written = c.pos0;
+  tot.spec_tok = c.spec_tok, tot.spec_ms = c.spec_ms;
+  Cmd cc = c;
+  int32_t last = c.tokens[0];
+  bool copy = kn.mintok <= 0 && cs.ready(kn.enter);
+  int switches = 0, bsteps = 0, at0 = copy ? 0 : -1, src0 = cs.src, mlen0 = cs.mlen;
+  int unprod = 0;  // copy drafts (DSGB10_COPY_SW): visits to copy steps in a row that ended with under kn.enter copied tokens
+  for (bool first = true;; first = false) {
+    const int base = tot.sampled;
+    DecodeEnd e;
+    if (!copy) {
+      e = spec_loop(m, cc, wd, [&](int i, const model::SampleOut& o, int row) {
+        last = o.row[row].token;
+        if (on) on(base + i, o, row);
+      }, &cs, kn.sw ? kn.enter << std::min(unprod, 3) : kn.enter, kn.mintok - base);
+    } else {
+      g_bits_mode = 1;
+      cs.visit0 = cs.acc;
+      BatchEntry x;
+      x.slot = m.slot(), x.handle = cc.handle, x.pos0 = cc.pos0, x.token = cc.tokens[0];
+      x.max_new = cc.max_new, x.limit = cc.limit, x.snap_every = cc.snap_every;
+      x.n_stop = cc.n_stop;
+      std::copy(cc.stop, cc.stop + kMaxStop, x.stop);
+      x.sp = cc.sp;
+      x.spec_tok = cc.spec_tok, x.spec_ms = cc.spec_ms;
+      Cmd cb = cc;
+      cb.n = 1, cb.flags = 0;
+      int i = 0;
+      SpecBatchStats st;
+      e = spec_batch_loop(m, cb, std::vector<BatchEntry>{x}, wd, [&](int, const model::SampleOut& o, int row) {
+        last = o.row[row].token;
+        if (on) on(base + i, o, row);
+        ++i;
+      }, &st, &cs, kn.exit)[0];
+      for (int r = 0; r <= model::kMaxRows; ++r) e.gpu_ms[r] = st.gpu_ms[r], e.gpu_n[r] = st.gpu_n[r];
+    }
+    g_bits_mode = 0;
+    if (copy) bsteps += e.vsteps;
+    if (copy) unprod = cs.acc - cs.visit0 >= kn.enter ? 0 : unprod + 1;
+    tot.sampled += e.sampled;
+    tot.fed = cc.pos0 - c.pos0 + e.fed, tot.last = e.last, tot.why = e.why;
+    tot.written = std::max(tot.written, e.written);
+    tot.vsteps += e.vsteps, tot.verified += e.verified, tot.accepted += e.accepted;
+    for (int r = 0; r <= model::ops::kDrafts; ++r) tot.rows_hist[r] += e.rows_hist[r];
+    for (int r = 0; r <= model::kMaxRows; ++r) tot.gpu_ms[r] += e.gpu_ms[r], tot.gpu_n[r] += e.gpu_n[r];
+    if (e.gate_n) {
+      tot.gate_min = tot.gate_n ? std::min(tot.gate_min, e.gate_min) : e.gate_min;
+      tot.gate_max = tot.gate_n ? std::max(tot.gate_max, e.gate_max) : e.gate_max;
+      tot.gate_sum += e.gate_sum, tot.gate_n += e.gate_n;
+    }
+    tot.spec_tok = e.spec_tok, tot.spec_ms = e.spec_ms;
+    (void)first;
+    if (e.why != kEndSwitch) break;
+    if (tot.sampled >= c.max_new) {  // never: a loop ends with kEndLength first
+      tot.why = kEndLength;
+      break;
+    }
+    // the other kind of step, from the last token sampled (it goes in again when a step fed it already)
+    cc.pos0 = c.pos0 + tot.sampled, cc.tokens[0] = last, cc.max_new = c.max_new - tot.sampled;
+    cc.spec_tok = e.spec_tok, cc.spec_ms = e.spec_ms;
+    copy = !copy, ++switches;
+    if (copy && at0 < 0) at0 = tot.sampled, src0 = cs.src, mlen0 = cs.mlen;
+    cs.idle = 0;
+  }
+  tot.copy_steps = cs.steps, tot.copy_rows = cs.rows, tot.copy_acc = cs.acc;
+  if (kn.log && on)
+    std::fprintf(stderr, "copy: one request: %d tokens, %d copy steps (%d whole), %d drafts, %d accepted, %d switches, %d "
+                         "batch steps; first copy mode at token %d (source %d, %d matched), prompt %d\n",
+                 tot.sampled, cs.steps, cs.whole, cs.rows, cs.acc, switches, bsteps, at0, src0, mlen0, c.pos0);
+  return tot;
 }
 
 }  // namespace
 
 DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample& on0) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
-  // couple (DSGB10_BITS_LOG=FILE, measurement only, rank 0; EXACT's format): every token a one-session run emits with the
-  // bits of its logit and of its log-probability, and the step that computed it (0, the step's rows, the row)
+  // exact (DSGB10_BITS_LOG=FILE, measurement only, rank 0): every emitted token with the bits of its logit and of its
+  // log-probability, and the step that computed it (mode, the step's rows, the row)
   static FILE* const blog = [] {
     const char* v = getenv("DSGB10_BITS_LOG");
     return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
@@ -358,7 +477,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
     onb = [&](int i, const model::SampleOut& o, int row) {
       uint32_t vb, lb;
       std::memcpy(&vb, &o.row[row].value, 4), std::memcpy(&lb, &o.row[row].logprob, 4);
-      std::fprintf(blog, "%d %d %08x %08x %d %d %d\n", i, o.row[row].token, vb, lb, 0, o.step_rows, row);
+      std::fprintf(blog, "%d %d %08x %08x %d %d %d\n", i, o.row[row].token, vb, lb, g_bits_mode, o.step_rows, row);
       on0(i, o, row);
     };
   }
@@ -366,6 +485,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
   struct BlogFlush {
     ~BlogFlush() { if (blog) std::fflush(blog); }
   } blog_flush;
+  if (c.spec && CopyKnobs::get().on && m.spec_copy()) return copy_loop(m, c, wd, on);
   if (c.spec) return spec_loop(m, c, wd, on);
   auto may_run = [&](int i) { return i <= c.max_new && c.pos0 + i < c.limit; };
   // a step at position pos; the window snapshot at pos first (the ring then holds pos - 128 .. pos - 1)
@@ -555,8 +675,9 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
                                  const std::vector<std::vector<int32_t>>& tokens, Watchdog& wd, const OnBatch& on,
                                  model::Sink* sink) {
   const int n = (int)e.size(), G = c.rows;
-  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > model::kMaxSessRows || (int)tokens.size() != n)
-    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, model::kMaxSessRows);
+  const int gmax = getenv("DSGB10_TF_SESSROWS") ? model::kMaxRows : model::kMaxSessRows;  // exact: a test of long runs
+  if (n < 1 || n > model::ops::kMaxSess || G < 1 || G > gmax || (int)tokens.size() != n)
+    die("batch_tf: %d entries, %d rows of each per step (1..%d)", n, G, gmax);
   for (int k = 0; k < n; ++k)
     if (e[k].max_new < 0 || (int)tokens[k].size() != e[k].max_new || e[k].pos0 < 0 ||
         e[k].pos0 + e[k].max_new > e[k].limit)
@@ -597,7 +718,7 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
 
 // B3 (cmd.h): spec_loop's accounting per entry, over batch spec steps
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                       const OnBatch& on, SpecBatchStats* st) {
+                                       const OnBatch& on, SpecBatchStats* st, CopySrc* ext, int solo) {
   constexpr int kD = model::ops::kDrafts;
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
@@ -617,6 +738,21 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     int32_t tok[model::ops::kSessTok] = {};
   };
   std::vector<Next> nx(n);
+  // copy drafts (server/copy.h): each entry's copy state (src[k], off: none), its rows in the newest step laid out
+  // (run_rows: the one running), the steps launched (the windows' turn when more entries copy than a step has windows)
+  const CopyKnobs& kn = CopyKnobs::get();
+  const bool copy = kn.on && m.spec_copy();
+  std::vector<CopySrc> own;
+  std::vector<CopySrc*> src(n, nullptr);
+  std::vector<int> run_rows(n, 1);
+  int n_launch = 0;
+  if (copy && ext) {
+    src[0] = ext;
+  } else if (copy) {
+    own.resize(n);
+    for (int k = 0; k < n; ++k)
+      if (e[k].max_new >= 1 && e[k].pos0 < e[k].limit && copy_init(m, e[k].slot, e[k].pos0, e[k].token, own[k])) src[k] = &own[k];
+  }
   std::vector<int> pin;
   for (const int32_t h : c.live)
     if (h > 0) pin.push_back(h);
@@ -654,6 +790,9 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     uint64_t id = 0;
     bool late = false;  // a verify step whose Engram lookups wait for its rows (engram_late_rows)
     char on[model::ops::kMaxSess] = {};
+    bool copy = false;                     // copy drafts: it carries windows
+    int rows[model::ops::kMaxSess] = {};   // each entry's rows as the host laid them out (0: not laid out)
+    int ncopy[model::ops::kMaxSess] = {};  // of them, drafts from a copy window
   };
   std::deque<Step> q;  // launched, not yet waited for: the one running, then the one queued behind it
   auto on_now = [&](int k) { return live[k] && !(ending[k] && pend[k]); };
@@ -662,6 +801,28 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
   auto late_rows = [&](Step& s) {
     int32_t t[model::kMaxRows], p[model::kMaxRows], sl[model::kMaxRows];
     int R = 0;
+    if (s.copy) {  // the device's layout with the windows (spec_batch.h), by the same function
+      static thread_local model::ops::SpecState ss[model::ops::kMaxSess];
+      static thread_local model::ops::StepIn d;
+      for (int k = 0; k < n; ++k) {
+        ss[k].next_rows = nx[k].rows, ss[k].next_pos0 = nx[k].pos0;
+        std::copy(nx[k].tok, nx[k].tok + model::ops::kSessTok, ss[k].next_tok);
+      }
+      R = m.spec_layout(s.id, ss, &d, s.ncopy);
+      for (int r = 0; r < R; ++r) {
+        const int k = d.sess[r];
+        if (k < 0 || k >= n || !s.on[k]) die("spec batch: a copy step's row %d is entry %d's", r, k);
+        t[r] = d.tokens[r], p[r] = d.pos[r], sl[r] = e[k].slot;
+        ++s.rows[k];
+      }
+      for (int k = 0; k < n; ++k)
+        if (s.on[k]) run_rows[k] = s.rows[k];
+      m.engram_late_rows(R, t, p, sl);
+      s.late = false;
+      return;
+    }
+    for (int k = 0; k < n; ++k)
+      if (s.on[k]) run_rows[k] = s.rows[k] = nx[k].rows;
     for (int k = 0; k < n; ++k) {
       if (!s.on[k]) continue;
       if (nx[k].rows < 1 || nx[k].rows > model::ops::kSessTok || R + nx[k].rows > model::kMaxRows)
@@ -704,10 +865,40 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       if (!b.on[k]) continue;
       b.thresh[k] = rate[k].thresh(c);
       end[k].gate(b.thresh[k]);
-      bound = std::max(bound, ahead ? nx[k].pos0 + nx[k].rows + kD : nx[k].pos0 + nx[k].rows - 1);
+      bound = std::max(bound, ahead ? nx[k].pos0 + run_rows[k] + kD : nx[k].pos0 + nx[k].rows - 1);
       lim = std::min(lim, e[k].limit);
       if (ending[k]) pend[k] = 1;
     }
+    // copy drafts: a window for each entry whose reply repeats a source (at most kCopyWin a step, in turns). Its
+    // first token is the entry's last real one (nx's, at nx.pos0); then what the source predicts after it: the rows
+    // of the step running (run_rows: all may be accepted) and this step's drafts.
+    if (copy && !given && (S == 1 || kn.shared > 0)) {  // DSGB10_COPY_SHARED=0 keeps shared steps as they are
+      int cand[model::ops::kMaxSess], nc = 0;
+      for (int j = 0; j < n; ++j) {
+        const int k = (j + n_launch) % n;
+        if (b.on[k] && !ending[k] && src[k] && src[k]->ready(kn.match) && (ext || end[k].sampled >= kn.mintok)) cand[nc++] = k;
+      }
+      nc = std::min(nc, (int)model::ops::kCopyWin);
+      const int rows_all = std::min(S == 1 ? kn.rows : kn.shared, m.spec_batch_rows());
+      b.copy_cap = rows_all;
+      int off = 0, nw = 0;
+      for (int j = 0; j < nc; ++j) {
+        const int k = cand[j];
+        const int width = std::min(src[k]->width, std::max(1, (rows_all - S) / nc));
+        const int a = ahead ? run_rows[k] : 0;
+        const int room = model::ops::kCopyTok / nc;
+        const int want = std::min(1 + a + width, room);
+        b.copy_tok[off] = nx[k].tok[0];
+        const int got = 1 + src[k]->window(b.copy_tok + off + 1, want - 1);
+        if (got < 2 + a) continue;  // nothing past the step running
+        b.copy[nw++] = model::ops::CopyWin{k, nx[k].pos0, off, got, width, kn.mode};
+        off += got;
+        bound = std::max(bound, nx[k].pos0 + a + width);
+      }
+      for (int w = nw; w < model::ops::kCopyWin; ++w) b.copy[w].ent = -1, b.copy[w].n = 0;
+      b.copy_on = s.copy = nw > 0;
+    }
+    ++n_launch;
     b.pos_bound = std::min(bound, lim - 1);
     s.id = given ? m.launch_spec_batch(b) : m.launch_verify_batch(b);
     s.late = !given;  // a given step's rows are the host's: launch_spec_batch looked them up
@@ -719,7 +910,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     int any = 0;
     for (int k = 0; k < n; ++k) {
       if (!live[k] || ending[k]) continue;
-      if (nx[k].pos0 + nx[k].rows > feed[k]) return false;
+      if (nx[k].pos0 + run_rows[k] > feed[k]) return false;
       ++any;
     }
     return any > 0;
@@ -732,6 +923,7 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
   }
   uint64_t prev_id = 0;
   int prev_R = 0;
+  bool sw_exit = false;  // copy drafts: the entry leaves for the speculative loop after the step queued
   for (int i = 0; !q.empty(); ++i) {
     const Step s = q.front();
     q.pop_front();
@@ -756,6 +948,9 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       const int p0 = o.sess_pos0[k], sr = o.sess_step_rows[k], er = o.sess_rows[k], r0 = o.sess_row0[k];
       if (sr < 1 || er < 1 || er > sr || r0 < 0 || r0 + sr > o.step_rows)
         die("spec batch: entry %d: rows %d (%d emitted) from row %d of %d", k, sr, er, r0, o.step_rows);
+      if (s.copy && s.rows[k] && s.rows[k] != sr)  // the host's layout is the device's (the Engram lookups were the rows')
+        die("spec batch: entry %d: %d rows on the device, %d laid out here (%d from a copy window)", k, sr, s.rows[k],
+            s.ncopy[k]);
       d.written = std::max(d.written, p0 + std::max(sr, er + dspark::draft_rows_batch()));  // blk7
       if (ending[k]) {  // its rows behind its end: their KV counts, their tokens do not
         snaps(k, H[k] + 1);
@@ -766,7 +961,13 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
         ++d.vsteps, d.verified += sr - 1, d.accepted += er - 1;
         ++d.rows_hist[std::min(sr - 1, kD)];
       }
-      rate[k].add(c, er, sr);
+      if (s.ncopy[k] > 0) {  // a copy step: its width from here on; the drafts' rate is the draft module's alone
+        src[k]->copied(sr - 1, er - 1, std::max(1, std::min(kn.rows, m.spec_batch_rows()) - 1));
+        ++d.copy_steps, d.copy_rows += sr - 1, d.copy_acc += er - 1;
+      } else {
+        rate[k].add(c, er, sr);
+        if (src[k]) ++src[k]->idle;
+      }
       d.spec_tok = rate[k].tok, d.spec_ms = rate[k].ms;
       // the tokens it emits, until a stop
       bool stop = false;
@@ -777,7 +978,8 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
         if (on) on(k, o, r);
         ++d.sampled, ++u, ++stats.emitted;
         toks[k].push_back(t);
-        if (o.ctl & (1u << e[k].slot)) stop = true, d.why = kEndCancel;
+        if (src[k]) src[k]->feed(t);
+        if (solo ? o.ctl != 0 : (o.ctl & (1u << e[k].slot)) != 0) stop = true, d.why = kEndCancel;
         for (int q2 = 0; !stop && q2 < e[k].n_stop; ++q2)
           if (t == e[k].stop[q2]) stop = true, d.why = kEndStop;
         if (!stop && d.sampled >= e[k].max_new) stop = true, d.why = kEndLength;
@@ -799,6 +1001,25 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
         const int kv_end = H[k] <= F[k] ? H[k] + 1 : F[k] + 1;
         snaps(k, kv_end);
         finish(k, kv_end);
+      }
+    }
+    // copy drafts, one request alone (decode_loop): `solo` steps without a copy, and no source in sight: it goes on
+    // in the speculative loop
+    // copy drafts (DSGB10_COPY_SW): a visit that has not had kn.enter copied tokens accepted leaves at its first step without
+    // a copy; and the change waits for the step queued (its tokens count), then ends with nothing queued
+    bool sw_now = solo > 0 && n == 1 && live[0] && !ending[0] && src[0] && !src[0]->ready(kn.match) &&
+                  src[0]->idle >= (kn.sw && src[0]->acc - src[0]->visit0 < kn.enter ? 1 : solo);
+    sw_exit = false;
+    if (sw_now && kn.sw && !q.empty() && q.front().on[0]) sw_exit = true, sw_now = false;
+    if (sw_now) {
+      end[0].why = kEndSwitch;
+      ending[0] = 1;
+      if (!q.empty() && q.front().on[0]) {
+        pend[0] = 1;
+      } else {
+        const int kv_end = H[0] <= F[0] ? H[0] + 1 : F[0] + 1;
+        snaps(0, kv_end);
+        finish(0, kv_end);
       }
     }
     if ((c.flags & kBatchSolo) && n > 1) {  // one entry left decoding: it pauses, to go on alone
@@ -823,11 +1044,16 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       launch(false, false);
       late_rows(q.back());
     }
-    if (c.ahead && q.size() == 1 && fits()) launch(false, true);
+    if (c.ahead && !sw_exit && q.size() == 1 && fits()) launch(false, true);
     g_t_launch.push_back(now_s());
   }
   m.use_slot(slot0);
   if (st) *st = stats;
+  if (copy && kn.log && on && !solo)
+    for (int k = 0; k < n; ++k)
+      if (src[k] && src[k]->steps)
+        std::fprintf(stderr, "copy: entry %d of %d (slot %d): %d tokens, %d copy steps (%d whole), %d drafts, %d accepted\n",
+                     k, n, e[k].slot, end[k].sampled, src[k]->steps, src[k]->whole, src[k]->rows, src[k]->acc);
   return end;
 }
 
@@ -863,7 +1089,16 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
     } else if (c.op == kCmdTokens) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);
+      if (c.delta) {  // copy drafts (DSGB10_COPY_DELTA): this rank's history below pos0 is rank 0's, or the matchers part
+        const std::vector<int32_t>& hh = m.history(c.slot);
+        if ((int)hh.size() < c.pos0 || copy_hist_hash(hh.data(), c.pos0) != c.hist_hash)
+          die("copy delta: rank %d's history of slot %d (%zu tokens) is not rank 0's below %d", rank, c.slot, hh.size(),
+              c.pos0);
+      }
       m.set_tokens(c.pos0, c.n, t.data());
+      std::vector<int32_t> pr(std::max(0, c.n_pred));  // copy drafts: the request's prediction
+      if (c.n_pred > 0) bcast_payload(ring, pr.data(), pr.size() * 4, rank);
+      set_prediction(m.slot(), pr.data(), (int)pr.size());
     } else if (c.op == kCmdImages) {
       if (c.n <= 0) {
         m.set_images(0, nullptr, nullptr, nullptr);

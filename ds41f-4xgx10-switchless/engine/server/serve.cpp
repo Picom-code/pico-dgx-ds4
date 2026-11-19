@@ -47,6 +47,7 @@
 // their sessions as before the stop.
 #include "dspark/dspark.h"
 #include "server/serve.h"
+#include "server/copy.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -140,6 +141,7 @@ struct Request {
   // vision (fe::kFlagImages): the image spans and their rows, bf16 [sum rows][kImageDim]; empty for text
   std::vector<fe::ImageSpan> spans;
   std::vector<uint16_t> img;
+  std::vector<int32_t> pred;  // copy drafts (fe::kFlagPrediction): the client's prediction as token ids
 };
 
 struct Event {
@@ -265,13 +267,20 @@ class Io {
       Request& r = e.rq;
       if (p.size() < sizeof r.h) return false;
       std::memcpy(&r.h, p.data(), sizeof r.h);
-      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
+      const size_t npred = (r.h.flags & fe::kFlagPrediction) ? r.h.reserved : 0;  // copy drafts: the prediction
+      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt + npred);
       if (!(r.h.flags & fe::kFlagImages) ? p.size() != base : p.size() < base + 4) return false;
       r.stop.resize(r.h.n_stop_ids);
       r.prompt.resize(r.h.n_prompt);
       const char* a = p.data() + sizeof r.h;
       if (!r.stop.empty()) std::memcpy(r.stop.data(), a, r.stop.size() * 4);
       if (!r.prompt.empty()) std::memcpy(r.prompt.data(), a + r.stop.size() * 4, r.prompt.size() * 4);
+      if (npred) {
+        r.pred.resize(std::min<size_t>(npred, 1u << 18));
+        std::memcpy(r.pred.data(), a + (r.stop.size() + r.prompt.size()) * 4, r.pred.size() * 4);
+        for (int32_t& t : r.pred)
+          if (t < 0 || t >= model::kVocab) t = -1;  // never a draft
+      }
       if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
         uint32_t ni = 0;
         std::memcpy(&ni, p.data() + base, 4);
@@ -1080,8 +1089,31 @@ class Server {
       Cmd c{};
       c.op = kCmdTokens;
       c.slot = s;
-      c.pos0 = std::max(0, q - 3);
+      // copy drafts (server/copy.h): every rank's matcher reads the whole prompt, so it goes from position 0
+      static const bool copy_on = CopyKnobs::get().on && m_.spec_copy();
+      c.pos0 = copy_on ? 0 : std::max(0, q - 3);
+      // copy drafts (DSGB10_COPY_DELTA): every rank's history of the slot is this rank's (the same commands and steps); what
+      // it holds of the prompt already is not sent again: from the first token that differs, at most q - 3 (the start
+      // without copy drafts). A slot that held another sequence gets the whole prompt.
+      static const bool delta_on = copy_on && CopyKnobs::get().delta;
+      if (delta_on) {
+        const std::vector<int32_t>& hh = m_.history(s);
+        const int lim = std::min<int>((int)hh.size(), std::max(0, q - 3));
+        int L = 0;
+        if (f.rq.spans.empty()) {
+          while (L < lim && hh[L] == prompt[L]) ++L;
+        } else {  // vision: the history holds -1 at image positions
+          std::vector<int32_t> w(prompt.begin(), prompt.begin() + lim);
+          for (const fe::ImageSpan& sp : f.rq.spans)
+            for (int k = sp.start; k < (int)(sp.start + sp.rows) && k < lim; ++k) w[k] = -1;
+          while (L < lim && hh[L] == w[L]) ++L;
+        }
+        c.pos0 = L;
+        c.delta = 1;
+        c.hist_hash = copy_hist_hash(hh.data(), L);
+      }
       c.n = n - c.pos0;
+      c.n_pred = copy_on ? (int)f.rq.pred.size() : 0;
       if (v.size() > (size_t)kMaxOps) die("serve: %zu state operations for one command", v.size());
       c.n_ops = (int)v.size();
       std::copy(v.begin(), v.end(), c.ops);
@@ -1099,6 +1131,10 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (copy_on) {  // the request's prediction, to every rank (none: the slot's earlier one is dropped)
+        if (c.n_pred > 0) bcast_payload(ring_, f.rq.pred.data(), f.rq.pred.size() * 4, 0);
+        set_prediction(s, f.rq.pred.data(), c.n_pred);
+      }
       if (!f.rq.spans.empty()) images(f.rq);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }

@@ -1,6 +1,7 @@
 // Correctness of the decode kernels against reference data from tests/gen_ref.py.
 // usage: test_kernels [data dir, default ~/dsgb10-data/kerneltests ("" for it)]
 //                     [only: act_quant|fp8|<fp8 name>|moe|mcode|woa|head|head4|norm|normgemv|router|rows16|prefill|p_fp8|p_small|p_16|p_moe]
+#include <chrono>
 #include <algorithm>
 #include <string>
 #include <cmath>
@@ -1894,6 +1895,273 @@ static void test_headrg() {
   }
 }
 
+// exact wide: the row-group kernels (17..64 rows, the weights read once) against the 1..8-row kernels, row by row and bit
+// for bit, at 9 / 16 / 17 / 32 / 48 / 64 rows; and their time against the wide (prefill) kernels and the 16-row kernels
+// in groups. Rows: the 8 recorded ones, rows 8.. the recorded row (5 r + 3) % 8 rotated by 32 r elements.
+template <class T>
+static std::vector<T> rows64(const T* h8, size_t cols, size_t unit = 32) {
+  std::vector<T> v(64 * cols);
+  for (int r = 0; r < 64; ++r) {
+    const T* src = h8 + (size_t)(r < 8 ? r : (5 * r + 3) % 8) * cols;
+    const size_t rot = r < 8 ? 0 : (unit * (size_t)r) % cols;
+    for (size_t c = 0; c < cols; ++c) v[r * cols + c] = src[(c + rot) % cols];
+  }
+  return v;
+}
+template <class T>
+static T* to_dev(const std::vector<T>& v) {
+  T* d = dev_alloc<T>(v.size());
+  CUDA_CHECK(cudaMemcpy(d, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+  return d;
+}
+template <class F>
+static double time_ms(F&& f, int reps = 20) {
+  f();
+  CUDA_CHECK(cudaDeviceSynchronize());
+  std::vector<double> t;
+  for (int i = 0; i < reps; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    t.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+  std::sort(t.begin(), t.end());
+  return t[t.size() / 2];
+}
+static void rg_verdict(const char* what, int m, size_t d) {
+  g_fail += d != 0;
+  printf("  %-44s M=%2d %s %zu outputs differ from the 8-row calls\n", what, m, d ? "FAIL" : "ok  ", d);
+}
+static const int kRgM[] = {9, 16, 17, 32, 48, 64};
+
+static void test_rg() {
+  printf("row groups (exact wide): 9..64 rows against 8-row calls, bit for bit; times in ms (median of 20)\n");
+  {  // FP8 GEMVs: wq_a + wkv in one launch (c8k), wo_b (c8), tiled
+    struct Site { const char* name; int wk; std::vector<std::string> mats; std::string xname; };
+    for (const Site& sh : {Site{"wq_a + wkv", 8, {"wq_a", "wkv"}, "wq_a"}, Site{"wo_b", 16, {"wo_b"}, "wo_b"}}) {
+      Npy x = L(sh.xname + "_x");
+      const int K = x.shape[1], nseg = (int)sh.mats.size();
+      auto* dx = reinterpret_cast<__nv_bfloat16*>(to_dev(rows64(x.as<uint16_t>(), K)));
+      uint8_t *dq = dev_alloc<uint8_t>((size_t)64 * K), *dqs = dev_alloc<uint8_t>((size_t)64 * K / 32);
+      dsk::act_quant(dx, 64, K, dq, dqs, 0);
+      dsk::Fp8Seg seg[2], ref[2], grp[2];
+      std::vector<void*> frees;
+      size_t wbytes = 0;
+      for (int i = 0; i < nseg; ++i) {
+        Npy w = L(sh.mats[i] + "_w"), sc = L(sh.mats[i] + "_s");
+        const int N = w.shape[0];
+        uint8_t *dwn = dev(w), *dwt = dev_alloc<uint8_t>((size_t)N * K), *ds = dev(sc);
+        dsk::tile_fp8(dwn, dwt, N, K, 0);
+        seg[i] = {dwt, ds, dev_alloc<__nv_bfloat16>((size_t)64 * N), N};
+        ref[i] = {dwt, ds, dev_alloc<__nv_bfloat16>((size_t)64 * N), N};
+        frees.insert(frees.end(), {dwn, dwt, ds, seg[i].y, ref[i].y});
+        wbytes += (size_t)N * K;
+      }
+      dsk::GemvCfg cfg{1, 1, sh.wk};
+      cfg.tiled = true;
+      for (int r0 = 0; r0 < 64; r0 += 8) {  // the reference: 8-row calls
+        for (int i = 0; i < nseg; ++i) grp[i] = ref[i], grp[i].y = ref[i].y + (size_t)r0 * ref[i].N;
+        dsk::gemv_fp8_multi(dq + (size_t)r0 * K, dqs + (size_t)r0 * K / 32, 8, grp, nseg, K, cfg, 0);
+      }
+      for (int mt : {1, 2})
+        for (int m : kRgM) {
+          size_t d = 0;
+          for (int i = 0; i < nseg; ++i) CUDA_CHECK(cudaMemset(seg[i].y, 0xFF, (size_t)64 * seg[i].N * 2));
+          dsk::GemvCfg cm = cfg;
+          cm.mt = m > 16 ? mt : 1;
+          dsk::gemv_fp8_rows(dq, dqs, m, seg, nseg, K, cm, 0);
+          for (int i = 0; i < nseg; ++i) d += diffd(seg[i].y, ref[i].y, (size_t)m * seg[i].N);
+          char what[64];
+          snprintf(what, sizeof what, "%s mt=%d", sh.name, mt);
+          rg_verdict(what, m, d);
+        }
+      for (int m : {17, 32, 64}) {
+        const double tw = time_ms([&] { dsk::gemm_fp8_p(dq, dqs, m, seg, nseg, K, 0); });
+        const double tg = time_ms([&] {
+          for (int r0 = 0; r0 < m; r0 += 16) {
+            for (int i = 0; i < nseg; ++i) grp[i] = seg[i], grp[i].y = seg[i].y + (size_t)r0 * seg[i].N;
+            dsk::gemv_fp8_multi(dq + (size_t)r0 * K, dqs + (size_t)r0 * K / 32, std::min(16, m - r0), grp, nseg, K, cfg, 0);
+          }
+        });
+        const double tr = time_ms([&] { dsk::gemv_fp8_rows(dq, dqs, m, seg, nseg, K, cfg, 0); });
+        const double t16 = time_ms([&] { dsk::gemv_fp8_multi(dq, dqs, 16, seg, nseg, K, cfg, 0); });
+        printf("  TIME %-12s M=%2d (%.1f MB): wide GEMM %.3f | 16-row groups %.3f | row-group kernel %.3f | one 16-row call %.3f\n",
+               sh.name, m, wbytes / 1048576.0, tw, tg, tr, t16);
+      }
+      CUDA_CHECK(cudaDeviceSynchronize());
+      for (void* q : frees) cudaFree(q);
+      cudaFree(dx), cudaFree(dq), cudaFree(dqs);
+    }
+  }
+  {  // the gate (bf16 weights, fp32 logits), cgate {1, 1, 8}
+    Npy gw = L("gate_w"), nx = L("norm_x");
+    const int E = gw.shape[0], K = gw.shape[1];
+    uint8_t *dgn = dev(gw), *dgt = dev_alloc<uint8_t>(gw.data.size());
+    dsk::tile_fp8(dgn, dgt, E, 2 * K, 0);
+    auto* dx = reinterpret_cast<__nv_bfloat16*>(to_dev(rows64(nx.as<uint16_t>(), K)));
+    float *l1 = dev_alloc<float>((size_t)64 * E), *l2 = dev_alloc<float>((size_t)64 * E);
+    const dsk::GemvCfg cfg{1, 1, 8};
+    for (int r0 = 0; r0 < 64; r0 += 8) dsk::gemv_bf16(dx + (size_t)r0 * K, 8, dgt, E, K, l1 + (size_t)r0 * E, nullptr, cfg, false, 0);
+    for (int m : kRgM) {
+      CUDA_CHECK(cudaMemset(l2, 0xFF, (size_t)64 * E * 4));
+      dsk::gemv_bf16_rows(dx, m, dgt, E, K, l2, cfg, 0);
+      rg_verdict("gate", m, diffd(l1, l2, (size_t)m * E));
+    }
+    for (int m : {17, 32, 64}) {
+      const double tw = time_ms([&] { dsk::gemm_bf16_p(dx, m, dgt, E, K, l2, 0); });
+      const double tg = time_ms([&] {
+        for (int r0 = 0; r0 < m; r0 += 16)
+          dsk::gemv_bf16(dx + (size_t)r0 * K, std::min(16, m - r0), dgt, E, K, l2 + (size_t)r0 * E, nullptr, cfg, false, 0);
+      });
+      const double tr = time_ms([&] { dsk::gemv_bf16_rows(dx, m, dgt, E, K, l2, cfg, 0); });
+      printf("  TIME %-12s M=%2d (%.1f MB): wide GEMM %.3f | 16-row groups %.3f | row-group kernel %.3f\n", "gate", m,
+             gw.data.size() / 1048576.0, tw, tg, tr);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(dgn), cudaFree(dgt), cudaFree(dx), cudaFree(l1), cudaFree(l2);
+  }
+  {  // wo_a with its act_quant, cwoa {1, 4, 4}
+    Npy w = L("woa_w"), sc = L("woa_s"), x = L("woa_x");
+    const int N = w.shape[0], K = w.shape[1], G = x.shape[1] / K;
+    uint8_t *dw = dev(w), *ds = dev(sc), *dwt = dev_alloc<uint8_t>(w.data.size());
+    dsk::tile_fp8(dw, dwt, N, K, 0);
+    auto* dx = reinterpret_cast<__nv_bfloat16*>(to_dev(rows64(x.as<uint16_t>(), (size_t)G * K)));
+    auto *y1 = dev_alloc<__nv_bfloat16>((size_t)64 * N), *y2 = dev_alloc<__nv_bfloat16>((size_t)64 * N);
+    auto *q1 = dev_alloc<uint8_t>((size_t)64 * N), *s1 = dev_alloc<uint8_t>((size_t)64 * N / 32);
+    auto *q2 = dev_alloc<uint8_t>((size_t)64 * N), *s2 = dev_alloc<uint8_t>((size_t)64 * N / 32);
+    const dsk::GemvCfg cfg{1, 4, 4};
+    const size_t ldx = (size_t)G * K;
+    for (int r0 = 0; r0 < 64; r0 += 8)
+      dsk::gemv_woa(dx + r0 * ldx, 8, dwt, ds, N, K, N / G, y1 + (size_t)r0 * N, cfg, false, 0, q1 + (size_t)r0 * N,
+                    s1 + (size_t)r0 * N / 32);
+    for (int m : kRgM) {
+      CUDA_CHECK(cudaMemset(y2, 0xFF, (size_t)64 * N * 2));
+      CUDA_CHECK(cudaMemset(q2, 0xFF, (size_t)64 * N));
+      CUDA_CHECK(cudaMemset(s2, 0xFF, (size_t)64 * N / 32));
+      dsk::gemv_woa_rows(dx, m, dwt, ds, N, K, N / G, y2, cfg, 0, q2, s2);
+      rg_verdict("wo_a + act_quant", m,
+                 diffd(y1, y2, (size_t)m * N) + diffd(q1, q2, (size_t)m * N) + diffd(s1, s2, (size_t)m * N / 32));
+    }
+    for (int m : {17, 32, 64}) {
+      const double tw = time_ms([&] { dsk::gemm_woa_p(dx, m, dwt, ds, N, K, N / G, nullptr, q2, s2, 0); });
+      const double tg = time_ms([&] {
+        for (int r0 = 0; r0 < m; r0 += 16)
+          dsk::gemv_woa(dx + r0 * ldx, std::min(16, m - r0), dwt, ds, N, K, N / G, nullptr, cfg, false, 0, q2 + (size_t)r0 * N,
+                        s2 + (size_t)r0 * N / 32);
+      });
+      const double tr = time_ms([&] { dsk::gemv_woa_rows(dx, m, dwt, ds, N, K, N / G, nullptr, cfg, 0, q2, s2); });
+      printf("  TIME %-12s M=%2d (%.1f MB): wide GEMM %.3f | 16-row groups %.3f | row-group kernel %.3f\n", "wo_a", m,
+             w.data.size() / 1048576.0, tw, tg, tr);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(dw), cudaFree(ds), cudaFree(dwt), cudaFree(dx), cudaFree(y1), cudaFree(y2), cudaFree(q1), cudaFree(s1), cudaFree(q2), cudaFree(s2);
+  }
+  {  // the MoE: a pool of 128 random experts and the reference's shared expert; four routings
+    Npy x = L("moe_x");
+    Npy shw1 = L("moe_shw1"), shs1 = L("moe_shs1"), shw3 = L("moe_shw3"), shs3 = L("moe_shs3");
+    Npy shw2 = L("moe_shw2"), shs2 = L("moe_shs2");
+    const int I = 576, D = x.shape[1];
+    auto tile8 = [&](const Npy& w, int N, int K) {
+      uint8_t *dw = dev(w), *t = dev_alloc<uint8_t>(w.data.size());
+      dsk::tile_fp8(dw, t, N, K, 0);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      cudaFree(dw);
+      return (const uint8_t*)t;
+    };
+    constexpr int kPoolE = 128;
+    const size_t w13 = (size_t)I * D / 2, s13 = (size_t)I * D / 32, w2b = (size_t)D * I / 2, s2b = (size_t)D * I / 32;
+    dsk::MoeWeights pool{};
+    pool.sh_w1 = tile8(shw1, I, D), pool.sh_s1 = dev(shs1);
+    pool.sh_w3 = tile8(shw3, I, D), pool.sh_s3 = dev(shs3);
+    pool.sh_w2 = tile8(shw2, D, I), pool.sh_s2 = dev(shs2);
+    uint32_t rr = 2468;
+    auto rnd = [&]() { rr = rr * 1664525u + 1013904223u; return rr >> 8; };
+    auto synth = [&](size_t per) {  // [kPoolE][per] scales, tiled: groups of 32 bytes, expert e's off the pair with p = (e % 12) / 11
+      std::vector<uint8_t> h(kPoolE * per);
+      for (int e = 0; e < kPoolE; ++e)
+        for (size_t gi = 0; gi < per / 32; ++gi) {
+          uint8_t* grp = &h[e * per + gi * 32];
+          for (int i = 0; i < 32; ++i) grp[i] = rnd() % 5 < 3 ? 120 : 121;
+          if (rnd() % 11 < (uint32_t)(e % 12)) grp[rnd() % 32] = (uint8_t)(116 + rnd() % 4 + (rnd() & 1) * 6);
+        }
+      return (const uint8_t*)to_dev(h);
+    };
+    pool.w1 = dev_fill16(kPoolE * w13, 1), pool.s1 = synth(s13);
+    pool.w3 = dev_fill16(kPoolE * w13, 3), pool.s3 = synth(s13);
+    pool.w2 = dev_fill16(kPoolE * w2b, 5), pool.s2 = synth(s2b);
+    dsk::MoeWeights poolc = pool;  // the same weights with their scales' 1-bit code
+    {
+      const size_t n13 = dsk::scale_code_words(kPoolE, I, D / 32), n2 = dsk::scale_code_words(kPoolE, D, I / 32);
+      uint32_t* code = dev_alloc<uint32_t>(2 * n13 + n2);
+      int b1, b3, b2;
+      const double f1 = dsk::scale_code(pool.s1, kPoolE, I, D / 32, code, &b1, 0);
+      const double f3 = dsk::scale_code(pool.s3, kPoolE, I, D / 32, code + n13, &b3, 0);
+      const double f2 = dsk::scale_code(pool.s2, kPoolE, D, I / 32, code + 2 * n13, &b2, 0);
+      poolc.c1 = {code, (uint32_t)b1 * 0x01010101u};
+      poolc.c3 = {code + n13, (uint32_t)b3 * 0x01010101u};
+      poolc.c2 = {code + 2 * n13, (uint32_t)b2 * 0x01010101u};
+      printf("  moe pool: groups coded w1 %.1f %%, w3 %.1f %%, w2 %.1f %%\n", 100 * f1, 100 * f3, 100 * f2);
+    }
+    auto* dx = reinterpret_cast<__nv_bfloat16*>(to_dev(rows64(x.as<uint16_t>(), D)));
+    uint8_t *dq = dev_alloc<uint8_t>((size_t)64 * D), *dqs = dev_alloc<uint8_t>((size_t)64 * D / 32);
+    dsk::act_quant(dx, 64, D, dq, dqs, 0);
+    uint8_t *ws8 = dev_alloc<uint8_t>(dsk::moe_workspace_bytes()), *wsr = dev_alloc<uint8_t>(dsk::moe_rows_workspace_bytes());
+    CUDA_CHECK(cudaMemset(ws8, 0, dsk::moe_workspace_bytes()));
+    uint8_t* wsp = dev_alloc<uint8_t>(dsk::moe_prefill_workspace_bytes(64, kPoolE));
+    float *y1 = dev_alloc<float>((size_t)64 * D), *y2 = dev_alloc<float>((size_t)64 * D);
+    int* didx = dev_alloc<int>(384);
+    float* dwts = dev_alloc<float>(384);
+    const char* rname[] = {"moe spread", "moe shared", "moe same 6", "moe copy-like"};
+    for (int routing = 0; routing < 4; ++routing) {
+      std::vector<int> hi(384);
+      std::vector<float> hw(384);
+      for (int r = 0; r < 64; ++r)
+        for (int k = 0; k < 6; ++k) {
+          const int i = r * 6 + k;
+          hi[i] = routing == 0 ? (i * 37 + 11) % kPoolE : routing == 1 ? (r * 3 + k * 5) % 40 : routing == 2 ? (k * 9 + 1) % 40
+                                                                                              : (k < 4 ? k * 11 + 2 : 40 + 20 * (k - 4) + r / 5);
+          hw[i] = 0.05f + 0.9f * (float)((i * 7919) % 101) / 101.f;
+        }
+      CUDA_CHECK(cudaMemcpy(didx, hi.data(), 384 * 4, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(dwts, hw.data(), 384 * 4, cudaMemcpyHostToDevice));
+      std::vector<int> un(hi);
+      std::sort(un.begin(), un.end());
+      const size_t nun = std::unique(un.begin(), un.end()) - un.begin();
+      for (int r0 = 0; r0 < 64; r0 += 8)  // the reference: 8-row calls (the engine's variants: up 0, down 4)
+        dsk::moe(dq + (size_t)r0 * D, dqs + (size_t)r0 * D / 32, 8, didx + r0 * 6, dwts + r0 * 6, pool, ws8, y1 + (size_t)r0 * D,
+                 dsk::MoeCfg{}, 0);
+      for (int cs = 0; cs < 2; ++cs)
+        for (int gq : {0, 2, 4})
+          for (int m : kRgM) {
+            CUDA_CHECK(cudaMemset(y2, 0xFF, (size_t)64 * D * 4));
+            CUDA_CHECK(cudaMemset(wsr, 0xAB, dsk::moe_rows_workspace_bytes()));
+            dsk::moe_rows(dq, dqs, m, didx, dwts, cs ? poolc : pool, wsr, y2, 0, gq);
+            char what[64];
+            snprintf(what, sizeof what, "%s (union %zu) gq=%d %s", rname[routing], nun, gq, cs ? "code" : "raw");
+            rg_verdict(what, m, diffd(y1, y2, (size_t)m * D));
+          }
+      for (int m : {17, 32, 64}) {
+        const double tw = time_ms([&] { dsk::moe_prefill(dq, dqs, m, didx, dwts, kPoolE, pool, wsp, y2, 0); }, 10);
+        const double tg = time_ms([&] {
+          for (int r0 = 0; r0 < m; r0 += 16) {
+            dsk::MoeCfg mc{};
+            mc.down = std::min(16, m - r0) == 1 ? 2 : 4;
+            dsk::moe(dq + (size_t)r0 * D, dqs + (size_t)r0 * D / 32, std::min(16, m - r0), didx + r0 * 6, dwts + r0 * 6, pool, ws8,
+                     y2 + (size_t)r0 * D, mc, 0);
+          }
+        }, 10);
+        const double t2 = time_ms([&] { dsk::moe_rows(dq, dqs, m, didx, dwts, pool, wsr, y2, 0, 2); }, 10);
+        const double t4 = time_ms([&] { dsk::moe_rows(dq, dqs, m, didx, dwts, pool, wsr, y2, 0, 4); }, 10);
+        const double tc = time_ms([&] { dsk::moe_rows(dq, dqs, m, didx, dwts, poolc, wsr, y2, 0, 0); }, 10);
+        const double twc = time_ms([&] { dsk::moe_prefill(dq, dqs, m, didx, dwts, kPoolE, poolc, wsp, y2, 0); }, 10);
+        printf("  TIME %-14s M=%2d: wide moe_prefill %.3f (code %.3f) | 16-row groups %.3f | row-group gq2 %.3f gq4 %.3f code %.3f\n",
+               rname[routing], m, tw, twc, tg, t2, t4, tc);
+      }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // lines reach a log file even if a check aborts
   g_dir = argc > 1 && argv[1][0] ? argv[1] : std::string(getenv("HOME")) + "/dsgb10-data/kerneltests";
@@ -1918,6 +2186,7 @@ int main(int argc, char** argv) {
   if (only.empty() || only == "prefill" || only == "p_fp8" || only == "p_small") g_fail += small_gemms::run(false);
   if (only.empty() || only == "prefill" || only == "p_16") test_prefill_16();
   if (only.empty() || only == "prefill" || only == "p_moe") test_prefill_moe();
+  if (only == "rg") test_rg();
   printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
   return g_fail != 0;
 }

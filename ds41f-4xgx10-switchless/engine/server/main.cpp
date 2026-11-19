@@ -476,7 +476,7 @@ Args parse(int argc, char** argv) {
     die("--chunk and --k must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
   if (a.small_rows < 0 || a.small_rows > model::kMaxSessRows)
     die("--small-rows must be 0..%d (a small turn runs as one step of one session)", model::kMaxSessRows);
-  if (a.batch_rows < 1 || a.batch_rows > model::kMaxSessRows)
+  if (a.batch_rows < 1 || a.batch_rows > (getenv("DSGB10_TF_SESSROWS") ? model::kMaxRows : model::kMaxSessRows))
     die("--batch-rows must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
   if (a.mode == "serve") a.spec = !a.no_spec;  // the drafts change the speed, never the tokens
   if (a.mode == "serve") a.draft_fp8 = !a.draft_bf16;  // nor does the drafter's FP8 head
@@ -1007,6 +1007,7 @@ int main(int argc, char** argv) {
       int32_t first = 0;
       uint64_t hash = 1469598103934665603ull;  // as decode mode's chosen_hash over its decode
       std::vector<int32_t> out;
+      std::vector<uint32_t> bits;  // exact: each sample's logit bits (DSGB10_TF_DUMP)
     };
     std::vector<Sess> ss;
     for (const char* q = a.batch.c_str(); *q;) {
@@ -1062,6 +1063,7 @@ int main(int argc, char** argv) {
         s.out.push_back(o.row[row].token);  // the sample at its position: the golden token after it when equal
         uint32_t bits;
         std::memcpy(&bits, &o.row[row].value, 4);
+        s.bits.push_back(bits);
         s.hash = (s.hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
         s.hash = (s.hash ^ bits) * 1099511628211ull;
       });
@@ -1070,7 +1072,7 @@ int main(int argc, char** argv) {
         FILE* f = std::fopen(dp, "w");
         for (size_t k = 0; f && k < ss.size(); ++k) {
           std::fprintf(f, "%zu %d", k, ss[k].ctx);
-          for (int32_t t : ss[k].out) std::fprintf(f, " %d", t);
+          for (size_t i = 0; i < ss[k].out.size(); ++i) std::fprintf(f, " %d:%08x", ss[k].out[i], ss[k].bits[i]);
           std::fprintf(f, "\n");
         }
         if (f) std::fclose(f);

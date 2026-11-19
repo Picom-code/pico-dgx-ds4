@@ -38,6 +38,17 @@ static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a
 // tokens today's sampler keeps (noise hashed from seed, position and token id, as the untruncated sampler's), and its
 // drafts may be coupled (DSGB10_GCOUPLE, dspark.h). Never set unless DSGB10_GSAMPLE is: every path is then today's.
 constexpr int32_t kSampGumbel = 1 << 30;
+// Copy drafts (DSGB10_COPY, docs/copy.md): the host's predicted tokens for entries of a batch verify step, by
+// position. Window w says "entry ent's token at position pos0 + j is copy_tok[off + j]", j < n; [0] is a token the
+// host knows. The device uses a window when the entry's first row (its real token, at a position inside the window)
+// equals the window's token there; the entry's drafts are then the (at most max) tokens after it instead of the draft
+// module's (spec_batch.h). Every draft is verified as any draft is, so a wrong window costs rows, never a token.
+// mode bit 0: only when the draft module's own gated drafts agree with the window.
+constexpr int kCopyWin = 4;    // windows a step
+constexpr int kCopyTok = 256;  // their tokens, in all
+struct CopyWin {
+  int32_t ent, pos0, off, n, max, mode;
+};
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
@@ -87,6 +98,11 @@ struct StepIn {
   // wide64: the gate's step-cost model (ms) by the rows R a step runs: R <= kDecodeRows: wcost[0] + wcost[1] R; a
   // wide bucket of Rb rows: wcost[2] + wcost[3] Rb (DSGB10_WIDE_COST; fit to serve's GPU ms by rows, 2026-11-05: 26, 2.1, 56, 1.6)
   float wcost[4];
+  // copy drafts (above): read only when sbatch = 1 and copy_on = 1. copy_cap: the step's rows in all, at most, once a
+  // window is used (the entries' own rows always fit; a step already in a wide bucket may fill that bucket)
+  int32_t copy_on, copy_cap;
+  CopyWin copy[kCopyWin];
+  int32_t copy_tok[kCopyTok];
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
