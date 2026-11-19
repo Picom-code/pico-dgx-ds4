@@ -42,7 +42,10 @@
 //                /tmp/dsgb10-engine.sock): sessions with exact prefix reuse (--snap-every positions
 //                between window snapshots, thinned with the distance from a session's end unless
 //                --snap-all; saved state in a pool reserved at startup: the smallest
-//                rank's free memory less --session-margin-gib, at most --session-gib; LRU, the evicted
+//                rank's free memory less --session-margin-gib, at most --session-gib.
+//                --min-session-mib N: fail startup below N MiB of reserved state capacity.
+//                --keep-early-snapshot: keep the window at four snapshot intervals for early forks.
+//                LRU, the evicted
 //                spilled to a file of --disk-gib (default 32; 0: none) in --disk-dir (default the
 //                fleet file's RANK<r>_SPILL), prefill in
 //                chunks of --prefill-rows (default 8192 with CED, else 4096 as in the other modes),
@@ -287,6 +290,8 @@ struct Args {
   uint32_t seed = 1;
   std::string socket = "/tmp/dsgb10-engine.sock";
   double session_gib = 12, session_margin_gib = 2;
+  size_t min_session_mib = 0;
+  bool keep_early_snapshot = false;
   double disk_gib = 32;  // serve: the store's disk tier (0: none)
   std::string disk_dir;  // its directory (default: the fleet's RANK<r>_SPILL)
   std::string disk_tag;  // its files' tag: rank<r>.<tag>.spill (none: rank<r>.spill)
@@ -378,6 +383,14 @@ Args parse(int argc, char** argv) {
     else if (s == "--socket") a.socket = val();
     else if (s == "--session-gib") a.session_gib = std::atof(val().c_str());
     else if (s == "--session-margin-gib") a.session_margin_gib = std::atof(val().c_str());
+    else if (s == "--min-session-mib") {
+      const std::string mib = val();
+      const auto amount = std::strtoull(mib.c_str(), nullptr, 10);
+      if (mib.empty() || mib.find_first_not_of("0123456789") != std::string::npos || amount > (SIZE_MAX >> 20))
+        die("--min-session-mib requires a nonnegative integer MiB count");
+      a.min_session_mib = (size_t)amount;
+    }
+    else if (s == "--keep-early-snapshot") a.keep_early_snapshot = true;
     else if (s == "--disk-gib") a.disk_gib = std::atof(val().c_str());
     else if (s == "--disk-dir") a.disk_dir = val();
     else if (s == "--disk-tag") a.disk_tag = val();
@@ -440,6 +453,8 @@ Args parse(int argc, char** argv) {
     }
     else die("unknown argument %s", s.c_str());
   }
+  if ((a.min_session_mib || a.keep_early_snapshot) && a.mode != "serve")
+    die("--min-session-mib and --keep-early-snapshot require --mode serve");
   if (!a.prefill_rows) a.prefill_rows = a.mode == "serve" && !a.exact ? 8192 : 4096;
   if (a.disk_tag.size() > 32 || a.disk_tag.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
@@ -734,12 +749,29 @@ int main(int argc, char** argv) {
     ring.allgather_host(mine, all, sizeof mine);
     uint64_t pool = (uint64_t)(a.session_gib * gib);
     for (const auto& r : all) pool = std::min(pool, r[2]);
+    const size_t minimum = a.min_session_mib << 20;
+    if (pool < minimum)
+      die("session store: common offer %.1f MiB is below --min-session-mib %zu", pool / 1048576.0, a.min_session_mib);
     m.state_reserve(pool);
     if (a.rank == 0) {
       std::printf("session store: %.2f GiB on every rank (at most %.1f; free device / available host memory before "
                   "it, ranks 0-3:", m.state_capacity() / gib, a.session_gib);
       for (const auto& r : all) std::printf(" %.2f / %.2f", r[0] / gib, r[1] / gib);
       std::printf(" GiB, less a margin of %.1f and the Engram cache's %.1f)\n", margin / gib, cache / gib);
+    }
+    if (a.min_session_mib != 0) {
+      CUDA_CHECK(cudaMemGetInfo(&dfree, &dtotal));
+      const uint64_t post[3] = {m.state_capacity(), dfree, mem_available()};
+      ring.allgather_host(post, all, sizeof post);
+      if (a.rank == 0) {
+        std::printf("session store reserved / free device / available host, ranks 0-3:");
+        for (const auto& r : all)
+          std::printf(" %.2f / %.2f / %.2f", r[0] / gib, r[1] / gib, r[2] / gib);
+        std::printf(" GiB\n");
+      }
+      for (int r = 0; r < 4; ++r)
+        if (all[r][0] < minimum || all[r][1] < margin || all[r][2] < margin + cache)
+          die("session store: rank %d missed the reserved-cache or post-allocation memory requirement", r);
     }
   }
   ring.barrier();
@@ -762,6 +794,7 @@ int main(int argc, char** argv) {
     so.snap_every = a.snap_every;
     so.slice = a.slice;
     so.snap_thin = !a.snap_all;
+    so.keep_early_snapshot = a.keep_early_snapshot;
     so.budget = (size_t)(a.session_gib * 1073741824.0);
     so.keep_index = disk_dir + "/server" + disk_tag + ".index";
     so.keep_bytes = std::min(m.state_disk_capacity(), (size_t)(a.keep_gib * 1073741824.0));  // none without a file

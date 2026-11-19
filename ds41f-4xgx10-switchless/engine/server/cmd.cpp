@@ -66,7 +66,8 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStDropSnap: m.state_drop_snap(o.h, o.a); break;
     case kStSnap: m.state_snap(o.h, o.a); break;
     case kStSpill: m.state_spill(o.h); break;
-    case kStUnspill: m.state_unspill(o.h); break;
+    case kStUnspill:
+    case kStUnspillWindowFirst: m.state_unspill(o.h, o.a, o.b, o.op == kStUnspillWindowFirst); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
     default: die("state: unknown operation %d", o.op);
   }

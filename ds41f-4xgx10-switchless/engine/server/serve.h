@@ -15,6 +15,7 @@ struct ServeOptions {
   int max_ctx = 65536;             // prompt + output positions per request
   int prefill_rows = 4096;         // rows per prefill chunk
   int small_rows = 8;              // a remainder of at most this many rows runs as one step (graphs)
+  bool keep_early_snapshot = false;  // reserve one early window for forks of long text histories
   int snap_every = 1024;           // a window snapshot every this many positions (exact reuse)
   bool snap_thin = true;           // keep them dense near a session's end only (serve.cpp keep_snap); false
                                    // (--snap-all): every one kept
