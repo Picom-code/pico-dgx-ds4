@@ -8,6 +8,7 @@
 namespace srv::image_prefix {
 
 constexpr uint32_t kFlagCache = 16;  // matches frontend/src/protocol.rs
+constexpr uint32_t kFlagDurable = 32;  // explicit ordinary frontend disk opt-in
 constexpr size_t kMaxEntries = 4;
 constexpr size_t kMaxRowBytes = 128u << 20;
 constexpr double kIdleSeconds = 300;

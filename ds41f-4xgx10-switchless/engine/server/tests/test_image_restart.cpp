@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -49,6 +50,7 @@ struct Flight {
 };
 
 double now_s() { return 1000; }
+double unix_now() { return 1234; }
 [[noreturn]] void die(const char*, unsigned long long) { std::abort(); }
 
 struct Server {
@@ -62,12 +64,28 @@ struct Server {
   bool enabled = true;
   int persisted = 0;
   bool save_has_room = false;
+  bool durable_enabled = false;
+  int ring_ = 0, next_h_ = 100;
+  struct {
+    struct Hit { int h, pos, snap; bool encoder_only; };
+    std::optional<Hit> hit;
+    int attempts = 0;
+
+    std::optional<Hit> load(model::Model&, int&, int& next_handle,
+                            const std::vector<int32_t>&, const std::vector<fe::ImageSpan>&,
+                            const std::vector<uint16_t>&, uint64_t, bool) {
+      ++attempts;
+      if (hit) hit->h = next_handle++;
+      return hit;
+    }
+  } durable_;
 
   Session* find(uint64_t id) {
     auto it = sess_.find(id);
     return it == sess_.end() ? nullptr : &it->second;
   }
   bool image_cache_enabled(const Request& rq) const { return enabled && !rq.spans.empty(); }
+  bool durable_request(const Request&) const { return durable_enabled; }
   int need_clamped(const Request&) const { return 1008; }
   bool fits(int s, int need) const { return slot_sizes.at(s) >= need; }
   void persist_slot(int slot, bool free) {
@@ -199,4 +217,18 @@ int main() {
   shorter.enc_snaps = {896};
   server.o_.ced = true;
   assert(server.restart(f).plan.q == 512);
+
+  // Try disk only with an eligible request and no feasible RAM restart.
+  server.durable_.hit = {0, 768, 768, true};
+  assert(server.restart(f).plan.q == 512);
+  server.durable_enabled = true;
+  assert(server.restart(f).plan.q == 512);
+  assert(server.durable_.attempts == 0);
+  server.sess_.clear();
+  result = server.restart(f);
+  assert(result.id == 0 && result.plan.q == 768 && result.plan.how == kSnap);
+  assert(!result.source_live && server.durable_.attempts == 1);
+  server.durable_.hit.reset();
+  assert(server.restart(f).plan.q == 0);
+  assert(server.durable_.attempts == 2);
 }

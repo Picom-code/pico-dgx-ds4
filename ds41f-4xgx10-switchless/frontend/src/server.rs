@@ -887,7 +887,8 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
     }
     let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
     let cache_flag = if std::env::var("DSGB10_ORDINARY_IMAGE_PREFIX_CACHE").as_deref() == Ok("1") {
-        crate::protocol::FLAG_IMAGE_CACHE
+        let disk = std::env::var("DSGB10_ORDINARY_IMAGE_DURABLE").as_deref() == Ok("1");
+        crate::protocol::FLAG_IMAGE_CACHE | if disk { crate::protocol::FLAG_DURABLE_IMAGE_CACHE } else { 0 }
     } else {
         0
     };

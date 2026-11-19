@@ -11,6 +11,8 @@
 namespace srv {
 
 struct ServeOptions {
+  std::string durable_image_dir, durable_image_namespace;
+  size_t durable_image_bytes = 0;
   std::string socket;              // the front-end's socket (mode 0600)
   int max_ctx = 65536;             // prompt + output positions per request
   int prefill_rows = 4096;         // rows per prefill chunk

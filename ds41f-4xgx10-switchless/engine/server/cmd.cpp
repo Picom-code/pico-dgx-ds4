@@ -69,8 +69,13 @@ void apply_state(model::Model& m, const StateOp& o) {
     case kStUnspill: m.state_unspill(o.h); break;
     case kStKeep: m.state_keep((uint64_t)(uint32_t)o.a | (uint64_t)(uint32_t)o.b << 32); break;
     case kStMarkRamOnly: m.state_mark_ram_only(o.h); break;
+    case kStMarkOrdinaryDurable: m.state_mark_ordinary_durable(o.h); break;
     default: die("state: unknown operation %d", o.op);
   }
+}
+
+bool run_durable(model::Model& m, comm::Ring& ring, const Cmd& c) {
+  return durable::run(m, ring, c.op, c.handle, c.durable_generation, c.pos0, c.durable_encoder_only != 0);
 }
 
 void apply_ops(model::Model& m, const Cmd& c) {
@@ -864,6 +869,10 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = now_s();
       m.wait(run_rows(m, c));
       wd.started = 0;
+    } else if (c.op == kCmdDurablePrune) {
+      (void)run_durable_prune(m, ring, c, rank);
+    } else if (c.op == kCmdDurableSave || c.op == kCmdDurableLoad || c.op == kCmdDurableDrop) {
+      (void)run_durable(m, ring, c);
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);
     }

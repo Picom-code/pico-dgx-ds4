@@ -58,6 +58,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +71,7 @@
 #include <set>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -78,6 +80,7 @@
 #include "model/nvtx.h"
 #include "common/frontend_protocol.h"
 #include "common/keepfile.h"
+#include "server/durable_images.h"
 #include "server/image_prefix.h"
 
 namespace srv {
@@ -376,7 +379,8 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
-  bool image = false; // image sessions never enter the spill/keep files
+  int durable_prompt = 0;  // completed ordinary request awaiting an idle checkpoint write
+  bool image = false; // image sessions never enter the general spill/keep files
   std::weak_ptr<Conn> image_owner;
   std::vector<fe::ImageSpan> image_spans;
   std::vector<uint16_t> image_rows;
@@ -474,13 +478,19 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {
+    if (!o.durable_image_dir.empty() && !durable_.open(o, m_, ring_))
+      die("serve: cannot open ordinary image checkpoint index");
+  }
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
       sweep();
+      // A disk write never starts ahead of queued work or while peers decode.
+      if (durable_.enabled() && flying_.empty() && ready_.empty() && wait_.empty() && !io_.submit_waiting())
+        publish_image();
       if (ordinary_image_cache_enabled()) {
         const double now = now_s();
         if (now >= next_image_prune_) {
@@ -797,6 +807,44 @@ class Server {
            (rq.h.flags & image_prefix::kFlagCache) && rq.h.base_session_id == 0 &&
            rq.img.capacity() <= image_prefix::kMaxRowBytes / sizeof(uint16_t);
   }
+  bool durable_request(const Request& rq) const {
+    return durable_.enabled() && image_cache_enabled(rq) && (rq.h.flags & image_prefix::kFlagDurable);
+  }
+  void publish_image() {
+    for (auto& [id, x] : sess_) {
+      if (!x.durable_prompt) continue;
+      const int n = std::exchange(x.durable_prompt, 0);
+      const auto info = m_.state_info(x.h);
+      const int last_image = x.image_spans.back().start + x.image_spans.back().rows;
+      int best = -1;
+      // Prefer a window slightly inside the submitted prompt, before its mutable
+      // answer framing. Prefer covering every screenshot; then consider older ones.
+      std::tuple<bool, bool, int> best_key{};
+      for (const int snap : info.snaps) {
+        const int q = snap & ~1;
+        if (q < 128 || snap > n || (x.slot < 0 && q > info.saved) ||
+            q < static_cast<int>(x.image_spans.front().start + x.image_spans.front().rows)) continue;
+        bool split = false;
+        for (const auto& img : x.image_spans)
+          if (img.start < static_cast<unsigned>(snap) && img.start + img.rows > static_cast<unsigned>(q)) split = true;
+        if (split) continue;
+        auto key = std::make_tuple(q >= last_image, q <= n - kReplay, q);
+        if (key > best_key) best = snap, best_key = key;
+      }
+      if (best < 0) continue;
+      const int q = best & ~1;
+      Cmd c{};
+      c.op = kCmdState;
+      c.slot = x.slot;
+      c.ops[c.n_ops++] = {kStMarkOrdinaryDurable, x.h, 0, 0};
+      if (info.saved < q) c.ops[c.n_ops++] = {kStSave, x.h, info.saved, q};
+      issue(c);
+      const bool enc = std::find(x.enc_snaps.begin(), x.enc_snaps.end(), best) != x.enc_snaps.end();
+      durable_.save(m_, ring_, x.h, rng_(), x.hist, x.image_spans, x.image_rows,
+                    best, enc, static_cast<uint64_t>(unix_now()), o_.durable_image_bytes);
+      return;
+    }
+  }
   // Least recently used sessions out until the store fits the budget: spilled to the disk tier (one live
   // in a slot saved first, and the slot let go), or freed without one. Sessions in flight stay.
   void evict(uint64_t keep) {
@@ -1028,6 +1076,7 @@ class Server {
     int p = 0;
     int s = S ? S->slot : -1;
     Plan pl;
+    Session disk_source;
     if (image_request && image_cache_enabled(f.rq)) {
       // Preview each candidate without allocating state or disturbing the slots.
       // An off-slot live source can save its state, but the store can run out of
@@ -1069,6 +1118,19 @@ class Server {
         persist_slot(src->slot, false);
         forget_evicted();
         select(false);
+      }
+      if (!pl.q && durable_request(f.rq)) {
+        const auto hit = durable_.load(m_, ring_, next_h_, prompt, f.rq.spans, f.rq.img,
+                                       static_cast<uint64_t>(unix_now()), o_.ced);
+        if (hit) {
+          disk_source.h = hit->h;
+          if (hit->encoder_only) disk_source.enc_snaps.push_back(hit->snap);
+          src = &disk_source;
+          src_id = 0;
+          s = -1;
+          p = hit->pos;
+          pl = Plan{hit->pos, kSnap, hit->snap};
+        }
       }
     } else if (!image_request) {
       // The session's own slot, or its base's when the base is idle and fits.
@@ -1183,6 +1245,7 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (disk_source.h) state({{kStFree, disk_source.h, 0, 0}});
       if (!f.rq.spans.empty()) images(f.rq, q);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
@@ -1635,6 +1698,7 @@ class Server {
     Session* S = !released ? find(h.session_id) : nullptr;
     if (S && S->image) {
       if (!cancelled && (why == fe::kStop || why == fe::kLength || why == fe::kContext) && image_cache_enabled(f.rq)) {
+        if (durable_request(f.rq)) S->durable_prompt = static_cast<int>(f.rq.prompt.size());
         S->image_spans = std::move(f.rq.spans);
         S->image_rows = std::move(f.rq.img);
         S->image_owner = f.rq.conn;
@@ -1703,6 +1767,7 @@ class Server {
   Io& io_;
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;
+  DurableImages durable_;
   double next_image_prune_ = 0;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn

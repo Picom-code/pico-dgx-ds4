@@ -352,6 +352,12 @@ struct Model::Impl {
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse, uint64_t run_id);
   void state_keep(uint64_t gen);
+  void state_durable_config(const std::string& base, size_t bytes, uint64_t run_id);
+  void state_mark_ordinary_durable(int h);
+  bool state_durable_save(int h, uint64_t generation, int snap, bool encoder_only);
+  bool state_durable_load(int h, uint64_t generation, int snap, bool encoder_only);
+  void state_durable_drop(uint64_t generation);
+  bool state_durable_prune(const std::vector<uint64_t>& committed);
   size_t disk_take(int h, size_t bytes);  // room in the disk tier's file for session h (dropping), or kNone
   void state_spill(int h);
   void state_unspill(int h);

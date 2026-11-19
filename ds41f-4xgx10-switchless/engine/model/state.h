@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "model/impl.h"
+#include "model/durable_state.h"
 #include "model/prefill.h"
 
 namespace model::detail {
@@ -70,6 +71,7 @@ struct Store {
     uint64_t used = 0;              // the clock when an operation last used the session
     // spilled: the same blocks at offsets in the disk tier's file, none in the pool
     bool disk = false;
+    bool ordinary_durable = false;  // set only after ordinary request completion
     bool ram_only = false;  // allocator pressure frees this session instead of writing it
     std::vector<size_t> dpages;
     std::map<int, size_t> dsnaps;
@@ -90,6 +92,7 @@ struct Store {
   Pool pool;
   size_t bytes = 0;          // the pool's bytes in sessions' blocks
   std::unique_ptr<SpillFile> disk;  // the disk tier (none: evicted sessions are freed)
+  durable::Files durable;           // ordinary-only immutable disk checkpoints
   Pool dpool;                       // its file's offsets
   size_t dbytes = 0;                // the file's bytes in spilled sessions' blocks
   std::string base;                 // the file is base.spill, its index base.index

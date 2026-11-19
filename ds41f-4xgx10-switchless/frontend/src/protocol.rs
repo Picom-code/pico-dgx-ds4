@@ -27,6 +27,7 @@ pub const FLAG_LOGPROBS: u32 = 4;
 pub const FLAG_IMAGES: u32 = 8;
 /// Opt into the ordinary connection-scoped RAM image cache when the engine also enables it.
 pub const FLAG_IMAGE_CACHE: u32 = 16;
+pub const FLAG_DURABLE_IMAGE_CACHE: u32 = 32;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;

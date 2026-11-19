@@ -22,6 +22,7 @@ inline int q_rows(int M) { return ((M + 3) / 4 + 7) & ~7; }
 // the encoder left it, kept per position (slot = position mod kReplay) in records of kCedRow bytes: the
 // stream x, the normed input y with its act_quant (yq, ys) and layer 20's attention mixes.
 constexpr int kReplay = 128;
+constexpr int kCedFirstDecoderLayer = 20;
 // The dense index scans' rows per batch (dsk::index_topk_p: a batch's keys are selected while in L2).
 constexpr int kIdxBatch = 128;
 constexpr size_t kCedX = 0, kCedY = kCedX + (size_t)kHcDim * 2, kCedYq = kCedY + (size_t)kDim * 2,
