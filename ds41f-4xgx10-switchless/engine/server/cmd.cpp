@@ -863,6 +863,8 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       wd.started = now_s();
       m.wait(run_rows(m, c));
       wd.started = 0;
+    } else if (c.op == kCmdTextCheckpoint) {
+      text_checkpoint_ready(m, ring, c);
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);
     }

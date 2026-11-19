@@ -68,6 +68,7 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  kCmdTextCheckpoint = 26,  // verify a resident restart on all ranks
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -117,6 +118,19 @@ Cmd bcast(comm::Ring& ring, const Cmd& mine);
 void apply_ops(model::Model& m, const Cmd& c);
 // rank 0's payload of nbytes, to every rank (in pieces of 64 KiB, the bootstrap sockets' limit)
 void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank);
+// For the text checkpoint probe, pos0 is the restart, n indicates saved pages
+// are required, and next/rows name the exact window/end positions (-1: absent).
+inline bool local_text_checkpoint_ready(const model::Model::StateInfo& info, const Cmd& c) {
+  if (info.on_disk || (c.n && info.saved < c.pos0)) return false;
+  if (c.next >= 0) return std::binary_search(info.snaps.begin(), info.snaps.end(), c.next);
+  return c.rows >= 0 && info.end_pos == c.rows;
+}
+inline bool text_checkpoint_ready(model::Model& m, comm::Ring& ring, const Cmd& c) {
+  const int32_t ready = local_text_checkpoint_ready(m.state_info(c.handle), c) ? 1 : 0;
+  int32_t all[4] = {};
+  ring.allgather_host(&ready, all, sizeof ready);
+  return std::all_of(all, all + 4, [](int32_t rank) { return rank == 1; });
+}
 model::Ctl to_ctl(const Cmd& c);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
