@@ -696,12 +696,18 @@ pub fn find_last_user_index(messages: &[Value], enc: Encoding) -> Result<Option<
     Ok(None)
 }
 
+enum RenderEffort<'a> {
+    Global(Option<&'a Value>),
+    BeforeTransition(Option<&'a Value>),
+    Omit,
+}
+
 fn render_message(
     index: usize,
     messages: &[Value],
     mode: ThinkingMode,
     drop_thinking: bool,
-    effort: Option<&Value>,
+    effort: RenderEffort<'_>,
     enc: Encoding,
 ) -> Result<String, EncodeError> {
     let msg = &messages[index];
@@ -716,7 +722,10 @@ fn render_message(
     };
     let wo_eos = truthy(get(msg, "wo_eos"));
 
-    let effort_prompt = render_reasoning_effort(index, mode, effort, enc)?;
+    let effort_prompt = match effort {
+        RenderEffort::Global(effort) => render_reasoning_effort(index, mode, effort, enc)?,
+        RenderEffort::BeforeTransition(_) | RenderEffort::Omit => String::new(),
+    };
     let mut prompt = String::new();
     if index == 0 && (!effort_prompt.is_empty() || r == Some("system")) {
         prompt.push_str(SYSTEM_SP);
@@ -830,6 +839,13 @@ fn render_message(
     if index + 1 < messages.len() && !matches!(role(&messages[index + 1]), Some("assistant") | Some("latest_reminder")) {
         return Ok(prompt);
     }
+    if let RenderEffort::BeforeTransition(effort) = effort {
+        let hint = render_reasoning_effort(0, mode, effort, enc)?;
+        if !hint.is_empty() {
+            prompt.push_str(SYSTEM_SP);
+            prompt.push_str(&hint);
+        }
+    }
     if is_task_set(msg) {
         let task = get(msg, "task").unwrap();
         let t = task.as_str().and_then(|t| TASK_TOKENS.iter().find(|(n, _)| *n == t));
@@ -918,13 +934,101 @@ fn encode_messages_text(messages: &[Value], o: &EncodeOptions, context: &[Value]
         if i < 0 || i as usize >= full.len() {
             return Err(err("IndexError: message index out of range"));
         }
-        prompt.push_str(&render_message(i as usize, &full, o.thinking_mode, effective_drop, o.reasoning_effort, enc)?);
+        prompt.push_str(&render_message(
+            i as usize, &full, o.thinking_mode, effective_drop, RenderEffort::Global(o.reasoning_effort), enc,
+        )?);
     }
     Ok(prompt)
 }
 
+fn can_start_generation(messages: &[Value], index: usize) -> bool {
+    match role(&messages[index]) {
+        Some("user") => true,
+        Some("system") => index > 0,
+        _ => false,
+    }
+}
+
+// Check the merged and sorted tool results. A complete, unambiguous result batch can open
+// another generation within the same user turn.
+fn supported_tool_exchange(messages: &[Value], index: usize) -> bool {
+    let blocks = get(&messages[index], "content_blocks").and_then(Value::as_array);
+    let calls = index.checked_sub(1)
+        .and_then(|prev| messages.get(prev))
+        .filter(|prev| role(prev) == Some("assistant"))
+        .and_then(|prev| get(prev, "tool_calls"))
+        .filter(|calls| truthy(Some(calls)));
+    let has_results = blocks.is_some_and(|blocks| blocks.iter().any(|b| get_str(b, "type") == Some("tool_result")));
+    if !has_results {
+        return calls.is_none();
+    }
+    let (Some(blocks), Some(calls)) = (blocks, calls.and_then(Value::as_array)) else { return false };
+    let mut pending = std::collections::HashSet::with_capacity(calls.len());
+    for call in calls {
+        let Some(id) = get_str(call, "id").filter(|id| !id.is_empty()) else { return false };
+        if !pending.insert(id) {
+            return false;
+        }
+    }
+    blocks.iter().all(|block| {
+        get_str(block, "type") == Some("tool_result")
+            && get_str(block, "tool_use_id").is_some_and(|id| pending.remove(id))
+    }) && pending.is_empty()
+}
+
+fn encode_tail(messages: &[Value], o: &EncodeOptions) -> Result<Option<String>, EncodeError> {
+    let Some(active) = messages.len().checked_sub(1) else { return Ok(None) };
+    if !can_start_generation(messages, active) {
+        return Ok(None);
+    }
+
+    // Infer the mode of a completed generation from its replayed reasoning.
+    let mut modes = vec![ThinkingMode::Chat; messages.len()];
+    for (index, message) in messages.iter().enumerate() {
+        if is_task_set(message) || truthy(get(message, "wo_eos")) {
+            return Ok(None);
+        }
+        match role(message) {
+            Some("assistant") => {
+                let Some(prev) = index.checked_sub(1).filter(|&prev| can_start_generation(messages, prev)) else {
+                    return Ok(None);
+                };
+                let mode = match get(message, "reasoning_content") {
+                    None | Some(Value::Null) => ThinkingMode::Chat,
+                    Some(Value::String(_)) => ThinkingMode::Thinking,
+                    _ => return Ok(None),
+                };
+                modes[prev] = mode;
+                modes[index] = mode;
+            }
+            Some("user" | "system") if supported_tool_exchange(messages, index) => {}
+            _ => return Ok(None),
+        }
+    }
+    modes[active] = o.thinking_mode;
+
+    let mut prompt = if o.add_default_bos_token { BOS.to_string() } else { String::new() };
+    for (index, mode) in modes.into_iter().enumerate() {
+        let effort = if index == active {
+            RenderEffort::BeforeTransition(o.reasoning_effort)
+        } else {
+            RenderEffort::Omit
+        };
+        prompt.push_str(&render_message(index, messages, mode, false, effort, o.encoding)?);
+    }
+    Ok(Some(prompt))
+}
+
 /// encoding.py encode_messages (text): the prompt string, plus the image records it found.
 pub fn encode_messages(messages: &[Value], o: &EncodeOptions) -> Result<(String, Vec<Value>), EncodeError> {
+    encode_messages_with_tail(messages, o, false)
+}
+
+pub(crate) fn encode_messages_with_tail(
+    messages: &[Value],
+    o: &EncodeOptions,
+    tail_cache_render: bool,
+) -> Result<(String, Vec<Value>), EncodeError> {
     if o.encoding == Encoding::V41_1017 {
         // validated before the merge, which can drop a tool message's own fields; the images are
         // collected once the tool results are in their final order
@@ -938,6 +1042,12 @@ pub fn encode_messages(messages: &[Value], o: &EncodeOptions) -> Result<(String,
         let merged = all.split_off(context.len());
         let context = if all.is_empty() { Vec::new() } else { process_image_messages(&all)?.0 };
         let (processed, images) = process_image_messages(&merged)?;
+        if tail_cache_render && context.is_empty() {
+            // Let the stock encoder handle unsupported histories and report any encoding errors.
+            if let Ok(Some(prompt)) = encode_tail(&processed, o) {
+                return Ok((prompt, images));
+            }
+        }
         let prompt = encode_messages_text(&processed, o, &context)?;
         return Ok((prompt, images));
     }

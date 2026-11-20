@@ -15,6 +15,8 @@ fn usage() -> ! {
       --model-name NAME         deepseek-v4.1-flash-uncensored
       --max-tokens N            default and cap for max_tokens: 32768
       --effort N                reasoning effort budget when a request names none: 75
+      --experimental-tail-cache-render
+                                opt into turn-tail rendering for unmarked 1017 requests
       --encoding E              the chat encoding: v4.1 (DeepSeek-V4.1-Flash's encoding.py, the default)
                                 or 1017 (DeepSeek-V4.1-Flash-1017's: tool namespaces, the reasoning
                                 kept across a turn's tool calls)
@@ -131,6 +133,7 @@ fn serve(args: &[String]) {
         prediction_max: parse_opt(args, "--prediction-max", 65536usize),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
         encoding: encoding_opt(args),
+        allow_tail_cache_render: args.iter().any(|arg| arg == "--experimental-tail-cache-render"),
         default_thinking: default_thinking(args),
         default_temperature: parse_opt(args, "--temperature", 1.0f32),
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
