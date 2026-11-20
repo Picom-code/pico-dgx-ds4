@@ -230,6 +230,23 @@ stop keeps the sessions on each box's disk for the next start of the same build 
 them). A job through ring.sh or run4.sh borrows the ring once the service has had no request for
 `DSGB10_YIELD_IDLE_S` (600 s); a request stops it (exit 76) unless it has `PREEMPT=0` ([operations.md](docs/operations.md)).
 
+**Optional 2 GiB checkpoint pool for memory-constrained long-history serving.** If you are already
+running with a 1 GiB pool, try replacing that setting in `DSGB10_ENGINE_ARGS` with `--session-gib 2`.
+Keep your existing context and slot settings, disk tier budget, and memory margin when comparing the
+two sizes. The flag caps saved-session memory per rank. The default cap remains 12 GiB.
+
+Check that the coordinator's `session store` startup line reports `2.00 GiB on every rank`. The
+startup reservation is limited by the tightest rank's free device and available host memory. Check
+free device memory and `/proc/meminfo`'s `MemAvailable` on each rank after startup and under load.
+On builds with the text checkpoint restore changes from #21, add `--min-session-mib 2048` to make
+startup fail if the full reservation cannot be made.
+
+The measured 1 vs 2 GiB comparison used the text checkpoint restore changes from #21. To check
+whether it helps on your setup, revisit a synthetic text history after other long histories have
+displaced it. Compare answer correctness, `usage.prompt_tokens_details.cached_tokens`, time to
+first token, gaps on concurrent streams, and decode throughput. Use a separate test spill directory
+outside the Git tree and verify that the actual disk tier is the same for both runs.
+
 **7. Use it.** dsfront serves OpenAI's chat completions (`POST /v1/chat/completions`, streamed with
 `"stream": true`, `tools` answered by `tool_calls`), `GET /v1/models` and `GET /health`, under the name
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default; a request's `model` is ignored).
