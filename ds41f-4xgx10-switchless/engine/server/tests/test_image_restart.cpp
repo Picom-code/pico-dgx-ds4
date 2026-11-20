@@ -65,16 +65,20 @@ struct Server {
   int persisted = 0;
   bool save_has_room = false;
   bool durable_enabled = false;
+  bool compare_disk = false;
   int ring_ = 0, next_h_ = 100;
   struct {
     struct Hit { int h, pos, snap; bool encoder_only; };
     std::optional<Hit> hit;
     int attempts = 0;
+    size_t requested_min = 0;
 
     std::optional<Hit> load(model::Model&, int&, int& next_handle,
                             const std::vector<int32_t>&, const std::vector<fe::ImageSpan>&,
-                            const std::vector<uint16_t>&, uint64_t, bool) {
+                            const std::vector<uint16_t>&, uint64_t, bool, size_t min_pos) {
+      requested_min = min_pos;
       ++attempts;
+      if (hit && size_t(hit->pos) < min_pos) return {};
       if (hit) hit->h = next_handle++;
       return hit;
     }
@@ -85,6 +89,7 @@ struct Server {
     return it == sess_.end() ? nullptr : &it->second;
   }
   bool image_cache_enabled(const Request& rq) const { return enabled && !rq.spans.empty(); }
+  bool ordinary_deeper_image_disk_enabled() const { return compare_disk; }
   bool durable_request(const Request&) const { return durable_enabled; }
   int need_clamped(const Request&) const { return 1008; }
   bool fits(int s, int need) const { return slot_sizes.at(s) >= need; }
@@ -231,4 +236,20 @@ int main() {
   server.durable_.hit.reset();
   assert(server.restart(f).plan.q == 0);
   assert(server.durable_.attempts == 2);
+
+  // With a partial RAM match, only adopt disk when it buys the full minimum gain.
+  f.rq.prompt.resize(16000, 42);
+  server.slot_sizes = {16000, 16000};
+  server.add(7, f.rq, 4097, {4096, -1, {4096}});
+  server.compare_disk = true;
+  server.durable_.hit = {0, 12286, 12286, false};
+  result = server.restart(f);
+  assert(result.id == 7 && result.plan.q == 4096);
+  assert(server.durable_.requested_min == 12288);
+  server.durable_.hit = {0, 12288, 12288, false};
+  result = server.restart(f);
+  assert(result.id == 0 && result.plan.q == 12288 && result.plan.how == kSnap);
+  server.durable_.hit.reset();
+  result = server.restart(f);
+  assert(result.id == 7 && result.plan.q == 4096);
 }

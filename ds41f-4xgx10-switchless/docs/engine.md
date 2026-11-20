@@ -523,7 +523,13 @@ disk cache. Keep these settings off on routes that require no retention.
   own byte limit. It keeps at most 128 committed checkpoints per deployment namespace
   and reserves 50 GiB of free space on each rank when writing payloads.
 
-The server checks the RAM cache first. A disk hit requires an exact token prefix,
+The server checks the RAM cache first. By default a usable RAM match wins. Set
+`DSGB10_ORDINARY_IMAGE_DEEPER_DISK=1` on rank zero to look for a disk checkpoint
+at least 8,192 tokens beyond a usable RAM match. The engine attempts one such
+restore and keeps the RAM match if any rank declines. Disk lookup after a RAM
+miss keeps its existing behavior.
+
+A disk hit requires an exact token prefix,
 image positions and lengths, and matching SHA-256 digests of the relevant encoded
 image rows. Each request still runs the vision encoder. A durable generation contains
 prompt token IDs, image digests, and model state derived from the prompt. The

@@ -25,14 +25,17 @@ class DurableImages {
 
   std::optional<Hit> load(model::Model& m, comm::Ring& ring, int& next_handle,
                           const std::vector<int32_t>& tokens, const std::vector<fe::ImageSpan>& spans,
-                          const std::vector<uint16_t>& rows, uint64_t now, bool ced) {
+                          const std::vector<uint16_t>& rows, uint64_t now, bool ced,
+                          size_t min_pos = 0) {
+    if (min_pos >= tokens.size()) return {};
     auto images = durable_image::identify(tokens, spans, rows);
     if (!images) return {};
     std::set<uint64_t> tried;
-    // A transient refusal must not destroy a good checkpoint. Try at most
-    // one shorter branch, and allow a later completion to repair the entry.
-    for (int attempt = 0; attempt < 2; ++attempt) {
-      const auto* e = index_.find(tokens, *images, now, ced, tried);
+    // A cold start may try one shorter branch. If a RAM restart exists,
+    // limit the extra work to one load and keep RAM on any refusal.
+    const int attempts = min_pos ? 1 : 2;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+      const auto* e = index_.find(tokens, *images, now, ced, tried, min_pos);
       dispose_evicted(m, ring);
       if (!e || next_handle == INT_MAX) break;
       Hit hit{next_handle++, static_cast<int>(e->tokens.size()), e->snap, e->encoder_only};

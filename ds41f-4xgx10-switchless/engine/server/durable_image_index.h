@@ -150,13 +150,13 @@ class Index {
   }
 
   const Entry* find(const std::vector<int32_t>& prompt, const Images& images, uint64_t now, bool ced,
-                    const std::set<CheckpointId>& excluded = {}) {
+                    const std::set<CheckpointId>& excluded = {}, size_t min_pos = 0) {
     prune(now);
     if (!enabled() || !valid_layout(prompt, images)) return nullptr;
     const Entry* best = nullptr;
     for (const auto& [id, entry] : entries_) {
       const size_t q = entry.tokens.size();
-      if (excluded.contains(id) || q >= prompt.size() || (entry.encoder_only && (!ced || prompt.size() - q < kDecoderReplay)) ||
+      if (excluded.contains(id) || q < min_pos || q >= prompt.size() || (entry.encoder_only && (!ced || prompt.size() - q < kDecoderReplay)) ||
           (best && std::make_pair(q, age_key(entry)) <= std::make_pair(best->tokens.size(), age_key(*best)))) continue;
       const auto count = prefix_images(images, q);
       if (count && *count == entry.images.size() && std::equal(entry.images.begin(), entry.images.end(), images.begin()) &&

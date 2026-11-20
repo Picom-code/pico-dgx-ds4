@@ -802,6 +802,13 @@ class Server {
     }();
     return enabled;
   }
+  static bool ordinary_deeper_image_disk_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_IMAGE_DEEPER_DISK");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
   bool image_cache_enabled(const Request& rq) const {
     return ordinary_image_cache_enabled() && !rq.spans.empty() &&
            (rq.h.flags & image_prefix::kFlagCache) && rq.h.base_session_id == 0 &&
@@ -1119,9 +1126,12 @@ class Server {
         forget_evicted();
         select(false);
       }
-      if (!pl.q && durable_request(f.rq)) {
+      // Prefer RAM when the disk checkpoint would only skip a short suffix.
+      constexpr int kMinDiskTokenGain = 8192;
+      if ((!pl.q || ordinary_deeper_image_disk_enabled()) && durable_request(f.rq)) {
+        const size_t min_pos = pl.q ? size_t(pl.q) + kMinDiskTokenGain : 0;
         const auto hit = durable_.load(m_, ring_, next_h_, prompt, f.rq.spans, f.rq.img,
-                                       static_cast<uint64_t>(unix_now()), o_.ced);
+                                       static_cast<uint64_t>(unix_now()), o_.ced, min_pos);
         if (hit) {
           disk_source.h = hit->h;
           if (hit->encoder_only) disk_source.enc_snaps.push_back(hit->snap);

@@ -88,6 +88,9 @@ void roundtrip() {
   const auto* found = index.find(f.prompt, images, 25, true);
   assert(found && found->id == 2 && found->checkpoint_bytes == 300 && found->encoder_only);
   assert(found->tokens.size() == 12 && found->snap == 12 && found->images == images);
+  assert(index.find(f.prompt, images, 25, true, {}, 12)->id == 2);
+  assert(!index.find(f.prompt, images, 25, true, {}, 13));
+  assert(!index.find(f.prompt, images, 25, true, {2}, 12));
   found = index.find(f.prompt, images, 25, true, {2});
   assert(found && found->id == 1 && index.contains(2));
   assert(!index.find(f.prompt, images, 25, true, {1, 2}));
