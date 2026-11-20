@@ -45,7 +45,7 @@ file cut for another rank.
 | Key | Read by | What |
 |---|---|---|
 | `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1` | engine | the RDMA devices facing rank r + 1 (port f0) and r − 1 (port f1), PCI domains 0 and 2, alike on every box |
-| `GID_INDEX` | engine | the RoCE v2 GID index, alike on every device |
+| `GID_INDEX` | engine | the preferred RoCE v2 GID index; a device with its link's address at another index falls back to that one, with a note |
 | `RANK<r>_NEXT_IP0`, `_NEXT_IP1`, `_PREV_IP0`, `_PREV_IP1` | engine | the rank's addresses on its two links, per PCI domain; `PREV_IP0` also carries the bootstrap |
 | `RANK<r>_HOSTNAME`, `RANK<r>_NAME` | engine | the rank by hostname, when no `--rank` is given; the box's name in logs (optional) |
 | `RANK<r>_WEIGHTS`, `_HASHMAP`, `_ENGRAM`, `_SPILL` | engine, scripts | the rank's weight file, hash map, shard directory and spill directory: the defaults of `--weights`, `--hashmap`, `--shard1`/`--shard14` and `--disk-dir`; the scripts drop their pages and `service.sh forget` clears the spill directories |
@@ -157,7 +157,8 @@ the ring, which the service and two other agents' jobs shared.
   run4.sh exited 134 after 9 s: `comm: on <hostname>, rocep1s0f0's GID 1 is fe80::…, but the fleet file
   …/fleet.conf has RANK<r>_NEXT_IP0=<address>: this box's link is not addressed as the fleet file says,
   or this is not that rank's box`. No rank was left running, and the default file went back beside the
-  engine on every box.
+  engine on every box. (Since the GID fallback, the same file starts with a note per link, because each
+  device's address is found at index 3; a wrong address still stops the rank.)
 
 ### The How-to, checked (2026-10-13)
 

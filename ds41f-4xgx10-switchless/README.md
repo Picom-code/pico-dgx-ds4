@@ -153,7 +153,7 @@ values have no spaces or quotes, and in a path a leading `~/` is the home on the
 
 | Key | What it is |
 |---|---|
-| `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1`, `GID_INDEX` | port f0's RDMA devices on PCI domains 0 and 2 (to rank r + 1), and port f1's (from rank r − 1), the same names on every box; the RoCE v2 GID index of the links' addresses, the same on every device |
+| `NEXT_DEV0`, `NEXT_DEV1`, `PREV_DEV0`, `PREV_DEV1`, `GID_INDEX` | port f0's RDMA devices on PCI domains 0 and 2 (to rank r + 1), and port f1's (from rank r − 1), the same names on every box; the preferred RoCE v2 GID index of the links' addresses; a device that has its link's address at another index falls back to that one, with a note |
 | `BIN_DIR`, `LOG_DIR`, `SERVICE_DIR`, `RING_LOCK` | on every box: the engine and `fleet.conf`, the ranks' logs, service.sh's state; on rank 0, in a directory that exists: the lock every job on the ring holds |
 | `RANK<r>_NAME`, `RANK<r>_HOSTNAME`, `RANK<r>_SSH` | the box's name in logs (optional); its `hostname`, by which a rank started without `--rank` finds itself; how rank 0 reaches ranks 1–3 (an address, or `user@host`) |
 | `RANK<r>_NEXT_IP0`, `RANK<r>_NEXT_IP1`, `RANK<r>_PREV_IP0`, `RANK<r>_PREV_IP1` | its addresses on the links to rank r + 1 and from rank r − 1, PCI domains 0 and 2; `PREV_IP0` also takes the start's TCP handshake (port 18620) |
@@ -163,7 +163,9 @@ values have no spaces or quotes, and in a path a leading `~/` is the home on the
 
 Both refuse a line they cannot read and an unknown or repeated key, naming the file and the line. Before
 the ring starts, each rank checks the GID at `GID_INDEX` of its four devices against the addresses the
-file gives their links, and stops at a mismatch, naming the device, its GID, the key and the file. Then
+file gives their links. Where it differs, the rank looks for the address among the device's other RoCE v2
+GIDs and uses that index with a note (after a neighbour loses power the index can move); where the address
+is nowhere, it stops, naming the device, its GID, the key and the file. Then
 `engine/server/ring.sh engine/comm/run4.sh engine/build/comm/ring_test` checks the links and the
 collectives (52 s; each rank prints `passed`).
 
