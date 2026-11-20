@@ -498,6 +498,12 @@ requests and one snapshot skipped, every comparison but one equal, and the two f
 short fork's, whose base had been evicted, so it ran cold (same tokens, `cached` 0, a cold CED
 prefill's log-probability); at the defaults it passes 17 of 17, and `--exact` 9 of 9.
 
+Use `--min-session-mib N` to require a minimum checkpoint pool on every rank at startup.
+With the default of zero, the server can still start with an empty pool.
+`--keep-early-snapshot` retains one window at four snapshot intervals for forks of long text
+histories. At the default interval, this gives forks a restart at position 4,096 when enough
+prefix, replay suffix and checkpoint memory are available.
+
 **The disk tier.** A session that leaves the store is spilled to disk rather than freed (unless
 `--disk-gib 0`). Each rank writes its own slice to its own disk: `rank<r>.spill` in `--disk-dir`,
 by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its USB4 SSD) and `~/dsgb10/spill` on the others (NVMe).
@@ -519,9 +525,10 @@ by default the fleet file's `RANK<r>_SPILL`: `/data/dsgb10/spill` on rank 0 (its
 - Eviction is otherwise unchanged. Between requests, the server spills least recently used sessions
   down to its budget (`serve: spill session …`). Inside a request, an allocation that finds the store
   full spills its victim.
-- A request whose session (or fork base) is on disk brings it back before it plans its restart: its
-  pages, then its end snapshot, then its window snapshots from the latest down, as far as the store has
-  room. The slots' sessions stay (every command pins them), so the room comes from other sessions. Reads go through two 8 MiB pinned buffers, each `pread`
+- On a text revisit, the server compares the request with the spilled history before allocating the
+  restore. If the whole checkpoint cannot fit, it gives priority to a restart snapshot covered by
+  the matching prefix and the contiguous pages that fit in memory. It can exchange the last page
+  for an earlier usable window while keeping active slots pinned. Reads go through two 8 MiB pinned buffers, each `pread`
   overlapping the previous buffer's copy to the device. A session read back right after its spill
   first waits for its own writes. From then on it is a stored session like any other.
 

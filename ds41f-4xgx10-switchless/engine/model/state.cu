@@ -471,11 +471,9 @@ void Model::Impl::state_spill(int h) {
                 1e3 * (wall_s() - t0));
 }
 
-// Session h back from the disk tier (after its writes), as far as the store has room: pages in order
-// (saved shrinks to what came back), the end snapshot, then window snapshots from the latest down; what
-// does not fit is dropped, as a save that finds no room would. Every block that comes back is checked
-// against its checksum from the way out; every rank logs a mismatch, and rank 0 the time it took.
-void Model::Impl::state_unspill(int h) {
+// Restore a contiguous run of pages and, when requested, a window from which those
+// pages can resume. Every returned block is checked against its spill checksum.
+void Model::Impl::state_unspill(int h, int window_limit, int preferred_snap, bool window_first) {
   Store& s = store_of();
   const auto it = s.sess.find(h);
   if (it == s.sess.end() || !it->second.disk) return;
@@ -497,14 +495,55 @@ void Model::Impl::state_unspill(int h) {
   for (size_t i = 0; i < ss.dpages.size(); ++i) {
     uint8_t* p = store_alloc(h, kPageBytes);
     if (!p) break;
-    read(p, kPageBytes, ss.dpages[i]);
     ss.pages.push_back(p);
   }
   ss.saved = std::min(ss.saved, (int)ss.pages.size() * kPagePos);
-  if (ss.dend != Pool::kNone && ss.end_pos <= ss.saved)
-    if ((ss.end = store_alloc(h, end_bytes(sp)))) read(ss.end, end_bytes(sp), ss.dend);
-  if (!ss.end) ss.end_pos = -1;
+  const auto restore_end = [&] {
+    if (ss.dend != Pool::kNone && ss.end_pos <= ss.saved)
+      if ((ss.end = store_alloc(h, end_bytes(sp)))) read(ss.end, end_bytes(sp), ss.dend);
+    if (!ss.end) ss.end_pos = -1;
+  };
+  if (!window_first) restore_end();
+
+  // Pages alone cannot resume a displaced session. Give one reachable window
+  // priority over later snapshots, which may lie beyond the pages that fit.
+  const auto window_at = [&](int saved) {
+    if (preferred_snap >= 0 && (preferred_snap & ~1) <= saved) {
+      auto exact = ss.dsnaps.find(preferred_snap);
+      if (exact != ss.dsnaps.end()) return exact;
+    }
+    const int cap = std::min(saved, window_limit);
+    if (cap <= 0) return ss.dsnaps.end();
+    auto it = ss.dsnaps.upper_bound(cap | 1);  // odd snapshot keys restart one position earlier
+    if (it == ss.dsnaps.begin()) return ss.dsnaps.end();
+    --it;
+    return it->first > 1 ? it : ss.dsnaps.end();
+  };
+  auto window = window_at(ss.saved);
+  if (window != ss.dsnaps.end()) {
+    uint8_t* buf = store_alloc(h, snap_bytes(sp));
+    if (!buf && !ss.end && !ss.pages.empty() && kPageBytes >= snap_bytes(sp)) {
+      const int shorter = std::min(ss.saved, (int)(ss.pages.size() - 1) * kPagePos);
+      auto earlier = window_at(shorter);
+      if (earlier != ss.dsnaps.end()) {
+        // The last page has not been read. Exchange it for a snapshot only
+        // if the remaining contiguous pages cover that snapshot's restart.
+        store_release(ss.pages.back(), kPageBytes);
+        ss.pages.pop_back();
+        ss.saved = shorter;
+        window = earlier;
+        buf = store_alloc(h, snap_bytes(sp));
+      }
+    }
+    if (buf) {
+      read(buf, snap_bytes(sp), window->second);
+      ss.snaps.emplace(window->first, buf);
+    }
+  }
+  if (window_first) restore_end();
+  for (size_t i = 0; i < ss.pages.size(); ++i) read(ss.pages[i], kPageBytes, ss.dpages[i]);
   for (auto i = ss.dsnaps.rbegin(); i != ss.dsnaps.rend(); ++i) {
+    if (ss.snaps.count(i->first)) continue;
     uint8_t* b = store_alloc(h, snap_bytes(sp));
     if (!b) break;
     read(b, snap_bytes(sp), i->second);
@@ -834,7 +873,7 @@ size_t Model::state_disk_capacity() const { return d_->store_s && d_->store_s->d
 size_t Model::state_disk_bytes() const { return d_->store_s ? d_->store_s->dbytes : 0; }
 std::string Model::state_disk_path() const { return d_->store_s && d_->store_s->disk ? d_->store_s->disk->path() : ""; }
 void Model::state_spill(int h) { d_->state_spill(h); }
-void Model::state_unspill(int h) { d_->state_unspill(h); }
+void Model::state_unspill(int h, int window_limit, int preferred_snap, bool window_first) { d_->state_unspill(h, window_limit, preferred_snap, window_first); }
 Model::StateInfo Model::state_info(int h) const {
   StateInfo r;
   if (!d_->store_s) return r;
