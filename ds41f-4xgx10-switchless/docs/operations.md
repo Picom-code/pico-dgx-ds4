@@ -51,3 +51,19 @@ job's driver that holds a want across its parts keeps the service from taking th
 candidate 4's start waited 44 minutes so). To bring the kit back: `service.sh stop`, then
 `cd ~/ai/dsv41-4x-ring && nohup setsid ./start-tp4.sh serve > logs-tp4/serve-launch.log 2>&1 < /dev/null &`
 on rank 0 (ready in ~6 min).
+
+### Retaining a checkpoint for older text branches
+
+With snapshot thinning enabled, set `DSGB10_ORDINARY_KEEP_PRIOR_TEXT_WINDOW=1` on rank zero
+to retain one existing grid snapshot before the first eligible kept text prompt of at least 8,192
+tokens. This helps a fork that returns to that prefix after the chat grows. The default is off.
+The engine tracks the anchor on the same frontend connection, allows 16 marked sessions in
+total, and requires at least 16 MiB of session-store headroom before marking a snapshot.
+Under pressure it can drop an idle mark first. An active mark can still displace another
+session. Mark metadata lasts for the process lifetime. The existing spill and shutdown paths
+can persist the retained snapshot like other ordinary snapshots. On restart it is an ordinary
+unmarked snapshot and the usual restart rules apply.
+
+On an isolated server with ample session-store headroom and a free mark, use the default 1,024-token grid, CED and at least 104,700 positions of context. Run
+`python3 engine/server/tests/snap_test.py --prior-text-window on` against the enabled server.
+Use `--prior-text-window off` for the baseline.

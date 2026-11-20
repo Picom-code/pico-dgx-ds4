@@ -108,6 +108,35 @@ def correctness(e, T, a):
     return all(res)
 
 
+def earlier_window(e, tokens, enabled):
+    """One seed, continued in place, then a fork into the seed. Default 1,024 grid and CED."""
+    if e.max_ctx < 104700 or len(tokens) < 106000:
+        raise ValueError('earlier-window test needs context >= 104700 and >= 106000 input tokens')
+    checks = []
+    for index, ends in enumerate(([104600], [25000, 35000, 45000, 55000, 65000, 75000,
+                                               85000, 95000, 104600])):
+        session = 0x5a30000000000000 + 4 * index
+        try:
+            seed = e.run(session, tokens[:15200], max_new=1)
+            for end in ends:
+                last = e.run(session, tokens[:end], max_new=1)
+            # Diverge at exactly 14,500. Leave enough new positions for the decoder replay.
+            fork = tokens[:14500] + [(tokens[14500] + 1) % 1000] + tokens[105000:105700]
+            warm = e.run(session + 1, fork, base=session, max_new=8, n_top=2)
+            cold = e.run(session + 2, fork, keep=False, max_new=8, n_top=2)
+            expected = 14336 if enabled else bound(14500, end + len(last['ids']))
+            transient = e.run(session + 3, fork, base=session, keep=False, max_new=8, n_top=2)
+            baseline = bound(14500, end + len(last['ids']))
+            checks.extend((transient['cached'] == baseline, same('transient fork vs cold', transient, cold)))
+            show('return after %d extensions' % len(ends), warm)
+            checks.extend((seed['cached'] == 0, warm['cached'] == expected,
+                           same('older fork vs cold', warm, cold)))
+        finally:
+            e.release(session + 1)
+            e.release(session)
+    return all(checks)
+
+
 def far(e, T, a):
     S = 0x5a20000000000000
     for i, n in enumerate(int(x) for x in a.far.split(',')):
@@ -142,10 +171,14 @@ def main():
     ap.add_argument('--ced', action='store_true', help='the server runs CED (its default); else --exact')
     ap.add_argument('--snap-all', action='store_true', help='the server keeps every snapshot (--snap-all)')
     ap.add_argument('--far', default='', help='sessions of these lengths, forks far back: timing only')
+    ap.add_argument('--prior-text-window', choices=('on', 'off'),
+                    help='test the matching rank-zero setting with default thinning, snapshot grid and CED')
     a = ap.parse_args()
     T = load_npy_i32(a.tokens)
     e = Engine(a.socket)
     print('engine: %s, context %d' % (e.name, e.max_ctx))
+    if a.prior_text_window:
+        return 0 if earlier_window(e, T, a.prior_text_window == 'on') else 1
     if a.far:
         return 0 if far(e, T, a) else 1
     return 0 if correctness(e, T, a) else 1
