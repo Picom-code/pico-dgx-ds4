@@ -169,6 +169,68 @@ described above).
 
 NVIDIA's SPEED-Bench qualitative split (880 prompts, 1,138 turns, 11 categories) with NVIDIA AIPerf 0.14.0, output cap 8192, temperature 0, on the v2.0 build: one stream 112 tok/s decode as the mean of the categories (coding 140, roleplay 80), 3.05 tokens per verify step; 16 closed-loop streams 245 tok/s in total, held down by a late end of stream that the run exposed (a finished request is released only when its group ends). Tables, method and limits: [docs/speed-bench.md](ds41f-4xgx10-switchless/docs/speed-bench.md); scripts `tools/bench/speed_bench.sh` and `tools/bench/speed_bench_table.py`.
 
+## v2.8 A stream ends when its reply ends: `DSGB10_END_EARLY=1` (2026-11-20; engine, off by default)
+
+The fault (found by the SPEED-Bench run of v2.7): requests that decode together form a group, and the engine sent a
+finished request's closing chunk (finish reason, usage, `[DONE]`) only when every request of the group had ended or
+a new request arrived. A client that waits for the end of its stream before it sends its next request, as agents
+and closed-loop benchmarks do, was held by the longest reply it shared the engine with; with every slot's client
+waiting, nobody could be the new request.
+
+The change (`engine/server/serve.cpp`, one file): with `DSGB10_END_EARLY=1` a request's DONE goes out at the token
+where it ends (its stop id, its `max_tokens`, or its cancel seen), while the others go on. Its session stays in
+flight until the group's run returns, where it is kept exactly as before; from the moment a request has ended, the
+next request that arrives pauses the group as an arrival does when a slot is free, and takes a slot. No step's
+rows, order or arithmetic change, and without the variable the engine behaves as v2.0.
+
+Measured on a test instance (same boxes, served arguments; closed-loop clients, each sends its next request when
+its stream has ended):
+
+| | v2.0 | `DSGB10_END_EARLY=1` |
+|---|---:|---:|
+| 16 clients, replies of unequal length: last token to end of stream, median / largest | 7.3 s / 18.1 s | under 1 ms / 0.34 s |
+| the same: streams producing tokens, of 16 | 8.4 | 15.5 |
+| the same: total output, tok/s (16 / 8 / 4 / 2 clients) | 196 / 164 / 131 / 109 | 238 / 191 / 148 / 110 |
+| SPEED-Bench, 16 streams, one fifth of the prompts, same window: total | 240 tok/s | 307 tok/s |
+| SPEED-Bench, 16 streams, all prompts: total (v2.0: one pass; new: five passes) | 245 tok/s | 303 tok/s |
+| SPEED-Bench, 16 streams: last token to end of stream, median / mean | 9.3 s / 24 s | under 1 ms / 34 ms |
+| 16 users started together (the README's bench), 4 runs each, alternating | 406-421 | 413-419 |
+| one user, 3-prompt bench x9, chat / code medians, 2 runs each, alternating | 84.9, 84.8 / 146, 144 | 85.2, 85.1 / 147, 154 |
+
+What it does not do, plainly:
+
+- It does not make 16 mixed closed-loop streams reach the 16-user figure of the README (about 413). That bench
+  starts 16 code prompts together. In a closed loop every new request has its prompt read while the group
+  waits, and mixed text accepts fewer draft tokens than code.
+- A request's own decode rate at 16 streams is lower than in v2.0's run (about 20 tok/s against 26 on SPEED-Bench):
+  16 streams now share the steps where 8 did. The gain is the end of the stream, the total, and the time a set of
+  requests takes.
+- Texts. A request that runs alone is bit-identical (logit bits compared). Requests that arrive in a fixed order
+  with nothing arriving while they run give v2.0's texts. Where clients send as soon as their stream ends, requests
+  now arrive at other moments, so other requests share a step; with the re-routing (`DSGB10_OEA`) and the plain wide
+  body of shared steps a reply's wording depends on who shares its steps, so texts differ from a v2.0 run there, as
+  two v2.0 runs differ from each other (same build twice, 16 closed-loop clients: 33 of 103 replies equal). With
+  those two levers off (`DSGB10_OEA` removed, `DSGB10_EXACT_SOLO` removed so that shared wide steps are exact) the
+  closed-loop texts of v2.0 and of `DSGB10_END_EARLY=1` are identical (72 of 72 replies) although their timing is
+  not.
+
+How it was tested (test instance, cold starts, against v2.0 as served): with the variable off, 54 of 54 fixed
+prompts and their logit bits equal. With it on: one request at a time 54 of 54, 140 held-out prompts, rewrites with
+copy drafts, predictions, seeded sampled requests, the Gumbel-path pairs and 45 request shapes all equal, logit
+bits of over 180,000 tokens with no difference; 2 to 16 users started together and the seeded sampled ruler up to 16
+sessions equal; quality set 73 and 71 of 75 at 4 and 16 users (v2.0: 71 and 71); a 948K-token prompt 3 of 3; images,
+video and 100-image checks pass; 24 requests on 16 slots answered; agent sessions (8 at 80-300K tokens, 4 turns) finish in the same time (181 s against 182-183 s, two pairs);
+a 30-minute mixed soak (text, sampled agent sessions, rewrites, images, video, thinking variants, tool calls, closed-loop
+streams, about 300 abandoned or cancelled requests): about 2,600 requests, no failed request (the only non-200 answers
+to valid requests were 8 of the image cap's 429s), no error line in the engine's log; memory at the end of the same
+load equal to v2.0's.
+
+| variable = value | what it does | output |
+|---|---|---|
+| `DSGB10_END_EARLY=1` (default 0) | a request's DONE is sent at the step where it ends, not when its group's run returns | identical for a request alone and for fixed arrivals; see above for closed-loop clients |
+
+Tables and method: [docs/speed-bench.md](ds41f-4xgx10-switchless/docs/speed-bench.md), "16 streams with `DSGB10_END_EARLY=1`".
+
 ## v2.6 Credits
 
 Thinking options, 100-image requests and video input are pull requests #4, #5 and #6 by MiaAI-Lab, merged with

@@ -1,6 +1,8 @@
 # SPEED-Bench (qualitative split) with NVIDIA AIPerf
 
-Measured 2026-11-20 on the build of tag `v2.0`, as it serves. One run per cell.
+Measured 2026-11-20 on the build of tag `v2.0`, as it serves. One run per cell. The 16-stream run exposed a late
+end of stream; the engine variable `DSGB10_END_EARLY=1` removes it, and the 16-stream section has the
+same benchmark with it ([16 streams with `DSGB10_END_EARLY=1`](#16-streams-with-dsgb10_end_early1)).
 
 SPEED-Bench is NVIDIA's benchmark for speculative decoding
 ([dataset](https://huggingface.co/datasets/nvidia/SPEED-Bench)). Its *qualitative* split is 880 prompts in
@@ -11,19 +13,24 @@ words, the more draft tokens a step accepts.
 
 ## The short version
 
-| | one stream | 16 streams |
-|---|---:|---:|
-| decode tok/s per request, mean over the 11 categories | 112.3 | 26.2 |
-| the same, median request | 109.9 | 24.3 |
-| fastest and slowest category (mean) | 140.5 coding, 80.0 roleplay | 36.0 math, 20.6 roleplay |
-| first token, median | 137 ms | 1,051 ms |
-| tokens per verify step, all steps | 3.05 | 2.69 |
-| draft acceptance rate, all steps | 75.9 % | 80.4 % |
-| total output of the endpoint | - | 245 tok/s |
-| requests sent / failed | 1,138 / 0 | 1,138 / 0 |
+| | one stream | 16 streams, `v2.0` | 16 streams, `DSGB10_END_EARLY=1` |
+|---|---:|---:|---:|
+| decode tok/s per request, mean over the 11 categories | 112.3 | 26.2 | 20.0 |
+| the same, median request | 109.9 | 24.3 | 19.3 |
+| fastest and slowest category (mean) | 140.5 coding, 80.0 roleplay | 36.0 math, 20.6 roleplay | 26.7 math, 14.4 roleplay |
+| first token, median | 137 ms | 1,051 ms | 486 ms |
+| tokens per verify step, all steps | 3.05 | 2.69 | 2.83 |
+| draft acceptance rate, all steps | 75.9 % | 80.4 % | 81.1 % |
+| streams producing tokens, on average | 1 | 8.3 of 16 | 15.4 of 16 |
+| last token to end of stream, median (mean) | 24 ms | 9.3 s (24 s) | under 1 ms (34 ms) |
+| total output of the endpoint | - | 245 tok/s | 303 tok/s |
+| requests sent / failed | 1,138 / 0 | 1,138 / 0 | 1,135 / 0 |
 
-Decode tok/s is measured per request from its first token to its last. The 16-stream total is lower than
-this engine can give 16 users at once: see [what the 16-stream total shows](#what-the-16-stream-total-shows).
+Decode tok/s is measured per request from its first token to its last. The `v2.0` 16-stream total is held
+down by a late end of stream: see [what the 16-stream total shows](#what-the-16-stream-total-shows). With
+`DSGB10_END_EARLY=1` all 16 streams produce tokens, so each one's share of a step is smaller (20 tok/s per
+request against 26) while the endpoint's total is higher (303 against 245) and a set of requests is done
+sooner.
 
 ## What was run
 
@@ -103,6 +110,8 @@ One request at a time; each number is a per-request figure averaged over the cat
 
 ## 16 streams
 
+### `v2.0`
+
 AIPerf keeps 16 requests in flight: when a stream ends it sends the next turn. The prompts go in the
 dataset's order, so mostly one or two categories share the engine at a time.
 
@@ -147,7 +156,78 @@ What this means for the numbers:
   waits for the end of the stream is held up by the longest request it shares the engine with. Any new
   request arriving ends the wait, so it shows only when all slots' clients are waiting at once.
 
-This is a finding of this benchmark, not a property anyone asked for. It is not fixed in `v2.0`.
+This is a finding of this benchmark, not a property anyone asked for. It is not fixed in `v2.0`;
+`DSGB10_END_EARLY=1` fixes it (next section).
+
+## 16 streams with `DSGB10_END_EARLY=1`
+
+`DSGB10_END_EARLY=1` (off by default; [CHANGES.md](../../CHANGES.md), v2.8) makes the engine send a request's
+closing chunk at the step where the request ends, while the rest of its group goes on. The session is kept
+as before; the next request that arrives pauses the group, as an arrival always did, and takes a slot.
+No step's arithmetic changes.
+
+How this run differs from the `v2.0` run above, plainly:
+
+- It ran on a test instance of the same four boxes (the engine built from this repository with the
+  variable set, the served front-end and arguments), not on the live endpoint, in time-boxed test
+  windows. One pass over all 880 prompts does not fit a window, so the file was split into five parts of
+  176 prompts (every fifth prompt, in the dataset's order: 16 prompts of each category in every part) and
+  each part ran as its own AIPerf pass at 16 streams, from a cold start, with the same command.
+- One part reached its window's time limit with 3 turns still in flight (1 multilingual, 2 writing): 1,135
+  of the 1,138 turns are in the table.
+- The same first part was also run on `v2.0` in the same window, as a like-for-like pair (below).
+
+| category | prompts | requests (turns) | decode tok/s, mean | median | end-to-end tok/s, mean | first token ms, median | p90 | output tokens, mean | median | replies at the 8192 cap | last token to end of stream, ms, mean | p90 | tokens per verify step | acceptance rate |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| coding | 80 | 89 | 25.6 | 25.5 | 24.1 | 1,304 | 2,505 | 1,012 | 664 | 2 | 33 | 130 | 3.68 | 86.3 % |
+| humanities | 80 | 88 | 17.4 | 15.8 | 16.3 | 479 | 550 | 1,269 | 451 | 5 | 61 | 141 | 2.82 | 82.5 % |
+| math | 80 | 98 | 26.7 | 26.7 | 25.5 | 473 | 532 | 2,217 | 1,216 | 9 | 38 | 127 | 3.31 | 83.3 % |
+| multilingual | 79 | 79 | 21.2 | 21.5 | 20.1 | 494 | 549 | 319 | 200 | 0 | 21 | 126 | 3.04 | 79.6 % |
+| qa | 80 | 80 | 17.0 | 16.3 | 15.6 | 427 | 447 | 189 | 140 | 0 | 37 | 126 | 2.15 | 74.5 % |
+| rag | 80 | 105 | 21.4 | 20.7 | 17.4 | 587 | 803 | 121 | 66 | 0 | 25 | 129 | 3.43 | 84.0 % |
+| reasoning | 80 | 190 | 20.6 | 19.2 | 19.1 | 460 | 557 | 360 | 256 | 1 | 37 | 130 | 2.94 | 81.0 % |
+| roleplay | 80 | 158 | 14.4 | 13.2 | 13.7 | 444 | 615 | 174 | 114 | 0 | 33 | 115 | 1.75 | 68.4 % |
+| stem | 80 | 86 | 20.1 | 19.3 | 19.7 | 479 | 550 | 1,688 | 836 | 5 | 29 | 127 | 3.04 | 82.1 % |
+| summarization | 80 | 80 | 17.9 | 17.9 | 16.9 | 583 | 728 | 207 | 160 | 0 | 25 | 128 | 2.76 | 77.2 % |
+| writing | 78 | 82 | 17.4 | 15.8 | 17.1 | 527 | 680 | 1,901 | 1,566 | 1 | 32 | 127 | 2.18 | 74.6 % |
+| **all 11, macro-average** (each category counts once) | 877 | 1135 | 20.0 | 19.3 | 18.7 | 569 | 774 | 860 | 515 |  |  |  | 2.83 | 79.4 % |
+| **all 1,135 requests pooled** | 877 | 1135 | 19.8 | 18.4 | 18.5 | 486 | 677 | 780 | 251 | 23 | 34 | 128 | 2.83 | 81.1 % |
+
+Total output: 885,529 tokens in 2,923 s of the five passes = **303 tok/s**. Each pass has its own
+end-of-file tail, where fewer than 16 streams are left; up to the moment the last request of a pass starts,
+the rate is 316 to 330 tok/s (323 over the five), with 15.4 of 16 streams producing tokens. The closing
+chunk follows the last token by 34 ms on average (median under 1 ms, 90th percentile 128 ms, largest
+468 ms).
+
+The like-for-like pair, the first part (176 prompts, 224 turns), same window, each from a cold start:
+
+| | `v2.0` | `DSGB10_END_EARLY=1` |
+|---|---:|---:|
+| total output | 240 tok/s | 307 tok/s |
+| time to finish the 224 requests | 743 s | 520 s |
+| streams producing tokens, on average | 7.3 | 15.5 |
+| last token to end of stream: median / mean / largest | 11.7 s / 27.1 s / 119 s | under 1 ms / 41 ms / 454 ms |
+| first token, median | 1,126 ms | 488 ms |
+| decode tok/s per request, mean | 26.0 | 19.7 |
+| requests failed | 0 | 0 |
+
+How to read it:
+
+- The end of a stream is no longer late, and the endpoint gives about a quarter more output on this
+  workload, because every slot is working.
+- A request's own decode rate is lower (about 20 tok/s against 26): its steps are now shared with 15
+  others, not with 7. What a client gains is the time from sending a request to the end of its stream
+  and the time to finish a set of requests.
+- The total is still under the README's 16-user figure (about 413). That figure is 16 code prompts
+  started together; here the text is mixed (2.83 tokens per verify step over all steps against about 3.7
+  for coding alone), and every new request first has its prompt read while the group waits: with a
+  request ending about every two seconds, that is the rest of the difference.
+- Replies are not word for word those of the `v2.0` run. When several requests share a step, a reply's
+  wording depends on who shares it (the re-routing `DSGB10_OEA`, and the plain wide body of shared steps);
+  that is so in `v2.0` too, where the same 16-stream run twice does not give the same texts. Requests now
+  arrive at other moments, so other requests share a step. With those two levers off, the 16-stream
+  closed-loop texts with and without `DSGB10_END_EARLY` are identical; a request that runs alone is
+  bit-identical either way.
 
 ## Draft acceptance, from the engine
 
@@ -215,7 +295,7 @@ The README's headline for one user is about 90 tok/s for chat (mean over 320 hel
 |---|---:|---|
 | code, one user | about 147 | coding 140.5 (89 requests, replies up to 8,192 tokens) |
 | chat, one user | about 90 | roleplay 80, writing 97, qa 101, humanities 104, summarization 108; all 11 categories 112 |
-| 16 users | about 413 | 245 total |
+| 16 users | about 413 | 245 total (`v2.0`); 303 with `DSGB10_END_EARLY=1` |
 
 - Code agrees within the spread of the prompts (140 against 147: other prompts, longer replies).
 - Chat: the README's figure sits inside the range of the conversational categories here. The overall
@@ -224,8 +304,8 @@ The README's headline for one user is about 90 tok/s for chat (mean over 320 hel
   mixes of text.
 - 16 users: not the same measurement. The README starts 16 different code prompts together, 512 tokens
   each, and counts tokens while all 16 decode. Here 16 clients work through mixed prose, each reply as
-  long as the model makes it, a new prompt read whenever one ends, and with the late end of stream
-  described above. The per-stream rates are comparable in kind (README: about 26 per user on code; here
+  long as the model makes it, a new prompt read whenever one ends, and in `v2.0` with the late end of
+  stream described above. The per-stream rates are comparable in kind (README: about 26 per user on code; here
   coding 33), the totals are not.
 
 ## Limits
