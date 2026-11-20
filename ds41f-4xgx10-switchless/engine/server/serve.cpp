@@ -63,6 +63,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -70,6 +71,7 @@
 #include <random>
 #include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -375,6 +377,8 @@ struct Session {
   int slot = -1;               // the slot whose working state is this session's (-1: none, the store's only)
   std::vector<int32_t> hist;   // the tokens whose state the session holds: positions [0, size)
   uint64_t used = 0;           // LRU clock
+  std::weak_ptr<Conn> text_owner;  // optional earlier-window policy, local to this process
+  int text_prompt_anchor = 0, prior_text_snap = -1;
   int pe_snap = -1;            // the snapshot at its last prompt's end (when not a multiple of snap_every)
   int lo = 0, clo = 0, w = 0;  // the live state's exact ranges (the comment at the top)
   int end_lo = 0, end_clo = 0, end_w = 0;  // the end snapshot's
@@ -748,12 +752,66 @@ class Server {
     if (it->second.slot >= 0) slot_[it->second.slot] = 0;
     sess_.erase(it);
   }
+  static bool ordinary_prior_text_window_enabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("DSGB10_ORDINARY_KEEP_PRIOR_TEXT_WINDOW");
+      return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  void check_prior_text_lineage(Session& s, const ConnP& conn, int common) {
+    if (s.text_owner.lock() != conn || common < s.text_prompt_anchor) {
+      s.text_prompt_anchor = 0;
+      s.prior_text_snap = -1;
+    }
+  }
+
+  void retain_prior_text_window(Session& s, int completed_prompt) {
+    constexpr int kMinPrompt = 8192, kMaxMarks = 16;
+    if (!o_.snap_thin || s.prior_text_snap >= 0) return;
+    if (!s.text_prompt_anchor) s.text_prompt_anchor = completed_prompt >= kMinPrompt ? completed_prompt : 0;
+    if (!s.text_prompt_anchor) return;
+    const int snap = (s.text_prompt_anchor - 1) / o_.snap_every * o_.snap_every;
+    if (snap < kReplay) return;
+    const auto info = m_.state_info(s.h);
+    if (!std::binary_search(info.snaps.begin(), info.snaps.end(), snap)) {
+      s.text_prompt_anchor = 0;
+      return;
+    }
+    if (keep_snap(snap, (int)s.hist.size(), o_.snap_every)) return;
+    constexpr size_t kMarkHeadroom = 16ull << 20;
+    if (budget_ < kMarkHeadroom || m_.state_bytes() > budget_ - kMarkHeadroom) return;
+    const auto count = std::count_if(sess_.begin(), sess_.end(), [](const auto& entry) {
+      return entry.second.prior_text_snap >= 0;
+    });
+    if (count < kMaxMarks) s.prior_text_snap = snap;
+  }
+
+  // Reclaim optional windows before displacing a whole idle session.
+  void shed_prior_text_windows() {
+    while (m_.state_bytes() > budget_) {
+      Session* oldest = nullptr;
+      for (auto& [id, s] : sess_) {
+        if (s.prior_text_snap < 0 || flying_.count(id) || m_.state_info(s.h).on_disk) continue;
+        if (!oldest || s.used < oldest->used) oldest = &s;
+      }
+      if (!oldest) break;
+      const int snap = std::exchange(oldest->prior_text_snap, -1);
+      if (snap == oldest->pe_snap || keep_snap(snap, (int)oldest->hist.size(), o_.snap_every))
+        continue;
+      oldest->enc_snaps.erase(std::remove(oldest->enc_snaps.begin(), oldest->enc_snaps.end(), snap),
+                              oldest->enc_snaps.end());
+      state({{kStDropSnap, oldest->h, snap, 0}});
+    }
+  }
+
   // Session s's window snapshots that keep_snap no longer keeps at its history's end, dropped (not the
   // one at its last prompt's end).
   void thin(Session& s) {
     if (!o_.snap_thin) return;
     const int E = (int)s.hist.size();
-    auto gone = [&](int sn) { return sn != s.pe_snap && !keep_snap(sn, E, o_.snap_every); };
+    auto gone = [&](int sn) { return sn != s.pe_snap && sn != s.prior_text_snap && !keep_snap(sn, E, o_.snap_every); };
     std::vector<StateOp> v;
     for (const int sn : m_.state_info(s.h).snaps)
       if (gone(sn)) v.push_back({kStDropSnap, s.h, sn, 0});
@@ -774,6 +832,7 @@ class Server {
   // Least recently used sessions out until the store fits the budget: spilled to the disk tier (one live
   // in a slot saved first, and the slot let go), or freed without one. Sessions in flight stay.
   void evict(uint64_t keep) {
+    if (ordinary_prior_text_window_enabled()) shed_prior_text_windows();
     const bool disk = m_.state_disk_capacity() > 0;
     std::vector<StateOp> v;
     std::vector<uint64_t> out;
@@ -822,10 +881,11 @@ class Server {
 
   // The earliest position a restart of s could start from (its snapshots, its end), for the log; -1:
   // none
-  int first_restart(const Session& s) const {
+  int first_restart(const Session& s, int skip_snap) const {
     const model::Model::StateInfo info = m_.state_info(s.h);
     int r = info.end_pos;
     for (const int sn : info.snaps) {
+      if (sn == skip_snap) continue;
       const int q = sn & 1 ? sn - 1 : sn;
       if (r < 0 || q < r) r = q;
     }
@@ -834,7 +894,7 @@ class Server {
 
   // The restart point for continuing session s (its state live or stored) after a common prefix of p,
   // for a prompt of n positions.
-  Plan choose(const Session& s, bool live, int p, int n) const {
+  Plan choose(const Session& s, bool live, int p, int n, int skip_snap = -1) const {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
     p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
@@ -866,6 +926,7 @@ class Server {
     if (live) consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kLive, -1);
     if (info.end_pos >= 0) consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
     for (const int sn : info.snaps) {
+      if (sn == skip_snap) continue;
       const int q = sn & 1 ? sn - 1 : sn;
       if (q <= p && usable(q, std::find(s.enc_snaps.begin(), s.enc_snaps.end(), sn) == s.enc_snaps.end()))
         consider(q, kSnap, sn);
@@ -1010,7 +1071,15 @@ class Server {
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
     const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
-    const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    const bool kept_text = (h.flags & fe::kFlagKeep) && !(h.flags & fe::kFlagImages);
+    // An optional window can help another branch on the same frontend connection.
+    // Other requests can still use all restart points the normal policy retained.
+    int skip_snap = -1;
+    if (src && src->prior_text_snap >= 0 && (!kept_text || src->text_owner.lock() != f.rq.conn)) {
+      const int mark = src->prior_text_snap;
+      if (mark != src->pe_snap && !keep_snap(mark, (int)src->hist.size(), o_.snap_every)) skip_snap = mark;
+    }
+    const Plan pl = src ? choose(*src, src_live, p, n, skip_snap) : Plan{};
     const int q = pl.q;
     const int lvl = reuse_exact();
     const int src_pf = src ? src->pf : 0;  // WARM: the source's prefill frontier (S may be src: read it now)
@@ -1034,7 +1103,7 @@ class Server {
                         : std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
                                         (unsigned long long)h.base_session_id, p);
         if (pl.how == kCold && k > 0 && k < (int)sizeof from) {
-          const int r = first_restart(*src);
+          const int r = first_restart(*src, skip_snap);
           if (r < 0) std::snprintf(from + k, sizeof from - k, ", and it has no restart point");
           else if (p < r) std::snprintf(from + k, sizeof from - k, ", under its first restart point %d", r);
           else std::snprintf(from + k, sizeof from - k, ", and no restart point up to it is usable");
@@ -1055,12 +1124,22 @@ class Server {
       ns.h = next_h_++;
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
     }
+    if (!resume && ordinary_prior_text_window_enabled()) {
+      if (kept_text && src == S) check_prior_text_lineage(*S, f.rq.conn, p);
+      else {
+        S->text_prompt_anchor = 0;
+        S->prior_text_snap = -1;
+      }
+      if (kept_text) S->text_owner = f.rq.conn;
+      else S->text_owner.reset();
+    }
     if (src) {
       if (!src_live && q > 0) v.push_back({kStLoad, src->h, q, 0});
       if (pl.how == kSnap) v.push_back({kStRestore, src->h, pl.snap, 0});
       if (pl.how == kEnd) v.push_back({kStRestoreEnd, src->h, 0, 0});
       if (src != S) v.push_back({kStCopySnaps, src->h, S->h, q});  // a fork: src's snapshots are S's too
       else v.push_back({kStDrop, S->h, q, 0});                     // S forgets what follows q
+      if (skip_snap >= 0 && skip_snap <= q) v.push_back({kStDropSnap, S->h, skip_snap, 0});
     }
     // the new live state's exact ranges
     if (pl.how == kCold) S->lo = S->clo = S->w = 0;
@@ -1073,9 +1152,13 @@ class Server {
     S->t_used = unix_now();
     S->hist.assign(prompt.begin(), prompt.begin() + q);
     if (S->pe_snap > q) S->pe_snap = -1;  // dropped
+    if (S->prior_text_snap > q) S->prior_text_snap = -1;
+    if (S->text_prompt_anchor &&
+        (S->text_prompt_anchor - 1) / o_.snap_every * o_.snap_every > q)
+      S->text_prompt_anchor = 0;
     // CED: S's encoder-only snapshots up to q (a fork's are src's), where its decoder rings are valid
     if (src && src != S) S->enc_snaps = src->enc_snaps;
-    S->enc_snaps.erase(std::remove_if(S->enc_snaps.begin(), S->enc_snaps.end(), [q](int x) { return x > q; }),
+    S->enc_snaps.erase(std::remove_if(S->enc_snaps.begin(), S->enc_snaps.end(), [q, skip_snap](int x) { return x > q || x == skip_snap; }),
                        S->enc_snaps.end());
     S->dec_lo = !src || pl.how == kCold ? 0
                 : pl.how == kSnap       ? std::max(0, q - 127)
@@ -1584,6 +1667,9 @@ class Server {
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
     Session* S = (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
+    if (S && !(h.flags & fe::kFlagImages) && ordinary_prior_text_window_enabled() &&
+        (why == fe::kStop || why == fe::kLength || why == fe::kContext) && h.n_prompt <= S->hist.size())
+      retain_prior_text_window(*S, (int)h.n_prompt);
     if (S) thin(*S);
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
