@@ -3,6 +3,180 @@
 Fork of blaesus/dsgx10 by Andy Shu (MIT). Changes by Patrick Moorhead.
 Base: upstream `a92b8f4` (master, 2026-10-18). All changes are in `ds41f-4xgx10-switchless/`.
 
+This file is organised as versions. **v2** (2026-11-19) is this release; **v1** is everything that was public before
+it and follows below unchanged, change by change.
+
+---
+
+# v2 (2026-11-19)
+
+One line: the engine we serve (lossless speed changes for shared steps, prompt reading, sampled requests and long
+code), the three community features merged on 2026-11-15 (thinking options, 100 images per request, video input)
+and copy drafts with the `prediction` request field, in ONE tree, tested together end to end on the real 4-Spark
+engine. The source in this repo is the source of the binaries we serve.
+
+## v2.1 What changes for someone who uses the endpoint
+
+Speed (4x DGX Spark, TP4 over a 200G RoCE switch, 1M context, 16 slots; decode tok/s):
+
+| what | v1 | v2 | how it was measured |
+|---|---|---|---|
+| chat, 1 user, held-out prompts | about 90 | about 90 (about +1 %) | paired cold starts on the same prompts, same texts |
+| chat, 1 user, 3-prompt bench | 84.6 | 84 (83.6-84.6) | four 9-run medians |
+| code, 1 user, 3-prompt bench | 139-144 | about 147 (143-152) | four 9-run medians; this bench swings by about 3 |
+| 16 users, a different prompt each | 368-376 | about 413 (408-419) | 8 runs |
+| 8 users, a different prompt each | about 302-307 | 340-350 | two runs |
+| reading a long prompt (prefill), 48.7K tokens cold | about 10.2K tok/s | about 10.8K tok/s | 8-10 cold starts each |
+| a 948K-token prompt, 3 facts recalled | 3/3, 9.4-9.8K tok/s | 3/3, 10.2K tok/s | one run each |
+| first token, short prompt | 99 ms | 86 ms | medians, same window |
+| sampled agent sessions (temperature 1.0, top-p) | baseline | +5 to 8 % | seeded pairs on identical texts, 1-12 sessions |
+| the same prompt sent again gets its first reply | 15 of 17 | 17 of 17 | |
+| rewrite of a 1K / 4K / 8K-token file, 1 user | 164 | 365-370 / 459-465 / 468 | identical texts |
+| numbered listing, the file sent as `prediction` | 163 | 432 | identical texts |
+
+What did NOT improve, plainly:
+
+- One-user chat. It sits at the hardware's limit (memory bandwidth); the gains of this release are in shared steps
+  (several users), prompt reading, sampled requests, longer draft blocks on code, and replies that repeat their prompt.
+- Short sampled chat replies (the sampled-request gain is on long agent sessions).
+- Several rewrites in flight at once: a copy is only used in a step that holds one request, so two rewrites at
+  once gain a few percent and four gain nothing.
+- A reply that repeats nothing from its prompt or prediction (a wrong prediction costs nothing and gains nothing).
+- The 3-prompt bench swings by about 3 tok/s between runs of one build, and the v1 column was measured on other
+  days. Same-window pairs of v1's engine against v2's: 8 users 274 -> 297, 16 users 380 -> 406, long code +2.7 to 3.7 %.
+
+Known costs:
+
+- About 0.3 GiB more memory on the box that runs rank 0 (0.26 GiB of device memory per rank for the copy step graph).
+- First token of a follow-up turn: equal on average; one shape (the third turn of a 77K-token conversation) is
+  3 ms later, repeatably.
+- A text request sent while two 40,000-token image prompts are being read waited up to 13 s (median 0.2 to 1 s).
+  With `--max-image-rows-in-flight 40000` (what we serve with) only one such prompt is read at a time: up to 7 s.
+  The price of that setting: an image or video request that arrives while a full 40,000-token request is being
+  answered gets 429 with `Retry-After: 5` instead of running beside it.
+- While several requests are in flight, a reply's wording can differ from the reply the same request gets alone.
+  That was already so in v1 (`DSGB10_OEA` re-routes experts in steps shared by 9 or more rows, a lossy opt-in);
+  copy drafts change WHEN a request's steps happen, so which requests share a step can change. Drop `DSGB10_OEA`
+  for replies that do not depend on the other users.
+
+New features:
+
+| feature | what a client can now do |
+|---|---|
+| thinking options (pull request #4, MiaAI-Lab) | `reasoning_effort`: none, minimal (1), low (50), medium / high / xhigh (75), ultra (95), max (100), or a number 1-100. `thinking: {"type": "enabled" \| "disabled"}` (or true / false). Any explicit off-switch wins |
+| 100 images per request (pull request #5, MiaAI-Lab) | up to 100 images in one request (was 16), bounded by image tokens: 40,000 per request (about 100 small or 40 full-size images) |
+| video input (pull request #6, MiaAI-Lab) | `video_url` parts (also `video`, `input_video`): mp4 (h264, mpeg4) and webm, data: or public http(s) URLs, `max_frames` 1-100 (default 32), frames carry their timestamps; several clips, and clips with stills, in one request |
+| predicted outputs | `prediction: {"type": "content", "content": "..."}` (OpenAI's shape). The text is used as drafts: same reply, faster when the prediction is right. Copying from the prompt needs no field at all |
+
+## v2.2 Flags and variables
+
+Front-end (`dsfront serve`), new in v2 (defaults in brackets):
+
+    --max-image-rows N              image tokens one request may take [40000]; more is answered 400 before anything
+                                    is encoded
+    --max-image-rows-in-flight N    image tokens of all image requests being answered [80000 = two full requests];
+                                    a request that does not fit gets 429 with Retry-After: 5 at once; text requests
+                                    are never counted
+    --max-body-mb N                 largest request body in MiB [64]; larger is answered 413
+    --thinking / --no-thinking      what a request gets when it does not say [off]
+    --prediction                    pass a request's `prediction` to the engine as drafts [off: the field is ignored]
+    --prediction-max N              the most prediction tokens sent [65536]
+
+Vision encoder (`tools/vision/vision_encoder.py`): `--max-images` [100], `--max-rows` [40000], `--max-video-bytes`
+[128 MiB], `--video-timeout-s` [60]; needs `video_frames.py` beside it.
+
+Engine variables new in v2 (`--setenv NAME=VALUE`; every one defaults to v1's behaviour; the values are the served ones):
+
+| variable = served value | what it does | output |
+|---|---|---|
+| `DSGB10_REUSE_EXACT=1` | a re-sent prompt gets its first reply (the 1-8 leftover positions take the prefill path) | repeats now equal the first reply |
+| `DSGB10_DRAFT_MAX=7`, `DSGB10_DRAFT_DYN=5` | a 7-draft block after a fully accepted step | identical |
+| `DSGB10_WIDE_SH=1` | wide steps: the shared expert beside the gate and router | identical |
+| `DSGB10_WIDE_AR=2` | wide steps: all-reduce as reduce-scatter + all-gather, the gather in bf16 | identical |
+| `DSGB10_L2PF=d:.../c2:...` | L2 prefetch plan for 9-16-row steps and the draft pass | identical |
+| `DSGB10_PF_TUNE=hc,small,down` | upstream's prefill tunings | identical |
+| `DSGB10_RING_RSBAL=1` | reduce-scatter balanced over both RoCE functions (switch fleets only) | identical |
+| `DSGB10_HEADG=2` | the wide LM head reads rows normalised once | identical |
+| `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` | sampled requests WITHOUT a client seed draw through a Gumbel-max sampler and the drafter uses the same noise | same distribution |
+| `DSGB10_GATE_SEP=1` | 2-4-row steps: a no-op kernel between the router gate and the MoE | identical |
+| `DSGB10_COPY=1`, `DSGB10_COPY_ROWS=64`, `DSGB10_COPY_ENTER=32`, `DSGB10_COPY_SHARED=0`, `DSGB10_COPY_SW=1`, `DSGB10_COPY_DELTA=1`, `DSGB10_COPY_LOG=1` | copy drafts: a reply that repeats its prompt or the client's prediction is verified up to 64 rows a step, in steps that hold one request | identical |
+| `DSGB10_EXACT_SOLO=136`, `DSGB10_NORM_EXACT=1`, `DSGB10_WIDE_EXACT=95`, `DSGB10_WIDE_EXACT_MT=2` | the copy steps' own graph with exact 32- and 64-row bodies (row-group kernels with the decode kernels' arithmetic); every other step runs the bodies of before | identical |
+
+Every copy-drafts variable, its default and the design: [docs/copy.md](ds41f-4xgx10-switchless/docs/copy.md). The
+full served argument line is in the README's "run it" block.
+
+## v2.3 Behaviour changes (read before upgrading)
+
+Intended, from the merged pull requests (front-end):
+
+1. A `reasoning_effort` (or `thinking.type`) value that is not valid now returns HTTP 400. v1 silently used the
+   default. Examples that now fail: "banana", "hihg", 0, 101, true, "0", [].
+2. `minimal` means effort 1 and `ultra` means 95. v1 read both as unknown = 75.
+3. The request field `thinking` is read. v1 ignored it.
+4. When a request carries both an on-switch and an off-switch, off wins. v1 took whichever field it read first.
+5. More than 16 images in one request are accepted (up to the image-token caps). v1 answered 400.
+6. A new status for clients: an image / video request can get 429 with `Retry-After: 5` when the image requests in
+   flight are at the cap. OpenAI-style clients retry it by themselves.
+7. Video parts are accepted. v1 answered 400.
+
+Unchanged: thinking is OFF unless a request or `--thinking` turns it on (as in v1); the body limit stays 64 MiB.
+
+Intended, from the engine:
+
+8. A sampled request WITHOUT a seed (the default for most clients) draws from another random stream than v1 (same
+   distribution; checked on 6,303 tokens against their rows' probabilities and on 7,200 replies). Such requests
+   were never repeatable, so nothing visible changes.
+9. The same prompt sent again now gets its first reply (v1: 15 of 17).
+10. With `--prediction`, the `prediction` field is read (v1 ignored it). It never changes a reply's text.
+
+Unchanged: greedy requests and requests WITH a seed are token-identical to the same engine without the v2 variables,
+copy drafts included (per-token logit bits compared, 0 differ).
+
+## v2.4 Upgrade notes
+
+- Engine, front-end and vision encoder must be updated TOGETHER. The v2 front-end sends requests the v1 engine and
+  the v1 encoder refuse (more than 16 images, video, prediction ids).
+- The first start of the new engine binary drops the kept sessions once (every open conversation's next turn is
+  read again from the start). Changing `--setenv` values later needs `service.sh stop --forget`: variables are not
+  part of the kept sessions' identity.
+- Memory on the rank-0 box, which also runs the front-end and the encoder (128 GB DGX Spark, 12 GiB session store,
+  one encoder, a fresh start, file rewrites running at the same time): about 11.5 GiB free when idle; lowest
+  during 100 small images 9.5 GiB, during one request of 40 full-size images 9.2 GiB, during two such requests at
+  once (the default `--max-image-rows-in-flight 80000`) 8.8 GiB. Memory follows image tokens, not the number of
+  images: on a box with less room lower `--max-image-rows`. Over long uptime the engine's n-gram cache grows to its
+  4 GiB per rank (`--engram-cache-mib`, as in v1; under heavy mixed load we saw about 0.3 GiB in 30 minutes, the
+  rate falling), so plan for about 4 GiB less than a fresh start shows.
+- `DSGB10_RING_DIRECT=2` and `DSGB10_RING_RSBAL=1` only on a switch; the `DSGB10_L2PF` budgets and `DSGB10_GATE_SEP`
+  were fitted on GB10.
+- Rolling back is a binary + launcher + encoder-file swap; no data format changed.
+
+## v2.5 How it was tested
+
+One request at a time, the build we served before against v2, cold against cold: 54/54 identity prompts, 140/140
+held prompts, 36/36 rewrites and numbered listings, predictions right, wrong, partial and malformed, seeded sampled
+sessions with a fixed arrival order, 45/45 fixed-answer request shapes, 15/15 images; per-token logit bits equal on
+185,707 tokens (0 differ), 58,707 of them computed in 32- and 64-row copy steps. With nobody copying, 2-16 users get
+the same texts (68/68 greedy, 32/32 seeded sampled). Rewrites and predictions were also sent together with images
+and video and with every thinking variant (34/34 replies equal to the same binaries with copy drafts off), and
+while image and video requests were in flight (replies equal except two of about sixty whose wording differed: see
+the last known cost above). 100 small / 40 full-size image requests, the caps and the 429 path, the video suite
+(39/39); quality eval 71/75 at 4 and 16 users (= v1); 3/3 facts from a 948K-token prompt; a 30-minute soak with
+everything mixed (text, sampled agent sessions, rewrites, predictions, images, video, thinking variants,
+cancellations): 2,366 requests, no failed request (the only non-200 answers to valid requests were 19 of the 429s
+described above).
+
+## v2.6 Credits
+
+Thinking options, 100-image requests and video input are pull requests #4, #5 and #6 by MiaAI-Lab, merged with
+maintainer commits on top. The engine, kernels, RoCE ring and drafter are Andy Shu's dsgx10 (MIT); `DSGB10_PF_TUNE`
+switches on tunings that upstream built. The `prediction` field follows OpenAI's predicted-outputs shape.
+
+---
+
+# v1 (public before 2026-11-19)
+
+Everything below is v1, as it was published.
+
 Measured on four GB10 boxes (TP=4) over a 200G switch, serving DeepSeek-V4.1-Flash-1017, `--max-ctx 1048576`.
 Speeds are decode tok/s (total across concurrent requests). "agent" = 8 concurrent sessions with
 80K-300K-token prompts, 512 tokens per turn. qeval = 75-question quality eval, bar >= 70.

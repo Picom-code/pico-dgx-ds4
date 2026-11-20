@@ -116,5 +116,7 @@ Front-end: `--prediction` (off: the field is ignored), `--prediction-max N` (655
 - First token of a follow-up turn: equal on average (within 2 ms); one shape (the third turn of a 77K-token
   conversation) was 3 ms later in 3 of 3 pairs.
 - One `copy:` line per request in rank 0's log with `DSGB10_COPY_LOG=1`.
+- While several requests share steps a reply's wording can differ from its solo reply, as without the feature
+  (`DSGB10_OEA` re-routes experts in shared steps of 9+ rows); copy drafts change when a request's steps happen.
 - A new way to die, by design: `copy delta: ...` when a rank's slot history differs from rank 0's (never seen in
   test, including soaks with cancellations, 16-user bursts and slot reuse).

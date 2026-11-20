@@ -260,6 +260,13 @@ temperature 1.0 and top-p 0.95 (0 is greedy; `top_k` and `seed` are taken), `max
 with the service's `baseUrl` and the served name as its model's `id`, then run
 `DSGB10_DEV_KEY=$(cat ~/api-key) pi --provider dsgb10 --model deepseek-v4.1-flash`.
 
+Predicted outputs: started with `--prediction`, dsfront passes a request's `"prediction": {"type": "content",
+"content": "..."}` (OpenAI's shape; `content` may also be a list of text parts) to an engine that runs with
+`DSGB10_COPY=1`, where it is used as drafts: the reply is the same text with or without the field, and comes
+faster when the prediction is right (a file sent back for an edit). Any other shape is ignored, never an error;
+requests with images or video send no prediction; without `--prediction` the field is ignored as before
+([docs/copy.md](docs/copy.md)).
+
 **8. Check a build:**
 
 ```bash
