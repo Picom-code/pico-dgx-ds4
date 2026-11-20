@@ -46,6 +46,8 @@ class SpillFile {
   void flush(cudaStream_t st);
   // Until write `seq` is in the file.
   void wait(uint64_t seq);
+  // Whether the writer has completed this write, without waiting for it.
+  bool is_written(uint64_t seq);
   // Every write so far in the file and on the disk (fdatasync): before a planned stop's index.
   void sync();
   // The file stays when this is destroyed: a planned stop kept sessions in it.
@@ -53,6 +55,8 @@ class SpillFile {
   // `bytes` of the file at `off` to device memory at dst, queued on st (the read itself is done when
   // this returns; its buffer is read again only after the copy).
   void read(void* dst, size_t bytes, size_t off, cudaStream_t st);
+  // Optional restore: an invalid extent or read error refuses the block.
+  bool try_read(void* dst, size_t bytes, size_t off, cudaStream_t st);
 
   // The checksum slot of the block at file offset `off`: as it went out, or as it came back.
   uint64_t* sum(size_t off, bool back) { return sums_ + (back ? slots_ : 0) + off / kPoolGrain; }
@@ -70,6 +74,7 @@ class SpillFile {
     cudaEvent_t pre = nullptr, start = nullptr;  // the last job's: begin() and the first copy
     size_t batch = 0;                            // the last job's: the flush's bytes
   };
+  bool read_block(void* dst, size_t bytes, size_t off, cudaStream_t st, bool optional);
   void writer();
 
   std::string path_;

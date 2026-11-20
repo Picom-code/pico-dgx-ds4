@@ -355,6 +355,7 @@ struct Model::Impl {
   size_t disk_take(int h, size_t bytes);  // room in the disk tier's file for session h (dropping), or kNone
   void state_spill(int h);
   void state_unspill(int h);
+  bool state_stage_spilled_snapshot(int source, int fresh, int snap);
   void state_save(int h, int from, int to);
   void state_load(int h, int to);
   uint8_t* state_snap_buf(int h, int pos);  // a new snapshot's block (the caller fills it), nullptr: no room

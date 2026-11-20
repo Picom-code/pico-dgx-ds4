@@ -68,6 +68,8 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  kCmdTextCheckpoint = 26,  // verify a resident restart on all ranks
+  kCmdStageTextCheckpoint = 27,  // read one spilled snapshot into a fresh handle
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -117,6 +119,40 @@ Cmd bcast(comm::Ring& ring, const Cmd& mine);
 void apply_ops(model::Model& m, const Cmd& c);
 // rank 0's payload of nbytes, to every rank (in pieces of 64 KiB, the bootstrap sockets' limit)
 void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank);
+// For the text checkpoint probe, pos0 is the restart, n indicates saved pages
+// are required, and next/rows name the exact window/end positions (-1: absent).
+inline bool local_text_checkpoint_ready(const model::Model::StateInfo& info, const Cmd& c) {
+  if (info.on_disk || (c.n && info.saved < c.pos0)) return false;
+  if (c.next >= 0) return std::binary_search(info.snaps.begin(), info.snaps.end(), c.next);
+  return c.rows >= 0 && info.end_pos == c.rows;
+}
+template<class Ring>
+bool text_checkpoint_vote(Ring& ring, bool ready) {
+  const int32_t mine = ready ? 1 : 0;
+  int32_t all[4] = {};
+  ring.allgather_host(&mine, all, sizeof mine);
+  return std::all_of(all, all + 4, [](int32_t rank) { return rank == 1; });
+}
+inline bool text_checkpoint_ready(model::Model& m, comm::Ring& ring, const Cmd& c) {
+  return text_checkpoint_vote(ring, local_text_checkpoint_ready(m.state_info(c.handle), c));
+}
+// All ranks either retain their private copy or free it before returning to the RAM plan.
+template<class Model, class Ring>
+bool stage_text_checkpoint(Model& m, Ring& ring, const Cmd& c) {
+  const auto handles = m.state_sessions();
+  const auto src = m.state_info(c.handle);
+  const int pos = c.pos0 & ~1;
+  const bool ready = c.handle > 0 && c.next > 0 && c.next != c.handle && pos > 0 &&
+      std::find(handles.begin(), handles.end(), c.next) == handles.end() &&
+      src.on_disk && src.saved >= pos && std::binary_search(src.snaps.begin(), src.snaps.end(), c.pos0);
+  if (!text_checkpoint_vote(ring, ready)) return false;
+  const bool staged = m.state_stage_spilled_snapshot(c.handle, c.next, c.pos0);
+  const auto result = m.state_info(c.next);
+  const bool accepted = text_checkpoint_vote(ring, staged && !result.on_disk && result.saved >= pos &&
+      std::binary_search(result.snaps.begin(), result.snaps.end(), c.pos0));
+  if (!accepted && staged) m.state_free(c.next);
+  return accepted;
+}
 model::Ctl to_ctl(const Cmd& c);
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
