@@ -700,7 +700,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
 #ifdef DSGB10_NVTX
   g_dump_a = a;
 #endif
-  for (int L = 0; L < (ced ? 20 : kLayers); ++L) {
+  for (int L = 0; L < (ced ? kCedFirstDecoderLayer : kLayers); ++L) {
     NVTX_RANGE("%s L%02d", ced ? "enc" : "ex", L);
     bool fresh = L == 0;
     if (engram_layer(L) && store) {

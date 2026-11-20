@@ -226,11 +226,21 @@ start_engine() {  # strays out, the model files' page cache dropped, memory chec
     log "not starting: MemAvailable under $MIN_AVAIL_GIB GiB on $low (another model loaded?)"
     return 1
   fi
+  local durable_env=
+  if [[ ${DSGB10_ORDINARY_IMAGE_DURABLE:-0} != 0 ]]; then
+    [[ ${DSGB10_ORDINARY_IMAGE_DURABLE:-} == 1 &&
+       ${DSGB10_ORDINARY_IMAGE_PREFIX_CACHE:-} == 1 &&
+       ${DSGB10_ORDINARY_IMAGE_DURABLE_BYTES:-} =~ ^[1-9][0-9]*$ &&
+       ${DSGB10_ORDINARY_IMAGE_ASSETS_EPOCH:-} =~ ^[0-9a-f]{64}$ ]] || return 1
+    durable_env="DSGB10_ORDINARY_IMAGE_DURABLE=1 DSGB10_ORDINARY_IMAGE_PREFIX_CACHE=1"
+    durable_env+=" DSGB10_ORDINARY_IMAGE_DURABLE_BYTES=$DSGB10_ORDINARY_IMAGE_DURABLE_BYTES"
+    durable_env+=" DSGB10_ORDINARY_IMAGE_ASSETS_EPOCH=$DSGB10_ORDINARY_IMAGE_ASSETS_EPOCH"
+  fi
   ARGS="--mode serve --socket $SOCK --disk-tag service --keep-gib ${KEEP_GIB:-4} $EARGS"
   r=1
   for w in "${WS[@]}"; do
     old=$(for ((i = KEEP - 1; i >= 1; i--)); do echo -n "$i "; done)
-    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; setsid nohup bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
+    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; setsid nohup env $durable_env bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
       {
         log "starting rank $r on $w failed"
         reap_all 0

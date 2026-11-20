@@ -277,6 +277,7 @@ class Model {
   void state_restore_end(int h);               // the end snapshot -> ring and carries
   void state_drop(int h, int from);            // forget what session h holds from position `from` on
   void state_free(int h);
+  void state_mark_ram_only(int h);  // before this handle receives state; pressure frees it instead of spilling
   void state_copy_snaps(int src, int dst, int upto);  // session src's window snapshots at <= upto -> dst
   void state_drop_snap(int h, int pos);
   // The store's disk tier: base.spill of `bytes` (the same on every rank; an earlier file is removed
@@ -296,6 +297,14 @@ class Model {
   uint64_t state_kept_check(const std::string& base, uint64_t run_id, double max_age_s, size_t* bytes, std::string* why);
   void state_disk(const std::string& base, size_t bytes, size_t staging, bool reuse = false, uint64_t run_id = 0);
   void state_keep(uint64_t gen);
+  // The ordinary checkpoint tier is independent of live spill. Save copies resident state;
+  // load reserves a fresh handle without evicting incumbent state. Drop removes only the disk copy.
+  void state_durable_config(const std::string& base, size_t bytes, uint64_t run_id);
+  void state_mark_ordinary_durable(int h);
+  bool state_durable_save(int h, uint64_t generation, int snap, bool encoder_only);
+  bool state_durable_load(int h, uint64_t generation, int snap, bool encoder_only);
+  void state_durable_drop(uint64_t generation);
+  bool state_durable_prune(const std::vector<uint64_t>& committed);
   uint64_t state_kept() const;              // the gen whose sessions this run's store holds (0: none)
   std::vector<int> state_sessions() const;  // the sessions in the store
   size_t state_disk_capacity() const;

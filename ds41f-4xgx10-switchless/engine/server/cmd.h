@@ -11,6 +11,7 @@
 
 #include "comm/ring.h"
 #include "model/model.h"
+#include "server/durable_cmd.h"
 
 namespace srv {
 
@@ -41,6 +42,8 @@ enum : int32_t {
   kStSpill,        // state_spill(h)
   kStUnspill,      // state_unspill(h)
   kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
+  kStMarkRamOnly,  // state_mark_ram_only(h)
+  kStMarkOrdinaryDurable,  // explicitly completed ordinary request; never secure
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;
@@ -68,6 +71,7 @@ enum : int32_t {
   // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
   // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
   kCmdImages = 21,
+  kCmdDurableSave = 22, kCmdDurableLoad = 23, kCmdDurableDrop = 24, kCmdDurablePrune = 25,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {
@@ -89,6 +93,8 @@ struct Cmd {
   int32_t ahead = 1;       // kCmdDecode: queue the next step before the current one ends (0: diagnostics)
   int32_t n = 0;           // kCmdTokens; kCmdBatch: the entries
   int32_t next = 0;        // kCmdPrefill: rows of the chunk after this one (its Engram lookups start now)
+  uint64_t durable_generation = 0;
+  int32_t durable_encoder_only = 0;
   int32_t handle = -1;     // the session whose window snapshots are taken
   int32_t snap_every = 0;  // kCmdDecode: a window snapshot at every multiple of this position (0: none)
   int32_t n_snaps = 0;     // kCmdPrefill: snapshots inside the chunk; kCmdRows: after the step
@@ -117,7 +123,30 @@ Cmd bcast(comm::Ring& ring, const Cmd& mine);
 void apply_ops(model::Model& m, const Cmd& c);
 // rank 0's payload of nbytes, to every rank (in pieces of 64 KiB, the bootstrap sockets' limit)
 void bcast_payload(comm::Ring& ring, void* data, size_t nbytes, int rank);
+// Startup only, after rank0 has verified its committed head catalog.
+inline bool run_durable_prune(model::Model& m, comm::Ring& ring, const Cmd& c,
+                              int rank, const std::vector<uint64_t>& committed = {}) {
+  if (!durable::vote(ring, c.n >= 0 && c.n <= 128 && (rank != 0 || committed.size() == size_t(c.n)))) return false;
+  std::vector<uint64_t> ids = rank == 0 ? committed : std::vector<uint64_t>(c.n);
+  bcast_payload(ring, ids.data(), ids.size() * sizeof(uint64_t), rank);
+  return durable::prune(m, ring, ids);
+}
+inline bool durable_prune(model::Model& m, comm::Ring& ring, const std::vector<uint64_t>& committed) {
+  if (committed.size() > 128) return false;
+  Cmd c{}; c.op = kCmdDurablePrune; c.n = int32_t(committed.size());
+  bcast(ring, c); apply_ops(m, c); return run_durable_prune(m, ring, c, 0, committed);
+}
 model::Ctl to_ctl(const Cmd& c);
+// Caller supplies a fresh globally unused handle for load. A false vote never
+// publishes a partial generation or frees any preexisting handle.
+bool run_durable(model::Model& m, comm::Ring& ring, const Cmd& c);
+inline bool durable_state(model::Model& m, comm::Ring& ring, int32_t op, int h,
+                          uint64_t generation, int snap = 0, bool encoder_only = false) {
+  Cmd c{}; c.op = op; c.handle = h; c.durable_generation = generation;
+  c.pos0 = snap; c.durable_encoder_only = encoder_only;
+  bcast(ring, c); apply_ops(m, c); return run_durable(m, ring, c);
+}
+
 
 // A prefill chunk on this rank (every rank alike): positions [pos0, pos0 + rows) of the tokens set
 // before; with kPfSample the last row is sampled (the step's number), else ~0.
