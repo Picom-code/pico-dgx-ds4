@@ -71,6 +71,8 @@
   A lossy relaxed-accept experiment (103 / 163) was tried and removed.
 ```
 
+A standard benchmark, by kind of text: NVIDIA's SPEED-Bench (880 prompts in 11 categories, replies up to 8,192 tokens) run with NVIDIA AIPerf, one stream and 16 streams, with draft acceptance per category: [docs/speed-bench.md](ds41f-4xgx10-switchless/docs/speed-bench.md).
+
 ## ✧ what changed
 
 ```

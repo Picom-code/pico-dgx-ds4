@@ -165,6 +165,10 @@ everything mixed (text, sampled agent sessions, rewrites, predictions, images, v
 cancellations): 2,366 requests, no failed request (the only non-200 answers to valid requests were 19 of the 429s
 described above).
 
+## v2.7 SPEED-Bench (2026-11-20, measurement only, no code change in the engine)
+
+NVIDIA's SPEED-Bench qualitative split (880 prompts, 1,138 turns, 11 categories) with NVIDIA AIPerf 0.14.0, output cap 8192, temperature 0, on the v2.0 build: one stream 112 tok/s decode as the mean of the categories (coding 140, roleplay 80), 3.05 tokens per verify step; 16 closed-loop streams 245 tok/s in total, held down by a late end of stream that the run exposed (a finished request is released only when its group ends). Tables, method and limits: [docs/speed-bench.md](ds41f-4xgx10-switchless/docs/speed-bench.md); scripts `tools/bench/speed_bench.sh` and `tools/bench/speed_bench_table.py`.
+
 ## v2.6 Credits
 
 Thinking options, 100-image requests and video input are pull requests #4, #5 and #6 by MiaAI-Lab, merged with
