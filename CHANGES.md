@@ -184,7 +184,8 @@ next request that arrives pauses the group as an arrival does when a slot is fre
 rows, order or arithmetic change, and without the variable the engine behaves as v2.0.
 
 Measured on a test instance (same boxes, served arguments; closed-loop clients, each sends its next request when
-its stream has ended):
+its stream has ended), except the rows that say serving endpoint (an earlier five-pass measurement of the full
+SPEED-Bench file on the test instance read 302.9 tok/s):
 
 | | v2.0 | `DSGB10_END_EARLY=1` |
 |---|---:|---:|
@@ -192,8 +193,10 @@ its stream has ended):
 | the same: streams producing tokens, of 16 | 8.4 | 15.5 |
 | the same: total output, tok/s (16 / 8 / 4 / 2 clients) | 196 / 164 / 131 / 109 | 238 / 191 / 148 / 110 |
 | SPEED-Bench, 16 streams, one fifth of the prompts, same window: total | 240 tok/s | 307 tok/s |
-| SPEED-Bench, 16 streams, all prompts: total (v2.0: one pass; new: five passes) | 245 tok/s | 303 tok/s |
-| SPEED-Bench, 16 streams: last token to end of stream, median / mean | 9.3 s / 24 s | under 1 ms / 34 ms |
+| SPEED-Bench, 16 streams, all prompts, one full pass each on the serving endpoint: total | 245 tok/s | 326 tok/s |
+| the same passes: last token to end of stream, median / mean | 9.3 s / 24 s | under 1 ms / 36 ms |
+| the same passes: streams at work, of 16 | 8.3 | 15.9 |
+| the same passes: decode tok/s per request, mean of the categories | 26.2 | 19.5 |
 | 16 users started together (the README's bench), 4 runs each, alternating | 406-421 | 413-419 |
 | one user, 3-prompt bench x9, chat / code medians, 2 runs each, alternating | 84.9, 84.8 / 146, 144 | 85.2, 85.1 / 147, 154 |
 
@@ -202,7 +205,7 @@ What it does not do, plainly:
 - It does not make 16 mixed closed-loop streams reach the 16-user figure of the README (about 413). That bench
   starts 16 code prompts together. In a closed loop every new request has its prompt read while the group
   waits, and mixed text accepts fewer draft tokens than code.
-- A request's own decode rate at 16 streams is lower than in v2.0's run (about 20 tok/s against 26 on SPEED-Bench):
+- A request's own decode rate at 16 streams is lower than in v2.0's run (19.5 tok/s against 26.2 on SPEED-Bench):
   16 streams now share the steps where 8 did. The gain is the end of the stream, the total, and the time a set of
   requests takes.
 - Texts. A request that runs alone is bit-identical (logit bits compared). Requests that arrive in a fixed order
