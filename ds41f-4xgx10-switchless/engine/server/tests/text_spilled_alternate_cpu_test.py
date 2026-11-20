@@ -7,14 +7,15 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 serve = (root / "server/serve.cpp").read_text()
 cmd = (root / "server/cmd.h").read_text()
+protocol = (root / "common/frontend_protocol.h").read_text()
 
 
 def between(text, first, last):
     start = text.index(first)
     return text[start:text.index(last, start)]
 
-adopt = between(serve, '    if (!resume && ordinary_text && !S && h.base_session_id && (h.flags & fe::kFlagKeep)',
-                '    // ---- prefill [q, n)')
+spill_gate = '    if ((text_fork || same_chat_lookup) && (h.flags & fe::kFlagKeep)'
+adopt = between(serve, spill_gate, '    // ---- prefill [q, n)')
 before_token, token = adopt.split('      c.op = kCmdTokens;', 1)
 assert 'issue(' not in before_token and 'state({' not in before_token
 assert '{kStLoad, src->h, q, 0}' in before_token and '{kStRestore, src->h, pl.snap, 0}' in before_token
@@ -31,6 +32,7 @@ program = r'''
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -39,7 +41,7 @@ program = r'''
 #include <vector>
 #include <cstdint>
 constexpr int kReplay = 128, kCmdStageTextCheckpoint = 27;
-namespace fe { constexpr int kFlagKeep = 2; }
+namespace fe { constexpr uint32_t ''' + between(protocol, 'kFlagKeep =', ',') + r'''; }
 enum { kCold, kLive, kEnd, kSnap };
 struct Plan { int q = 0, how = kCold, snap = -1; };
 struct Conn { bool dead = false; };
@@ -110,7 +112,8 @@ struct Fixture {
     int adopt(const ConnP& conn, const std::vector<int32_t>& prompt, bool resume,
               bool image_request, bool in_place, int flags, int named, int floor, bool named_text = true) {
         struct { struct { ConnP conn; } rq; } f{{conn}};
-        struct { int base_session_id, flags; } h{named, flags};
+        struct { uint64_t session_id, base_session_id; int flags; }
+            h{static_cast<uint64_t>(in_place ? named : 1000), static_cast<uint64_t>(named), flags};
         Session named_ram;
         named_ram.ordinary_text = named_text;
         const bool ordinary_text = ordinary_text_lineage(image_request, &named_ram);
@@ -118,18 +121,21 @@ struct Fixture {
         Session* src = &named_ram;
         Session disk_source;
         int spilled_source_h = 0;
-        int src_id = named, p = floor;
+        uint64_t src_id = h.base_session_id;
+        const int n = static_cast<int>(prompt.size());
+        int p = floor;
         bool src_live = true;
         Plan pl{floor, kLive, -1};
-''' + between(serve, '    if (!resume && ordinary_text && !S && h.base_session_id && (h.flags & fe::kFlagKeep)',
-              '    const int q = pl.q;') + r'''
+''' + between(serve, '    constexpr int kMinExistingGain',
+              '    if ((text_fork || same_chat_lookup)') + between(serve, spill_gate,
+              '    const bool replace_destination') + r'''
         if (disk_source.h) {
-            assert(src == &disk_source && src_id != named && !src_live);
+            assert(src == &disk_source && src_id != h.base_session_id && !src_live);
             assert(spilled_source_h == find(src_id)->h && m_.state_info(spilled_source_h).on_disk);
             assert(p >= pl.q && m_.state_info(src->h).saved == pl.q);
             m_.state_free(disk_source.h);
         } else {
-            assert(src == &named_ram && src_id == named && p == floor && src_live && pl.q == floor);
+            assert(src == &named_ram && src_id == h.base_session_id && p == floor && src_live && pl.q == floor);
             assert(!spilled_source_h);
         }
         return pl.q;
@@ -201,5 +207,6 @@ with tempfile.TemporaryDirectory(prefix="pico-spilled-cpu-") as tmp:
     subprocess.run(["g++", "-std=c++20", "-O1", "-I", root, source, "-o", binary], check=True)
     for flag in ("0", "1"):
         subprocess.run([binary, flag], check=True,
-                       env={**os.environ, "DSGB10_ORDINARY_TEXT_SPILLED_ALTERNATES": flag})
+                       env={**os.environ, "DSGB10_ORDINARY_TEXT_SPILLED_ALTERNATES": flag,
+                            "DSGB10_ORDINARY_EXISTING_TEXT_ALTERNATES": "0"})
 print("spilled selector, gate, rank refusal, and bounded lookup tests passed")

@@ -19,6 +19,7 @@ def part(source, start, stop):
 program = r'''
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,7 +59,10 @@ struct Model {
 }
 struct Conn { bool dead = false; };
 using ConnP = std::shared_ptr<Conn>;
-namespace fe { constexpr uint32_t ''' + part(protocol, 'kFlagImages =', ',') + r'''; }
+namespace fe {
+constexpr uint32_t ''' + part(protocol, 'kFlagImages =', ',') + r''';
+constexpr uint32_t ''' + part(protocol, 'kFlagKeep =', ',') + r''';
+}
 constexpr int ''' + part(cmd, '  kCmdTextCheckpoint =', '\n};').split('//', 1)[0].strip().rstrip(',') + r''';
 struct Cmd { int op = 0, handle = -1, pos0 = 0, next = 0, rows = 0, n = 0; };
 ''' + part(cmd, 'inline bool local_text_checkpoint_ready', '// All ranks either retain') + r'''
@@ -80,6 +84,7 @@ struct Server {
     std::map<uint64_t, Session> sess_;
     std::set<uint64_t> flying_;
     std::vector<uint64_t> slot_{0, 0};
+    int next_h_ = 100;
     int commands = 0;
     bool fits(int slot, int need) const { return slot == 0 ? need <= 2048 : need <= 1024; }
     void issue(const Cmd& c) { assert(c.op == kCmdTextCheckpoint && c.handle > 0); ++commands; }
@@ -87,8 +92,7 @@ struct Server {
         const auto i = sess_.find(id);
         return i == sess_.end() ? nullptr : &i->second;
     }
-''' + part(serve, '  Plan choose(', '  static bool ordinary_text_spilled_alternates_enabled()') + part(
-    serve, '  static bool ordinary_text_lineage', '  // Cheap disk metadata') + part(
+''' + part(serve, '  Plan choose(', '  // Cheap disk metadata') + part(
     serve, '  // Validate only the winner.', '  void tokens(') + r'''
     TextChoice adopt(const ConnP& conn, const std::vector<int32_t>& prompt, bool resume,
                      bool image_flag, Session* S, uint64_t src_id, Plan pl,
@@ -107,8 +111,8 @@ struct Server {
       int p = 0, s = 0, need = 1400;
       bool src_live = false;
       std::set<uint64_t> keep;
-''' + part(serve, '    const bool image_request =', '    bool src_live =') + part(serve, '    if (!resume && ordinary_text && !S && h.base_session_id',
-    '    if (!resume && ordinary_text && !S && h.base_session_id && (h.flags & fe::kFlagKeep)') + r'''
+''' + part(serve, '    const bool image_request =', '    bool src_live =') + part(
+    serve, '    constexpr int kMinExistingGain', '    if ((text_fork || same_chat_lookup) && (h.flags & fe::kFlagKeep)') + r'''
       assert(!S || src == S);
       return {src_id, p, src_live ? s : -1, pl};
     }
@@ -250,5 +254,6 @@ with tempfile.TemporaryDirectory(prefix='text-alternate-cpu-') as run_dir:
     binary = Path(run_dir) / 'check'
     fixture.write_text(program)
     subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(fixture), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], env={**os.environ, 'DSGB10_ORDINARY_TEXT_ALTERNATES': '0'}, check=True)
-    subprocess.run([str(binary)], env={**os.environ, 'DSGB10_ORDINARY_TEXT_ALTERNATES': '1'}, check=True)
+    for flag in ('0', '1'):
+        subprocess.run([str(binary)], check=True, env={**os.environ,
+            'DSGB10_ORDINARY_TEXT_ALTERNATES': flag, 'DSGB10_ORDINARY_EXISTING_TEXT_ALTERNATES': '0'})

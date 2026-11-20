@@ -855,6 +855,14 @@ class Server {
     return !image_request && (!source || source->ordinary_text);
   }
 
+  static bool ordinary_existing_text_alternates_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_EXISTING_TEXT_ALTERNATES");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
   struct TextChoice {
     uint64_t id = 0;
     int common = 0, slot = -1;
@@ -864,7 +872,7 @@ class Server {
   // Alternate sources are resident, idle text sessions from this connection.
   // Planned-stop restores lack proven text lineage, even when explicitly resumed.
   TextChoice text_alternate(const ConnP& conn, uint64_t named, const std::vector<int32_t>& prompt,
-                            int need, const std::set<uint64_t>& keep, int floor) const {
+                            int need, const std::set<uint64_t>& keep, int floor, bool stored_only = false) const {
     TextChoice best;
     const int n = (int)prompt.size();
     constexpr size_t kMaxSessions = 256;
@@ -873,7 +881,8 @@ class Server {
     size_t remaining = kPrefixBudget;
     std::tuple<int, bool, uint64_t, uint64_t> best_key{};
     for (const auto& [id, candidate] : sess_) {
-      if (id == named || !candidate.ordinary_text || flying_.count(id) || candidate.text_owner.lock() != conn ||
+      if (id == named || !candidate.ordinary_text || (stored_only && candidate.slot >= 0) ||
+          flying_.count(id) || candidate.text_owner.lock() != conn ||
           candidate.hist.size() <= static_cast<size_t>(floor)) continue;
       const auto info = m_.state_info(candidate.h);
       if (info.on_disk) continue;
@@ -1103,8 +1112,14 @@ class Server {
     Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
     Session disk_source;
     int spilled_source_h = 0;
-    if (!resume && ordinary_text && !S && h.base_session_id && pl.q < n - 1 && ordinary_text_alternates_enabled()) {
-      const TextChoice hit = text_alternate(f.rq.conn, src_id, prompt, need, keep, pl.q);
+    constexpr int kMinExistingGain = 8192;
+    const bool same_chat_lookup = !resume && ordinary_text && S && !h.base_session_id && (h.flags & fe::kFlagKeep) &&
+        S->text_owner.lock() == f.rq.conn && !f.rq.conn->dead && n - 1 - pl.q >= kMinExistingGain &&
+        next_h_ < INT_MAX - 1 && ordinary_existing_text_alternates_enabled();
+    const bool text_fork = !resume && ordinary_text && !S && h.base_session_id;
+    if ((text_fork || same_chat_lookup) && pl.q < n - 1 && ordinary_text_alternates_enabled()) {
+      const int floor = same_chat_lookup ? pl.q + kMinExistingGain - 1 : pl.q;
+      const TextChoice hit = text_alternate(f.rq.conn, src_id, prompt, need, keep, floor, same_chat_lookup);
       if (hit.id) {
         Session* alt = find(hit.id);
         if (alt && text_alternate_ready(*alt, hit)) {
@@ -1117,9 +1132,9 @@ class Server {
         }
       }
     }
-    if (!resume && ordinary_text && !S && h.base_session_id && (h.flags & fe::kFlagKeep) &&
+    if ((text_fork || same_chat_lookup) && (h.flags & fe::kFlagKeep) &&
         ordinary_text_spilled_alternates_enabled() && next_h_ < INT_MAX - 1) {
-      const TextChoice hit = text_spilled_alternate(f.rq.conn, h.base_session_id, prompt, pl.q);
+      const TextChoice hit = text_spilled_alternate(f.rq.conn, S ? h.session_id : h.base_session_id, prompt, pl.q);
       if (hit.id) {
         const Session* alt = find(hit.id);
         if (alt) {
@@ -1140,6 +1155,7 @@ class Server {
         }
       }
     }
+    const bool replace_destination = same_chat_lookup && src != S;
     const int q = pl.q;
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
@@ -1156,9 +1172,14 @@ class Server {
         else
           std::snprintf(from, sizeof from, "no base named, and this engine does not hold the session");
       } else {
-        const int k = S ? std::snprintf(from, sizeof from, "its own history: common prefix %d ids", p)
-                        : std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
-                                        (unsigned long long)src_id, p);
+        int k;
+        if (replace_destination)
+          k = std::snprintf(from, sizeof from, "a stored same-connection checkpoint: common prefix %d ids", p);
+        else if (S)
+          k = std::snprintf(from, sizeof from, "its own history: common prefix %d ids", p);
+        else
+          k = std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
+                            (unsigned long long)src_id, p);
         if (pl.how == kCold && k > 0 && k < (int)sizeof from) {
           const int r = first_restart(*src);
           if (r < 0) std::snprintf(from + k, sizeof from - k, ", and it has no restart point");
@@ -1176,6 +1197,14 @@ class Server {
       }
       slot_[s] = 0;
     }
+    // Keep the session ID and slot. Its previous answer can own pages past
+    // this edit, so copy the validated source into a fresh store handle.
+    int retired_handle = 0;
+    if (replace_destination) {
+      retired_handle = S->h;
+      *S = Session{};
+      S->h = next_h_++;
+    }
     if (!S) {
       Session ns;
       ns.h = next_h_++;
@@ -1188,6 +1217,7 @@ class Server {
       if (src != S) v.push_back({kStCopySnaps, src->h, S->h, q});  // a fork: src's snapshots are S's too
       else v.push_back({kStDrop, S->h, q, 0});                     // S forgets what follows q
     }
+    if (retired_handle) v.push_back({kStFree, retired_handle, 0, 0});
     // the new live state's exact ranges
     if (pl.how == kCold) S->lo = S->clo = S->w = 0;
     else if (pl.how == kSnap) S->lo = pl.snap - 128, S->clo = q, S->w = q;
