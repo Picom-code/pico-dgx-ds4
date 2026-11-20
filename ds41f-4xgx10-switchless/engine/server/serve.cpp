@@ -55,6 +55,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -842,6 +843,14 @@ class Server {
     return enabled;
   }
 
+  static bool ordinary_text_spilled_alternates_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_TEXT_SPILLED_ALTERNATES");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
   static bool ordinary_text_lineage(bool image_request, const Session* source) {
     return !image_request && (!source || source->ordinary_text);
   }
@@ -887,6 +896,56 @@ class Server {
       best = TextChoice{id, common, live ? candidate.slot : -1, restart};
     }
     return best;
+  }
+
+  // Cheap disk metadata and exact submitted tokens only. A staged snapshot
+  // must have saved pages through its position and leave any required replay.
+  TextChoice text_spilled_alternate(const ConnP& conn, uint64_t named,
+                                    const std::vector<int32_t>& prompt, int floor) const {
+    constexpr int kMinDiskGain = 8192;
+    constexpr size_t kMaxSessions = 256;
+    constexpr size_t kPrefixBudget = 4 * 1024 * 1024;
+    TextChoice best;
+    const int n = (int)prompt.size();
+    if (conn->dead || n - 1 - floor < kMinDiskGain || sess_.size() > kMaxSessions) return best;
+    const int minimum = floor + kMinDiskGain;
+    size_t remaining = kPrefixBudget;
+    std::tuple<int, uint64_t, uint64_t> best_key{};
+    for (const auto& [id, candidate] : sess_) {
+      if (id == named || !candidate.ordinary_text || candidate.slot >= 0 || flying_.count(id) ||
+          candidate.text_owner.lock() != conn || candidate.hist.size() < static_cast<size_t>(minimum)) continue;
+      const auto info = m_.state_info(candidate.h);
+      if (!info.on_disk || info.saved < minimum || info.snaps.empty()) continue;
+      const size_t limit = std::min({candidate.hist.size(), static_cast<size_t>(n - 1),
+                                     static_cast<size_t>(info.saved)});
+      if (limit > remaining) return TextChoice{};
+      remaining -= limit;
+      const auto mismatch = std::mismatch(candidate.hist.begin(), candidate.hist.begin() + limit, prompt.begin());
+      const int common = static_cast<int>(mismatch.first - candidate.hist.begin());
+      if (common < minimum) continue;
+      for (const int snap : info.snaps) {
+        const int q = snap & ~1;
+        if (q < minimum || q > common) continue;
+        const bool encoder_only = std::find(candidate.enc_snaps.begin(), candidate.enc_snaps.end(), snap) !=
+                                  candidate.enc_snaps.end();
+        if (encoder_only && (!o_.ced || n - q < kReplay)) continue;
+        const auto key = std::make_tuple(q, candidate.used, UINT64_MAX - id);
+        if (key <= best_key) continue;
+        best_key = key;
+        best = TextChoice{id, common, -1, Plan{q, kSnap, snap}};
+      }
+    }
+    return best;
+  }
+
+  bool text_spilled_alternate_ready(const Session& source, const TextChoice& hit, int staged) {
+    Cmd c{};
+    c.op = kCmdStageTextCheckpoint;
+    c.handle = source.h;
+    c.next = staged;
+    c.pos0 = hit.restart.snap;
+    issue(c);
+    return stage_text_checkpoint(m_, ring_, c);
   }
 
   // Validate only the winner. A stale or rank-local stored checkpoint leaves
@@ -1042,6 +1101,8 @@ class Server {
     bool src_live = src && src->slot == s;
     int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
     Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    Session disk_source;
+    int spilled_source_h = 0;
     if (!resume && ordinary_text && !S && h.base_session_id && pl.q < n - 1 && ordinary_text_alternates_enabled()) {
       const TextChoice hit = text_alternate(f.rq.conn, src_id, prompt, need, keep, pl.q);
       if (hit.id) {
@@ -1053,6 +1114,29 @@ class Server {
           pl = hit.restart;
           src_live = hit.slot >= 0;
           if (src_live) s = hit.slot;
+        }
+      }
+    }
+    if (!resume && ordinary_text && !S && h.base_session_id && (h.flags & fe::kFlagKeep) &&
+        ordinary_text_spilled_alternates_enabled() && next_h_ < INT_MAX - 1) {
+      const TextChoice hit = text_spilled_alternate(f.rq.conn, h.base_session_id, prompt, pl.q);
+      if (hit.id) {
+        const Session* alt = find(hit.id);
+        if (alt) {
+          const int staged = next_h_++;
+          if (text_spilled_alternate_ready(*alt, hit, staged)) {
+            // No state command may intervene before kCmdTokens. Its load and
+            // restore operations pin this handle through slot displacement.
+            disk_source.h = staged;
+            spilled_source_h = alt->h;
+            if (std::find(alt->enc_snaps.begin(), alt->enc_snaps.end(), hit.restart.snap) != alt->enc_snaps.end())
+              disk_source.enc_snaps.push_back(hit.restart.snap);
+            src = &disk_source;
+            src_id = hit.id;
+            p = hit.common;
+            pl = hit.restart;
+            src_live = false;
+          }
         }
       }
     }
@@ -1113,7 +1197,8 @@ class Server {
     S->slot = s;
     if (!resume) {
       S->ordinary_text = ordinary_text;
-      if (ordinary_text && ordinary_text_alternates_enabled()) S->text_owner = f.rq.conn;
+      if (ordinary_text && (ordinary_text_alternates_enabled() ||
+          ((h.flags & fe::kFlagKeep) && ordinary_text_spilled_alternates_enabled()))) S->text_owner = f.rq.conn;
       else S->text_owner.reset();
     }
     S->used = ++clock_;
@@ -1136,6 +1221,8 @@ class Server {
       Cmd c{};
       c.op = kCmdTokens;
       c.slot = s;
+      // Pin the original spill through slot displacement and copying.
+      if (spilled_source_h) c.handle = spilled_source_h;
       c.pos0 = std::max(0, q - 3);
       c.n = n - c.pos0;
       if (v.size() > (size_t)kMaxOps) die("serve: %zu state operations for one command", v.size());
@@ -1155,6 +1242,7 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (disk_source.h) state({{kStFree, disk_source.h, 0, 0}});
       if (!f.rq.spans.empty()) images(f.rq);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }

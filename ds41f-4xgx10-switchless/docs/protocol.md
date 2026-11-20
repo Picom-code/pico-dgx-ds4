@@ -118,6 +118,13 @@ DESIGN decision 6: a new turn continues from the state its conversation left beh
   for sessions it will not name again. `prefix_hint` is what the front-end believes is reusable; it
   is for logging and need not be trusted.
 
+For ordinary text forks, `DSGB10_ORDINARY_TEXT_SPILLED_ALTERNATES=1` lets rank 0 consider
+spilled window snapshots from the same frontend connection. The option defaults off.
+The selected disk snapshot must match the submitted token IDs and skip at least
+8,192 more tokens than the current plan, including any resident alternate already selected.
+Rank 0 attempts one snapshot. If a rank cannot stage it, the current plan remains available.
+The source stays in the existing spill tier and keeps its regular eviction policy after use.
+
 How the front-end picks the session and the token ids (frontend/src/session.rs):
 
 1. The prompt is rendered to text with the chat encoding. Clients such as pi send no session id,

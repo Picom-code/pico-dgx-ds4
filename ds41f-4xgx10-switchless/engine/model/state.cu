@@ -471,6 +471,68 @@ void Model::Impl::state_spill(int h) {
                 1e3 * (wall_s() - t0));
 }
 
+bool Model::Impl::state_stage_spilled_snapshot(int source, int fresh, int snap) {
+  Store& s = store_of();
+  if (source <= 0 || fresh <= 0 || s.sess.count(fresh) || !s.disk || !s.pool.base ||
+      snap < kSnapRows || snap > opt.max_ctx) return false;
+  const auto it = s.sess.find(source);
+  if (it == s.sess.end() || !it->second.disk) return false;
+  const Store::Sess& src = it->second;
+  const int saved = snap & ~1;  // an odd window restarts one position earlier
+  const size_t pages = (saved - 1) / kPagePos + 1;
+  const auto window = src.dsnaps.find(snap);
+  if (saved > src.saved || pages > src.dpages.size() || window == src.dsnaps.end()) return false;
+  const size_t window_bytes = snap_bytes(spec != nullptr);
+  const size_t bytes = pages * Pool::round(kPageBytes) + Pool::round(window_bytes);
+  // Optional work must leave the incumbent plan available while the spill writer catches up.
+  if (bytes > s.pool.size - s.bytes || !s.disk->is_written(src.dseq)) return false;
+
+  // Reserve the destination without store_alloc: pressure here must never evict
+  // a resident fallback or change the source's disk blocks.
+  Store::Sess staged;
+  staged.pages.reserve(pages);
+  auto take = [&](size_t n) {
+    auto* ptr = s.pool.take(n);
+    if (ptr) s.bytes += Pool::round(n);
+    return ptr;
+  };
+  auto release = [&] {
+    for (auto* page : staged.pages) store_release(page, kPageBytes);
+    for (const auto& [pos, ptr] : staged.snaps) store_release(ptr, window_bytes);
+    return false;
+  };
+  for (size_t i = 0; i < pages; ++i) {
+    auto* page = take(kPageBytes);
+    if (!page) return release();
+    staged.pages.push_back(page);
+  }
+  auto* target = take(window_bytes);
+  if (!target) return release();
+  staged.snaps.emplace(snap, target);
+
+  auto read = [&](void* dst, size_t n, size_t off) {
+    if (!s.disk->try_read(dst, n, off, st)) return false;
+    sum_block(dst, n, s.disk->sum(off, true), st);
+    return true;
+  };
+  size_t copied = 0;
+  while (copied < pages && read(staged.pages[copied], kPageBytes, src.dpages[copied])) ++copied;
+  const bool window_copied = copied == pages && read(target, window_bytes, window->second);
+  CUDA_CHECK(cudaStreamSynchronize(st));  // finish any queued copies before verifying or releasing blocks
+  if (!window_copied) return release();
+  const auto valid = [&](size_t off) { return *s.disk->sum(off, true) == *s.disk->sum(off, false); };
+  for (size_t i = 0; i < pages; ++i)
+    if (!valid(src.dpages[i])) return release();
+  if (!valid(window->second)) return release();
+
+  // Encoder-only validity is carried by the server's snapshot metadata. This
+  // is still a text handle so the selected window can be copied into its fork.
+  staged.saved = saved;
+  staged.used = s.clock;
+  s.sess.emplace(fresh, std::move(staged));
+  return true;
+}
+
 // Session h back from the disk tier (after its writes), as far as the store has room: pages in order
 // (saved shrinks to what came back), the end snapshot, then window snapshots from the latest down; what
 // does not fit is dropped, as a save that finds no room would. Every block that comes back is checked
@@ -835,6 +897,9 @@ size_t Model::state_disk_bytes() const { return d_->store_s ? d_->store_s->dbyte
 std::string Model::state_disk_path() const { return d_->store_s && d_->store_s->disk ? d_->store_s->disk->path() : ""; }
 void Model::state_spill(int h) { d_->state_spill(h); }
 void Model::state_unspill(int h) { d_->state_unspill(h); }
+bool Model::state_stage_spilled_snapshot(int source, int fresh, int snap) {
+  return d_->state_stage_spilled_snapshot(source, fresh, snap);
+}
 Model::StateInfo Model::state_info(int h) const {
   StateInfo r;
   if (!d_->store_s) return r;

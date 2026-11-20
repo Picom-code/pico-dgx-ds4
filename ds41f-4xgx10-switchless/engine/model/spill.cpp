@@ -28,14 +28,18 @@ void mkdirs(const std::string& dir) {
     }
 }
 
-void io_all(bool wr, int fd, uint8_t* buf, size_t n, size_t off, const std::string& path) {
+bool io_all(bool wr, int fd, uint8_t* buf, size_t n, size_t off, const std::string& path, bool optional = false) {
   while (n) {
     const ssize_t r = wr ? pwrite(fd, buf, n, (off_t)off) : pread(fd, buf, n, (off_t)off);
     if (r < 0 && errno == EINTR) continue;
-    if (r <= 0) die("spill: %s %zu bytes at %zu of %s: %s", wr ? "write" : "read", n, off, path.c_str(),
-                    r < 0 ? std::strerror(errno) : "end of file");
+    if (r <= 0) {
+      if (optional) return false;
+      die("spill: %s %zu bytes at %zu of %s: %s", wr ? "write" : "read", n, off, path.c_str(),
+          r < 0 ? std::strerror(errno) : "end of file");
+    }
     buf += r, off += (size_t)r, n -= (size_t)r;
   }
+  return true;
 }
 
 }  // namespace
@@ -157,6 +161,11 @@ void SpillFile::wait(uint64_t seq) {
   cv_.wait(l, [&] { return done_ >= seq; });
 }
 
+bool SpillFile::is_written(uint64_t seq) {
+  const std::lock_guard<std::mutex> lock(mu_);
+  return done_ >= seq;
+}
+
 void SpillFile::sync() {
   if (!pending_.empty()) die("spill: a sync with writes not yet flushed");
   wait(seq_);
@@ -164,15 +173,27 @@ void SpillFile::sync() {
 }
 
 void SpillFile::read(void* dst, size_t bytes, size_t off, cudaStream_t st) {
+  read_block(dst, bytes, off, st, false);
+}
+
+bool SpillFile::try_read(void* dst, size_t bytes, size_t off, cudaStream_t st) {
+  return read_block(dst, bytes, off, st, true);
+}
+
+bool SpillFile::read_block(void* dst, size_t bytes, size_t off, cudaStream_t st, bool optional) {
   const size_t n = Pool::round(bytes);
-  if (n > kReadBuf || off + n > size_) die("spill: a read of %zu bytes at %zu", n, off);
+  if (!n || bytes > kReadBuf || off % kPoolGrain || off > size_ || n > size_ - off) {
+    if (optional) return false;
+    die("spill: a read of %zu bytes at %zu", n, off);
+  }
   const int b = rnext_;
   rnext_ ^= 1;
   CUDA_CHECK(cudaEventSynchronize(rev_[b]));  // its last copy has left the buffer
-  io_all(false, fd_, rbuf_[b], n, off, path_);
+  if (!io_all(false, fd_, rbuf_[b], n, off, path_, optional)) return false;
   CUDA_CHECK(cudaMemcpyAsync(dst, rbuf_[b], n, cudaMemcpyHostToDevice, st));
   CUDA_CHECK(cudaEventRecord(rev_[b], st));
   if (!direct_) posix_fadvise(fd_, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
+  return true;
 }
 
 void SpillFile::writer() {
