@@ -1138,7 +1138,7 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx, bool cg) {
   for (int b = 0; b < pb + xbodies; ++b) {  // body b: b + 1 rows, or a wide bucket's rows (pad rows past the step's)
     const int R = b >= pb ? xrows[b - pb] : b < kDecodeRows ? b + 1 : ops::wide_bucket_rows(b - kDecodeRows);
     CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[b], nullptr, nullptr, 0, mode));
-    g_xbody = b >= pb;  // copy drafts: the exact kernels (DSGB10_NORM_EXACT, DSGB10_WIDE_EXACT) in these bodies only
+    g_xbody = b >= pb;  // copy drafts: the exact wide kernels in these bodies only (norm_nt)
     g_ctail = copyt;
     forward_rows(R, ctx, 0, nullptr, 0);
     g_xbody = false, g_ctail = false;
