@@ -56,6 +56,8 @@ their own:
 - `DSGB10_NORM_EXACT=1` and `DSGB10_WIDE_EXACT=95` select the exact kernels and, with the mask set, act in those
   bodies ONLY: the RMSNorm sums in the fused kernels' order, and every family of the step (attention GEMMs, wo_a +
   wo_b, gate, MoE, Engram) runs row-group kernels that keep the decode kernels' arithmetic and read each weight once.
+  The one exception: `DSGB10_NORM_EXACT` also acts in the batch graph's steps of 9..16 rows, so a session decoded
+  beside others keeps the rows it gets alone (issue #18).
 - The layout (`spec_batch.h copy_fit`, the same function on device and host) keeps a one-request step to row counts
   that have an exact body: at most 8 rows, or a bucket of the mask. With mask 136 a copy grows 8 -> 32 -> 64 rows and
   a one-request step of 9..16 rows never runs.
@@ -91,7 +93,7 @@ Engine (`--setenv`, the same on every rank). "served" is the value in the README
 | `DSGB10_COPY_SW` | 0 | 1 | cheap changes of step kind (above) |
 | `DSGB10_COPY_DELTA` | 0 | 1 | the prompt's delta to the other ranks (above) |
 | `DSGB10_EXACT_SOLO` | 0 | 136 | mask of wide buckets with an exact body for one-request steps (136 = 32 and 64 rows) |
-| `DSGB10_NORM_EXACT` | 0 | 1 | RMSNorm in the fused kernels' order (with the mask: in the exact bodies only) |
+| `DSGB10_NORM_EXACT` | 0 | 1 | RMSNorm in the fused kernels' order (with the mask: in the exact bodies and in steps of 9..16 rows) |
 | `DSGB10_WIDE_EXACT` | 0 | 95 | bits 1 attention GEMMs, 2 wo_a + wo_b, 4 gate, 8 MoE, 16 Engram through the decode kernels' arithmetic; + 64: the row-group kernels (each weight read once) |
 | `DSGB10_WIDE_EXACT_MT` | 1 | 2 | wo_b's row-group kernel with two tiles of weight rows per warp (the same bits) |
 | `DSGB10_COPY_LOG` | 0 | 1 | a `copy:` line per request that ran alone, in rank 0's log |

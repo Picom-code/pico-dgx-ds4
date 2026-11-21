@@ -59,8 +59,9 @@ __global__ void route_rotate(float* gl, int shift, int group) {
 // gets a second body for each of those buckets, captured with DSGB10_NORM_EXACT / DSGB10_WIDE_EXACT in force
 // (g_xbody), and a step takes it when all its rows are ONE entry's and it is wide (17+ rows): a copy step of a request
 // that decodes alone (without copy drafts one entry never has more than kSessTok rows). Every other step (1..16
-// rows, or two or more entries) runs the bodies and kernels of before, bit for bit; DSGB10_NORM_EXACT and
-// DSGB10_WIDE_EXACT then act in the solo bodies only. 0 / unset: no extra body, the two variables act as before.
+// rows, or two or more entries) runs the bodies and kernels of before, bit for bit; DSGB10_WIDE_EXACT then acts in the
+// solo bodies only, and DSGB10_NORM_EXACT in the solo bodies and in steps of 9..16 rows (norm_nt). 0 / unset: no extra
+// body, the two variables act as before.
 namespace detail {
 bool g_xbody = false;
 bool g_ctail = false;
@@ -162,7 +163,9 @@ int wide_mt() {
 // its norm, and the fused order costs it about 2 % (64 CTAs of 256 threads instead of 640).
 int norm_nt(const dsk::GemvCfg& c, int R) {
   static const bool on = getenv("DSGB10_NORM_EXACT") && atoi(getenv("DSGB10_NORM_EXACT"));
-  if (exact_solo() && !g_xbody) return 0;  // copy drafts: the solo bodies only
+  // copy drafts: a plain wide step keeps D / 8 (the solo bodies only); a 9..16-row step of several entries still takes
+  // the fused order, or its rows differ from those of the same sessions alone (issue #18)
+  if (exact_solo() && !g_xbody && R > kDecodeRows) return 0;
   return on && (R <= kDecodeRows || wide_exact()) ? 32 * c.wn * c.wk : 0;
 }
 // exact: DSGB10_R16_EXACT=bits runs parts of a 9..16-row step through the kernels of a step of at most 8 rows, in two
