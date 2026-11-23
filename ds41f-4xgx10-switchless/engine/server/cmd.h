@@ -39,8 +39,9 @@ enum : int32_t {
   kStDropSnap,     // state_drop_snap(h, a)
   kStSnap,         // state_snap(h, a)
   kStSpill,        // state_spill(h)
-  kStUnspill,      // state_unspill(h)
+  kStUnspill,      // state_unspill(h, a, b): replay limit and preferred snapshot (-1 when absent)
   kStKeep,         // state_keep(gen): a planned stop's kept sessions (gen = a | b << 32)
+  kStUnspillWindowFirst,  // as kStUnspill, with the preferred window ahead of the end snapshot
 };
 struct StateOp {
   int32_t op = 0, h = -1, a = 0, b = 0;

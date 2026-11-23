@@ -446,7 +446,8 @@ constexpr int kNever = 1 << 30;       // Session::dec_lo of rings that are valid
 // the end re-prefills at most d / 3 positions from the snapshot below it (at most a third of what the
 // client dropped), and a session holds O(log E) snapshots (28 at 250k positions, not 245). As E grows
 // the multiples coarsen, so a snapshot dropped once is never wanted again.
-bool keep_snap(int s, int E, int every) {
+bool keep_snap(int s, int E, int every, bool keep_early = false) {
+  if (keep_early && s == 4ll * every) return true;
   const int64_t d = (int64_t)E - s, dense = 8ll * every;
   if (d < dense) return true;
   int64_t g = 2ll * every;
@@ -771,7 +772,7 @@ class Server {
   void thin(Session& s) {
     if (!o_.snap_thin) return;
     const int E = (int)s.hist.size();
-    auto gone = [&](int sn) { return sn != s.pe_snap && !keep_snap(sn, E, o_.snap_every); };
+    auto gone = [&](int sn) { return sn != s.pe_snap && !keep_snap(sn, E, o_.snap_every, o_.keep_early_snapshot); };
     std::vector<StateOp> v;
     for (const int sn : m_.state_info(s.h).snaps)
       if (gone(sn)) v.push_back({kStDropSnap, s.h, sn, 0});
@@ -823,7 +824,7 @@ class Server {
   }
   // A request's session (or a fork's base) that was spilled comes back to the store before its plan
   // sees it. The slots' sessions stay where they are (every command pins them).
-  void unspill(const fe::SubmitHeader& h) {
+  void unspill(const fe::SubmitHeader& h, const std::vector<int32_t>& prompt, bool text) {
     Session* x = find(h.session_id);
     uint64_t id = h.session_id;
     if (!x && h.base_session_id) x = find(h.base_session_id), id = h.base_session_id;
@@ -831,10 +832,21 @@ class Server {
     const model::Model::StateInfo si = m_.state_info(x->h);
     if (!si.on_disk) return;
     const double t0 = now_s();
-    state({{kStUnspill, x->h, 0, 0}});
+    // A window before this limit can seed replay even if it contains encoder rings only.
+    int window_limit = -1;
+    Plan window;
+    bool window_first = false;
+    if (text && std::find(x->hist.begin(), x->hist.end(), fe::kImageTokenId) == x->hist.end()) {
+      const int n = (int)prompt.size();
+      const int common = std::min(lcp(x->hist, prompt), n - 1);
+      window_limit = std::min(common, n - (o_.ced ? kReplay : 1));
+      const Plan desired = choose(*x, false, common, n, &window);
+      window_first = desired.how == kSnap;
+    }
+    state({{window_first ? kStUnspillWindowFirst : kStUnspill, x->h, window_limit, window.snap}});
     m_.drain();
-    std::printf("serve: session %016llx back from disk: %.1f MiB, %zu positions, in %.1f ms\n", (unsigned long long)id,
-                si.disk_bytes / 1048576.0, x->hist.size(), 1e3 * (now_s() - t0));
+    std::printf("serve: session %016llx restored %.1f of %.1f MiB from disk, %zu positions, in %.1f ms\n", (unsigned long long)id,
+                m_.state_info(x->h).bytes / 1048576.0, si.disk_bytes / 1048576.0, x->hist.size(), 1e3 * (now_s() - t0));
     forget_evicted();
   }
 
@@ -852,7 +864,7 @@ class Server {
 
   // The restart point for continuing session s (its state live or stored) after a common prefix of p,
   // for a prompt of n positions.
-  Plan choose(const Session& s, bool live, int p, int n) const {
+  Plan choose(const Session& s, bool live, int p, int n, Plan* best_window = nullptr) const {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
     p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
@@ -885,8 +897,10 @@ class Server {
     if (info.end_pos >= 0) consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
     for (const int sn : info.snaps) {
       const int q = sn & 1 ? sn - 1 : sn;
-      if (q <= p && usable(q, std::find(s.enc_snaps.begin(), s.enc_snaps.end(), sn) == s.enc_snaps.end()))
+      if (q <= p && usable(q, std::find(s.enc_snaps.begin(), s.enc_snaps.end(), sn) == s.enc_snaps.end())) {
         consider(q, kSnap, sn);
+        if (best_window && q > best_window->q) *best_window = Plan{q, kSnap, sn};
+      }
     }
     return best;
   }
@@ -1007,7 +1021,7 @@ class Server {
     Turn resumed;
     Turn& tu = resume ? resumed : f.tu;  // the log splits a request's first run
     forget_evicted();
-    unspill(h);
+    unspill(h, prompt, f.rq.spans.empty());
 
     // ---- the slot, where the state comes from, and from which position on it is computed
     Session* S = find(h.session_id);
@@ -1175,7 +1189,8 @@ class Server {
       c.sp = f.sp;
       c.handle = S->h;
       for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
-        if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
+        if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin ||
+            keep_snap(sn, n, o_.snap_every, o_.keep_early_snapshot && f.rq.spans.empty())))
           c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
       wd_.started = now_s();
       bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)

@@ -335,7 +335,7 @@ class Model {
   size_t state_disk_bytes() const;  // the file's bytes in spilled sessions
   std::string state_disk_path() const;
   void state_spill(int h);    // session h's state to the disk tier (freed without one: state_evicted)
-  void state_unspill(int h);  // and back
+  void state_unspill(int h, int window_limit = -1, int preferred_snap = -1, bool window_first = false);  // and back; optional deepest useful replay window
   struct StateInfo {
     int saved = 0;           // compressed caches of positions [0, saved) are kept
     int end_pos = -1;        // the end snapshot's position (-1: none)
