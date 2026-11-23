@@ -25,6 +25,11 @@ struct ServeOptions {
                                    // decoding and is prefilled; while more of them decode than there are
                                    // slots (Model::slots), they take turns of this many tokens. 0: no turns
                                    // (a request that would need the slot of another in flight waits)
+  int interleave_pct = 0;          // a new request's prefill, chunk by chunk: after each of its chunks the
+                                   // requests it paused (those live in their slots) decode for this many per
+                                   // cent of the time that chunk took, so a long prefill no longer stops every
+                                   // other session for its whole length and the two share the wall clock
+                                   // instead. 50: half each. 0: prefill first, the whole prompt (upstream)
   // Kept sessions (docs/engine.md): a planned stop (SIGTERM) spills the sessions in device memory to the
   // disk tier, the most recently used first, up to keep_bytes (0: nothing is kept), and writes every
   // kept session's history to keep_index (beside the disk tier's files); the next start takes them back

@@ -299,6 +299,8 @@ struct Args {
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): the one-session draft of every entry after the batch
                               // step's pass over them, and the words that differ, printed by --mode batch
   int slice = 64;  // serve: time-slicing's turns, in tokens (0: none)
+  int interleave_pct = 0;  // serve: the per cent of a prefill chunk's time the paused requests decode after it
+                           // (50: half; 0: none)
   bool snap_all = false;
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
@@ -394,6 +396,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--batch-tf") a.batch_tf = true;
     else if (s == "--batch-rows") a.batch_rows = std::atoi(val().c_str());
     else if (s == "--slice") a.slice = std::atoi(val().c_str());
+    else if (s == "--interleave-pct") a.interleave_pct = std::atoi(val().c_str());
     else if (s == "--snap-all") a.snap_all = true;
     else if (s == "--small-rows") a.small_rows = std::atoi(val().c_str());
     else if (s == "--ring-cap") a.ring_cap = std::strtoull(val().c_str(), nullptr, 10);
@@ -445,6 +448,7 @@ Args parse(int argc, char** argv) {
     die("--disk-tag: at most 32 of a-z, 0-9, _ and -");
   if (a.keep_gib < 0 || !(a.keep_days > 0)) die("--keep-gib must be >= 0 and --keep-days > 0");
   if (a.slice < 0) die("--slice must be >= 0");
+  if (a.interleave_pct < 0 || a.interleave_pct > 100) die("--interleave-pct must be 0..100");
   // this box's rank and files: the fleet file's, unless given
   const comm::Fleet& fl = comm::fleet(a.fleet);
   if (a.rank < 0) a.rank = comm::rank_from_hostname(a.fleet);
@@ -762,6 +766,7 @@ int main(int argc, char** argv) {
     so.small_rows = a.small_rows;
     so.snap_every = a.snap_every;
     so.slice = a.slice;
+    so.interleave_pct = a.interleave_pct;
     so.snap_thin = !a.snap_all;
     so.budget = (size_t)(a.session_gib * 1073741824.0);
     so.keep_index = disk_dir + "/server" + disk_tag + ".index";

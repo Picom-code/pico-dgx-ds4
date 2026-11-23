@@ -654,6 +654,19 @@ the design, steps B1 and B2).
   and the tokens sent so far, restarted at its end snapshot (one row, ~25 ms, the state's load
   included). With `--slice 0` there are no turns: a request that would need the slot of another
   request in flight waits until one ends.
+- **Prefill interleave.** `--interleave-pct N` (0, off) makes a new request's prefill share the wall
+  clock with the requests it paused: after each chunk, the requests live in their own slots decode for
+  N per cent of the time that chunk took, then wait again in the same order. 50 is half each. A fixed
+  number of tokens per gap was the first shape of this and is the wrong knob -- 16 tokens a session
+  paid a whole second or more per chunk on a busy fleet and stretched a long prefill several times
+  over -- so the budget is the chunk's own clock, whatever the load. The gaps are decode-only: every
+  command selects its own slot, Engram history is per slot, decode reads neither the prefill's buffers
+  nor its image spans, and `evict()`/`pick_slot()` leave the session in flight alone. A brand-new
+  request arriving mid-prefill still waits for it, since a nested prefill would share the prefill
+  buffers and the image spans. The request's line adds `prefill interleaved: G gaps, S s for P% of the
+  chunks' time, T tokens of the paused requests`. Measured at a fixed token budget (16 a session): a
+  105k-token cold prefill no longer silenced a decoding session for its whole 28 s (longest gap
+  3.2 s), and greedy output was byte-identical with and without it.
 - **Exact.** Every row computes what it would alone, and the sampler's noise is a function of the seed
   and the position. A request therefore gives the same tokens and log-probabilities batched, sliced,
   resumed or alone. [slice_test.py](../engine/server/tests/slice_test.py) and
