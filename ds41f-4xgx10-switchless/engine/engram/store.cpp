@@ -10,8 +10,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -446,12 +448,35 @@ struct Store::Impl {
     retire();
   }
 
+  // StoreConfig::iowq_avoid: the io-wq mask, applied once, after this thread's first submit
+  cpu_set_t iowq_mask;
+  std::string iowq_list;
+  bool iowq_pending = false;
+  void iowq_set() {
+    iowq_pending = false;
+    const int r = ring->iowq_affinity(iowq_mask);
+    if (r == 0) std::fprintf(stderr, "engram: rank %d: worker on CPU %d, io-wq workers on CPUs %s\n", cfg.rank, cfg.cpu, iowq_list.c_str());
+    else std::fprintf(stderr, "engram: rank %d: io-wq affinity not set (%s); its workers share CPU %d\n", cfg.rank, strerror(-r), cfg.cpu);
+  }
+
   void run() {
     if (cfg.cpu >= 0) {
       cpu_set_t set;
       CPU_ZERO(&set);
       CPU_SET(cfg.cpu, &set);
       pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+      // the io-wq workers off cfg.cpu (StoreConfig::iowq_avoid): measured on GB10 + ZFS, 1 KiB O_DIRECT
+      // random reads at depth 128 give 19.5k/s with every worker on one CPU and 241k/s across the rest.
+      // The mask goes on after this thread's first submit (iowq_set): the ring was made on another thread,
+      // and the kernel has no io-wq for this one until it submits (before that: EINVAL, measured).
+      CPU_ZERO(&iowq_mask);
+      const long n = sysconf(_SC_NPROCESSORS_ONLN);
+      for (int c = 0; c < n && c < CPU_SETSIZE; ++c) {
+        if (c == cfg.cpu || std::find(cfg.iowq_avoid.begin(), cfg.iowq_avoid.end(), c) != cfg.iowq_avoid.end()) continue;
+        CPU_SET(c, &iowq_mask);
+        iowq_list += (iowq_list.empty() ? "" : ",") + std::to_string(c);
+      }
+      iowq_pending = CPU_COUNT(&iowq_mask) > 0;
     }
     const uint64_t spin_ns = cfg.spin_us < 0 ? ~uint64_t(0) : uint64_t(cfg.spin_us) * 1000;
     const uint64_t ka_ns = uint64_t(cfg.keepalive_ms < 0 ? 0 : cfg.keepalive_ms) * 1000000;
@@ -461,6 +486,7 @@ struct Store::Impl {
       bool did = scan();
       if (issue()) {
         ring->submit();
+        if (iowq_pending) iowq_set();
         did = true;
       }
       did |= reap();
@@ -479,11 +505,13 @@ struct Store::Impl {
       if (ka_ns && !ka_inflight && !n_inflight_reads && t - last_io >= ka_ns) {
         keepalive();
         ring->submit();
+        if (iowq_pending) iowq_set();
         continue;
       }
       if (t - last < spin_ns) continue;  // spin: lowest latency for the next request or completion
       if (n_inflight_reads) {
         ring->submit(1);  // block until a read completes
+        if (iowq_pending) iowq_set();
         continue;
       }
       // idle: sleep until submit() wakes us or the next keep-alive read is due

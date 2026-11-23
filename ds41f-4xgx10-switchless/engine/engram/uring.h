@@ -2,6 +2,7 @@
 // One thread owns a ring. SQEs are used in ring order, so the SQ index array is the identity.
 #pragma once
 #include <linux/io_uring.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -65,6 +66,13 @@ class Uring {
   void register_buffers(const iovec* iov, unsigned n) {
     if (syscall(__NR_io_uring_register, fd_, IORING_REGISTER_BUFFERS, iov, n) < 0)
       die("io_uring register buffers: %s", strerror(errno));
+  }
+
+  // The CPUs of this ring's io-wq workers (IORING_REGISTER_IOWQ_AFF, Linux 5.14+): the workers that run
+  // the reads the kernel cannot issue inline. Without a ring of SQPOLL they belong to the submitting
+  // thread, so call it from that thread. Returns -errno.
+  int iowq_affinity(const cpu_set_t& set) {
+    return syscall(__NR_io_uring_register, fd_, IORING_REGISTER_IOWQ_AFF, &set, sizeof(set)) < 0 ? -errno : 0;
   }
 
   // The next free SQE, zeroed, or nullptr when the ring is full.

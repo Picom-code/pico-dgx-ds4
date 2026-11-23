@@ -653,6 +653,8 @@ int main(int argc, char** argv) {
     sc.shard[0] = a.shard[0];
     sc.shard[1] = a.shard[1];
     sc.cpu = 9;
+    sc.iowq_avoid = {5, 6, 12, 15};  // the ring proxies (comm::Options::proxy_cpu, the probe ring's), serve's
+                                     // I/O threads (serve.cpp kIoCpu) and the main thread (pin_self below)
     sc.cache_bytes = (size_t)a.engram_cache_mib << 20;
     sc.read_batch = a.engram_read_batch;  // the fleet file's, for this rank's SSD
     store = std::make_unique<engram::Store>(sc, *emap);

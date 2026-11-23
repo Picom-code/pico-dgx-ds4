@@ -117,6 +117,18 @@ handled in the store without root:
    states, which gave rank 0 a ~1.1 ms p99 for steps that read. Now, whenever 5 ms pass without a
    read (`keepalive_ms`), the worker reads one random record, waking from its sleep to do so. That
    is 200 reads/s, about 100 KB/s.
+4. **The io-wq workers.** A read the kernel cannot issue inline does not run on the submitting
+   thread: io_uring hands it to an io-wq worker, and those inherit the submitter's affinity, so with
+   the worker pinned to one core every such read runs on that core too, sharing it with the spin.
+   Filesystems differ in whether that path is taken at all: ext4 issues the read inline, ZFS (no
+   `IOCB_NOWAIT`) never does. The store therefore sets `IORING_REGISTER_IOWQ_AFF` -- after its first
+   submit, since the ring was made on another thread and the kernel has no io-wq for this one before
+   that (`EINVAL`, measured) -- to every online CPU that the engine's other pinned threads do not
+   hold (`StoreConfig::iowq_avoid`). On ZFS this took 1 KiB O_DIRECT random reads at depth 128 from
+   19.5k/s to 241k/s, and cold (never-seen) prefill from ~4.7k to ~9.35k tok/s; on ext4 the variable
+   is set and nothing uses it. The engine logs the mask it applied at start:
+   `engram: rank N: worker on CPU 9, io-wq workers on CPUs ...`.
+
 3. **Interrupt coalescing on the PM9C1a (ranks 2, 3).** The drive signals a completion once 8 are
    pending or 200 µs have passed, so 1–7 reads take 200 µs (p50 199.8 µs at queue depths 1, 2 and
    4). With `read_batch` = 8, whenever the worker has nothing more to issue, it rounds the reads
