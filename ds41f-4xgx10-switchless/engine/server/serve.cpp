@@ -439,6 +439,9 @@ struct SrvHeader {
 
 constexpr int kReplay = 128;          // CED's decoder replay
 constexpr int kNever = 1 << 30;       // Session::dec_lo of rings that are valid nowhere
+// The tokens each paused request decodes in one round of an interleaved prefill's gap (interleave_round):
+// a few, so a command's overhead is amortised and the gap's budget is spent to within one round.
+constexpr int kInterleaveSlice = 4;
 
 // The window snapshots a session keeps, by their distance d from its history's end E: every one (each
 // `every` positions) while d < 8 * every; further back those at multiples of every * 2^k, k = 1, 2, ...
@@ -1161,6 +1164,8 @@ class Server {
     model::SampleOut first{};
     int first_row = 0;
     bool cancelled = false;
+    int gaps = 0, gap_tokens = 0;
+    double gap_s = 0;
     while (pos < n) {
       if (Io::cancelled(f.rq)) {
         cancelled = true;
@@ -1177,6 +1182,12 @@ class Server {
       for (int sn = (pos / o_.snap_every + 1) * o_.snap_every; sn <= pos + R; sn += o_.snap_every)
         if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
           c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
+      // interleave: after this chunk, the requests it paused decode for a share of the time this chunk took
+      // before the next one starts. Only a request's first run (a resume is one row), only between two full
+      // chunks, and the next chunk's Engram rows are not looked up ahead: the gap's decode steps would queue
+      // behind them in the store.
+      const bool gap = !resume && o_.interleave_pct > 0 && !last && R == o_.prefill_rows && gap_ready(s);
+      const double t_chunk = now_s();
       wd_.started = now_s();
       bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
       for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
@@ -1198,6 +1209,7 @@ class Server {
         c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
         const int rest = n - pos - R;
         c.next = rest > o_.small_rows || ((ced || !step_ok) && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
+        if (gap) c.next = 0;
         for (int i = 0; i < c.n_snaps; ++i)
           if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
         issue(c);
@@ -1212,7 +1224,16 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+      if (gap) {
+        const double tg = now_s();
+        gap_tokens += interleave(s, tg - t_chunk);
+        gap_s += now_s() - tg, ++gaps;
+      }
     }
+    if (gaps)
+      std::printf("serve: req %llu prefill interleaved: %d gaps, %.2f s for %d%% of the chunks' time, %d tokens of "
+                  "the paused requests\n",
+                  (unsigned long long)h.req_id, gaps, gap_s, o_.interleave_pct, gap_tokens);
     if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
       Cmd c{};
       c.op = kCmdImages;
@@ -1259,6 +1280,77 @@ class Server {
     if ((int)f.out.size() >= (int)h.max_new_tokens) return ended(f, fe::kLength);
     return true;
   }
+
+  // Interleave (Options::interleave_pct): whether a request waiting in turn is live in a slot other than s, the
+  // slot of the prefill in progress, so that it can decode in the gap without any state moving.
+  bool gap_ready(int s) const {
+    for (const Flight& g : rot_) {
+      const auto it = sess_.find(g.rq.h.session_id);
+      if (it != sess_.end() && it->second.slot >= 0 && it->second.slot != s && fits(it->second.slot, need_clamped(g.rq)))
+        return true;
+    }
+    return false;
+  }
+  // One round of the gap in slot s: the requests at the front of the turns that are live in their own
+  // slots decode up to kInterleaveSlice tokens each, together (batch_loop) or one alone, then wait again in
+  // the same order.
+  // Nothing is restored or evicted for them (a request whose session lost its slot waits for the
+  // prefill's end, as before), the prefill's session is in flight (evict() and pick_slot() leave it
+  // alone), and every command selects its own slot, so the prefill's chunks go on in slot s with its
+  // history, rings and caches as the chunk before left them. A new request arriving in the gap pauses it
+  // (the decode loops' own check) and is admitted once this prefill has its first token.
+  // Returns the tokens decoded.
+  int interleave_round(int s) {
+    std::vector<Flight> fl;
+    std::deque<Flight> skip;
+    while (!rot_.empty() && fl.size() + 1 < slot_.size()) {
+      Flight g = std::move(rot_.front());
+      rot_.pop_front();
+      const auto it = sess_.find(g.rq.h.session_id);
+      const bool live = it != sess_.end() && it->second.slot >= 0 && it->second.slot != s &&
+                        fits(it->second.slot, need_clamped(g.rq));
+      if (live) fl.push_back(std::move(g));
+      else skip.push_back(std::move(g));
+    }
+    for (auto it = skip.rbegin(); it != skip.rend(); ++it) rot_.push_front(std::move(*it));
+    if (fl.empty()) return 0;
+    const double t = now_s();
+    std::vector<size_t> before(fl.size());
+    for (size_t k = 0; k < fl.size(); ++k) fl[k].paused_s += t - fl[k].t_paused, before[k] = fl[k].out.size();
+    std::vector<uint32_t> why(fl.size());
+    turn_cap_ = kInterleaveSlice;
+    if (fl.size() == 1) why[0] = decode_one(fl[0], true);
+    else decode_batch(fl, true, why);
+    turn_cap_ = 0;
+    int tokens = 0;
+    std::vector<Flight> back;
+    for (size_t k = 0; k < fl.size(); ++k) {
+      tokens += (int)(fl[k].out.size() - before[k]);
+      fl[k].t_paused = now_s();
+      if (why[k] == kPaused || why[k] == kTurn) back.push_back(std::move(fl[k]));
+      else finish(fl[k], why[k]);
+    }
+    for (auto it = back.rbegin(); it != back.rend(); ++it) rot_.push_front(std::move(*it));
+    return tokens;
+  }
+
+  // The gap between two chunks of the prefill in slot s: rounds of interleave_round() until the paused
+  // requests have had o_.interleave_pct per cent of the time that chunk took, so the prefill and the
+  // sessions it paused share the wall clock at that ratio (50: half each) instead of the gap being a fixed
+  // number of tokens, which paid a whole second or more per chunk on a busy fleet and stretched a long
+  // prefill several times over. A round is a few tokens each, so the budget is spent to within a step; a
+  // round that decodes nothing (every paused request finished, or a new arrival paused them again) ends
+  // the gap. Returns the tokens decoded.
+  int interleave(int s, double chunk_s) {
+    const double t_end = now_s() + o_.interleave_pct * 0.01 * chunk_s;
+    int tokens = 0;
+    for (;;) {
+      const int got = interleave_round(s);
+      tokens += got;
+      if (got == 0 || now_s() >= t_end) return tokens;
+    }
+  }
+
 
   // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
   void images(const Request& rq) {
@@ -1387,7 +1479,9 @@ class Server {
     c.pos0 = pos;
     c.tokens[0] = f.out.back();
     c.sp = f.sp;
-    c.max_new = turns ? std::min(left, o_.slice) : left;  // a turn while others wait for a slot
+    c.max_new = turn_cap_ > 0  ? std::min(left, turn_cap_)  // a gap between a prefill's chunks (interleave)
+                : turns        ? std::min(left, o_.slice)   // a turn while others wait for a slot
+                               : left;
     c.limit = m_.slot_ctx(S->slot);
     c.n_stop = (int)f.rq.stop.size();
     std::copy(f.rq.stop.begin(), f.rq.stop.end(), c.stop);
@@ -1457,7 +1551,9 @@ class Server {
       BatchEntry& x = e[k];
       x.slot = S[k]->slot, x.handle = S[k]->h, x.pos0 = pos, x.token = f.out.back();
       const int left = (int)f.rq.h.max_new_tokens - (int)f.out.size();
-      x.max_new = turns ? std::min(left, o_.slice) : left;  // a turn while others wait for a slot
+      x.max_new = turn_cap_ > 0  ? std::min(left, turn_cap_)  // a gap between a prefill's chunks (interleave)
+                  : turns        ? std::min(left, o_.slice)   // a turn while others wait for a slot
+                                 : left;
       x.limit = m_.slot_ctx(S[k]->slot), x.snap_every = o_.snap_every;
       x.n_stop = (int)f.rq.stop.size();
       std::copy(f.rq.stop.begin(), f.rq.stop.end(), x.stop);
@@ -1682,6 +1778,7 @@ class Server {
   std::map<uint64_t, Session> sess_;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
+  int turn_cap_ = 0;            // > 0 while interleave_round() runs: the tokens each request decodes in a round
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;
                                              // those waiting for a slot
   std::set<uint64_t> flying_, later_;  // the sessions in flight; RELEASEs of them, applied at their end

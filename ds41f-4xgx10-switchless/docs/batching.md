@@ -32,7 +32,8 @@ any kernel was written. When it was written the engine ran one request at a time
     - A request's drafter windows miss the positions it decoded in a batch. When it goes on alone, its
       first drafts see stale windows: they are still verified, so only acceptance suffers, until the
       windows fill again.
-    - The 2,048-row prefill interleave.
+    - ~~The 2,048-row prefill interleave.~~ Built as `--interleave-pct` (0, off): see
+      [engine.md](engine.md)'s prefill interleave bullet.
 - **B3** was estimated from measured step times and acceptance on 2026-10-12 ([B3 from
   measurements](#b3-from-measurements)): with 2–4 agent sessions decoding at once, 18–32 % more in all
   than the better of B1 and B2, and one session alone unchanged. The owner ran several agents at once
