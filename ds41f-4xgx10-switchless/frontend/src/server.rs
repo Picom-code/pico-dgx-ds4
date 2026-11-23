@@ -56,6 +56,11 @@ pub struct ServerConfig {
     pub hold: Duration,
     /// vision: the image encoder's address (host:port); None: image input is refused as before
     pub vision_addr: Option<String>,
+    /// The session table's limits (session.rs SessionTable): at most this many sessions and ids in all;
+    /// past them the least recently used idle sessions go, and the engine is told to release them. Each
+    /// id costs the table ~15 bytes (its id, its byte end and its share of the text).
+    pub table_sessions: usize,
+    pub table_tokens: usize,
     /// vision: the most rows (image tokens) the images of one request may take together
     /// (--max-image-rows); memory on rank 0's box follows rows, not the number of images
     pub max_image_rows: usize,
@@ -87,7 +92,8 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
-        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        let sessions = Mutex::new(SessionTable::new(cfg.table_sessions, cfg.table_tokens));
+        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions, think_end_id, counter: AtomicU64::new(0) })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -1184,6 +1190,8 @@ pub(crate) mod tests {
             dump_dir: None,
             hold: Duration::from_secs(600),
             vision_addr: None,
+            table_sessions: 256,
+            table_tokens: 16 << 20,
             max_image_rows: crate::vision::DEFAULT_MAX_IMAGE_ROWS,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_image_rows_in_flight: crate::vision::DEFAULT_MAX_IMAGE_ROWS_IN_FLIGHT,

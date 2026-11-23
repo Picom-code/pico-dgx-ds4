@@ -1187,6 +1187,12 @@ dsfront saves its session table at its own stop (`--table-file`; the service's i
 each session's text and token ids, by which a restarted dsfront sends a conversation's next turn to
 the same session. During a lend dsfront keeps running, and its table stays in memory.
 
+The table's size is bounded: `--table-sessions` (256) and `--table-tokens` (16777216 ids, ~15 bytes
+each) are what it holds before it drops the least recently used idle session, and tells the engine to
+release it. The defaults are what the table always held; raise them on a box with the memory to spare
+when many long conversations are live at once. Each id costs the table ~15 bytes (its id, its byte end
+and its share of the text), so 16M ids is about 1 GiB at full.
+
 **The start.** Each rank reads its index and checks:
 - the magic, its rank, the run id, the store's layout, and a hash over the records;
 - the age: an index written more than `--keep-days` ago is cleared;
