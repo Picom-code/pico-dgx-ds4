@@ -106,6 +106,12 @@ struct StoreConfig {
                                       // a completion once 8 are pending or after 200 us). The engine takes
                                       // it from the fleet file's RANK<r>_ENGRAM_READ_BATCH
   int cpu = -1;                       // pin the worker to this CPU (best: an otherwise idle X925 core)
+  std::vector<int> iowq_avoid;        // with cpu >= 0: CPUs the ring's io-wq workers must not run on (the
+                                      // engine's other pinned threads); the workers get every other online
+                                      // CPU. A read the kernel cannot issue inline (every read on a
+                                      // filesystem without IOCB_NOWAIT, ZFS among them) runs on such a
+                                      // worker, and the workers inherit the submitter's affinity: left
+                                      // alone, every one of them shares cfg.cpu with the spinning worker
 };
 
 // One Engram layer's rows for n_pos positions. The store fills the records it owns, packed in
