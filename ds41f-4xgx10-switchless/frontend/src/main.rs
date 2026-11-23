@@ -35,6 +35,9 @@ fn usage() -> ! {
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
       --table-days N            sessions unused for longer are not kept: 7
+      --table-sessions N        the session table holds at most N sessions: 256
+      --table-tokens N          and at most N ids in all (~15 bytes each): 16777216; past either, the
+                                least recently used idle sessions go and the engine releases them
       --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
                                 them into embedding rows (docs/vision.md); without it images are refused
       --max-body-mb N           the largest request body taken, in MiB: 64; a larger one is answered
@@ -139,6 +142,8 @@ fn serve(args: &[String]) {
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
         vision_addr: opt(args, "--vision-addr"),
+        table_sessions: parse_opt(args, "--table-sessions", 256usize).max(1),
+        table_tokens: parse_opt(args, "--table-tokens", 16usize << 20).max(1),
         max_image_rows: max_image_rows(args),
         max_body_bytes: max_body_bytes(args),
         max_image_rows_in_flight: max_image_rows_in_flight(args),
