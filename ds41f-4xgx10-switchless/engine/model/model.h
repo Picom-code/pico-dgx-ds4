@@ -27,6 +27,25 @@ struct Sampling {
 };
 using ops::SampleOut;
 
+// couple: which sampled requests go on the Gumbel path (ops::kSampGumbel in Sampling::top_k).
+//   DSGB10_GSAMPLE unset / 0: none: every request is sampled as before this change.
+//   1: sampled requests whose client sent NO seed (there is no earlier text for such a request to be equal to), and
+//      sampled requests without top-p / top-k (their sampler is the Gumbel-max one already; only their drafts change).
+//      A seeded top-p / top-k request keeps today's sampler and today's text.
+//   2: every sampled request (a seeded top-p / top-k request then gives ANOTHER text for its seed than before, from the
+//      same distribution, and the same one again from then on).
+// On the path: a truncated row takes the Gumbel-max winner among today's kept tokens; with DSGB10_GCOUPLE the drafts
+// are picked by the request's own noise. Greedy requests are never on it.
+int gsample_mode();  // model.cu: DSGB10_GSAMPLE, read once
+inline int32_t gsample_top_k(int32_t top_k, float temperature, float top_p, bool seeded) {
+  int32_t k = top_k > 0 ? (top_k < ops::kSampGumbel ? top_k : ops::kSampGumbel - 1) : 0;
+  const int mode = gsample_mode();
+  if (mode <= 0) return top_k > 0 ? k : top_k;
+  const bool trunc = k > 0 || top_p < 1.f;
+  if (temperature > 0.f && (mode >= 2 || !seeded || !trunc)) k |= ops::kSampGumbel;
+  return k;
+}
+
 struct Sink;
 
 // A step of rows from several sessions (docs/batching.md, B2; Model::launch_batch). Row r is position
@@ -53,9 +72,9 @@ struct SpecCfg {
   int max_drafts = 5;  // 0..5
   int pos_end = 0;
   int force = -1;  // >= 0: draft from this token instead of the step's last sample (teacher-forced checks)
-  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
+  int probe[ops::kDrafts] = {-1, -1, -1, -1, -1, -1, -1};  // EXPERIMENT (Options::tree_probe): the probe's path
   int gate = ops::kGateThresh;
-  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};  // 0..5 drafts
+  float step_ms[ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};  // 0..5 drafts
 };
 
 // A batch spec step (docs/batching.md, B3: drafts across sessions; Model::launch_spec_batch and
@@ -74,6 +93,11 @@ struct SpecBatch {
   SpecCfg cfg;
   int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
   int budget = 0;     // night T2/T4: > 0: the next step's rows across the entries, at most (StepIn::rbudget)
+  // copy drafts (ops.h CopyWin; launch_verify_batch with Model::spec_copy()): copy_on, the windows (ent < 0 or
+  // n < 2: none), their tokens and the step's rows at most once a window is used
+  int copy_on = 0, copy_cap = 0;
+  ops::CopyWin copy[ops::kCopyWin] = {};
+  int32_t copy_tok[ops::kCopyTok] = {};
 };
 
 // One step, as rank 0 decided it (the golden and bench modes: every rank receives the same).
@@ -215,6 +239,15 @@ class Model {
   int spec_batch_rows() const;
   uint64_t launch_spec_batch(const SpecBatch& b);
   uint64_t launch_verify_batch(const SpecBatch& b);
+  // Copy drafts (ops.h CopyWin; DSGB10_COPY=1 with session slots). spec_copy(): on. spec_layout(): batch verify
+  // step n's rows as the device lays them out, from ss [kMaxSess] (each entry's next_rows, next_pos0 and next_tok
+  // as the step before it reported them): its StepIn copied to *d and laid out (rows, tokens, pos, sess), ncopy
+  // [kMaxSess] the drafts each entry takes from a window; returns the rows. For the rows' Engram lookups
+  // (engram_late_rows), before the step is waited for and before four more are launched.
+  // history(): the token ids of slot s's sequence so far (set_tokens and the steps' rows).
+  bool spec_copy() const;
+  int spec_layout(uint64_t n, const ops::SpecState* ss, ops::StepIn* d, int* ncopy) const;
+  const std::vector<int32_t>& history(int slot) const;
   unsigned spec_batch_mismatches() const;
   // engram_late() of a batch verify step: its rows as the device laid them out (the entries on in entry
   // order, each its next_s* of the step before): their tokens, positions and slots.

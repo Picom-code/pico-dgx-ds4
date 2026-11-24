@@ -1,13 +1,13 @@
 {
  "banner": {
-  "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images",
+  "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images + video",
   "stats": [
    [
-    "90/144",
+    "90/147",
     "chat/code, 1 user, tok/s"
    ],
    [
-    "376",
+    "413",
     "16 users, distinct, tok/s"
    ],
    [
@@ -15,7 +15,7 @@
     "context"
    ],
    [
-    "10k",
+    "10.8k",
     "prefill tok/s"
    ]
   ]
@@ -28,14 +28,14 @@
    "rows": [
     [
      "pico-dgx  distinct",
-     376,
+     413,
      "16 different prompts",
      true
     ],
     [
      "pico-dgx  copies",
      441,
-     "same prompts repeated",
+     "same prompts repeated (v1 build)",
      true
     ],
     [
@@ -56,11 +56,11 @@
   {
    "file": "c1.png",
    "title": "1 user: decode tok/s",
-   "sub": "1 user · temp 0 · our bench (not sparkDash) · live build, 2026-11-11",
+   "sub": "1 user · temp 0 · our bench (not sparkDash) · 2026-11-19",
    "rows": [
     [
      "pico-dgx  code",
-     142.6,
+     147,
      "3-prompt bench",
      true
     ],
@@ -96,7 +96,7 @@
     ],
     [
      "pico-dgx  chat",
-     82.7,
+     84,
      "3-prompt bench",
      true
     ],

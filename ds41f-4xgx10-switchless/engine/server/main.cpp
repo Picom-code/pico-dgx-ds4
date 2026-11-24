@@ -305,11 +305,11 @@ struct Args {
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
   std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
-  int spec_drafts = 5;
+  int spec_drafts = -1;  // blk7: -1: the one-session pass's rows (dspark::draft_rows(), DSGB10_DRAFT_MAX; 5 by default)
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
   int spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
 };
 
 Args parse(int argc, char** argv) {
@@ -477,7 +477,7 @@ Args parse(int argc, char** argv) {
     die("--chunk and --k must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
   if (a.small_rows < 0 || a.small_rows > model::kMaxSessRows)
     die("--small-rows must be 0..%d (a small turn runs as one step of one session)", model::kMaxSessRows);
-  if (a.batch_rows < 1 || a.batch_rows > model::kMaxSessRows)
+  if (a.batch_rows < 1 || a.batch_rows > (getenv("DSGB10_TF_SESSROWS") ? model::kMaxRows : model::kMaxSessRows))
     die("--batch-rows must be 1..%d (one session's rows in a step)", model::kMaxSessRows);
   if (a.mode == "serve") a.spec = !a.no_spec;  // the drafts change the speed, never the tokens
   if (a.mode == "serve") a.draft_fp8 = !a.draft_bf16;  // nor does the drafter's FP8 head
@@ -495,7 +495,8 @@ Args parse(int argc, char** argv) {
        a.chain_every < 0))
     die("--route-file FILE [--route-every 1..%d] [--chain-every N] [--props FILE]: --mode spectf only",
         model::kMaxSessRows);
-  if (a.spec_drafts < 0 || a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..5");
+  if (a.spec_drafts < 0) a.spec_drafts = dspark::draft_rows();  // after every --setenv
+  if (a.spec_drafts > model::ops::kDrafts) die("--spec-drafts must be 0..%d", model::ops::kDrafts);
   if (a.spec && (a.mode == "decode" || a.mode == "generate") && !a.big)
     die("--spec: the prompt goes through the prefill path (--big), which fills the draft module's windows");
   for (int k : a.ks) {
@@ -836,7 +837,7 @@ int main(int argc, char** argv) {
     c.tokens[0] = tok0;
     c.sp.temperature = a.temp;
     c.sp.top_p = a.top_p;
-    c.sp.top_k = a.top_k;
+    c.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true);  // couple: the tools' seed is a client's
     c.sp.seed = a.seed;
     c.max_new = n;
     c.limit = a.max_ctx;
@@ -871,6 +872,7 @@ int main(int argc, char** argv) {
                 e.vsteps, (double)e.verified / e.vsteps, (double)e.accepted / e.vsteps,
                 e.verified ? 100.0 * e.accepted / e.verified : 0.0, 1.0 + (double)e.accepted / e.vsteps, e.rows_hist[0],
                 e.rows_hist[1], e.rows_hist[2], e.rows_hist[3], e.rows_hist[4], e.rows_hist[5]);
+    if (e.rows_hist[6] + e.rows_hist[7]) std::printf("  steps verifying 6, 7 drafts: %d %d\n", e.rows_hist[6], e.rows_hist[7]);
     std::printf("  verify-length gate (%s): mean %.3f, min %.3f, max %.3f over %d steps\n",
                 a.spec_gate == model::ops::kGateRatio      ? "ratio; lambda, tokens per ms"
                 : a.spec_gate == model::ops::kGateMarginal ? "marginal; lambda, tokens per ms"
@@ -1014,6 +1016,7 @@ int main(int argc, char** argv) {
       int32_t first = 0;
       uint64_t hash = 1469598103934665603ull;  // as decode mode's chosen_hash over its decode
       std::vector<int32_t> out;
+      std::vector<uint32_t> bits;  // exact: each sample's logit bits (DSGB10_TF_DUMP)
     };
     std::vector<Sess> ss;
     for (const char* q = a.batch.c_str(); *q;) {
@@ -1055,7 +1058,7 @@ int main(int argc, char** argv) {
       for (size_t k = 0; k < ss.size(); ++k) {
         BatchEntry& x = e[k];
         x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.max_new = per, x.limit = a.max_ctx;
-        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+        x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
         t[k].assign(toks.begin() + ss[k].ctx, toks.begin() + ss[k].ctx + per);
       }
       Cmd c{};
@@ -1069,6 +1072,7 @@ int main(int argc, char** argv) {
         s.out.push_back(o.row[row].token);  // the sample at its position: the golden token after it when equal
         uint32_t bits;
         std::memcpy(&bits, &o.row[row].value, 4);
+        s.bits.push_back(bits);
         s.hash = (s.hash ^ (uint32_t)o.row[row].token) * 1099511628211ull;
         s.hash = (s.hash ^ bits) * 1099511628211ull;
       });
@@ -1077,7 +1081,7 @@ int main(int argc, char** argv) {
         FILE* f = std::fopen(dp, "w");
         for (size_t k = 0; f && k < ss.size(); ++k) {
           std::fprintf(f, "%zu %d", k, ss[k].ctx);
-          for (int32_t t : ss[k].out) std::fprintf(f, " %d", t);
+          for (size_t i = 0; i < ss[k].out.size(); ++i) std::fprintf(f, " %d:%08x", ss[k].out[i], ss[k].bits[i]);
           std::fprintf(f, "\n");
         }
         if (f) std::fclose(f);
@@ -1104,7 +1108,7 @@ int main(int argc, char** argv) {
       BatchEntry& x = e[k];
       x.slot = ss[k].slot, x.pos0 = ss[k].ctx, x.token = ss[k].first;
       x.max_new = a.steps, x.limit = a.max_ctx;
-      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = a.top_k, x.sp.seed = a.seed;
+      x.sp.temperature = a.temp, x.sp.top_p = a.top_p, x.sp.top_k = model::gsample_top_k(a.top_k, a.temp, a.top_p, true), x.sp.seed = a.seed;
     }
     Cmd c{};
     c.op = a.spec ? kCmdSpecBatch : kCmdBatch;  // B3 (--spec): drafts across the sessions, every one to its end

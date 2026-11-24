@@ -94,6 +94,15 @@ struct Options {
   // 2: also send a small contribution (below split_domains_from) to each neighbour as one write and one write of
   // both flags, instead of two halves with a flag each (the halves existed so a relay could start early).
   int direct = -1;
+  // Direct mode, reduce-scatter posts of split_domains_from bytes or more: how a neighbour's quarter is spread over
+  // the two PCI domains. 0 (today): the whole quarter on domain 1, so domain 0 carries 0.5 and domain 1 2.5 quarters
+  // of a post. 1: each neighbour's quarter in two halves, one per domain (1.5 quarters each). 2: next's quarter on
+  // domain 0, prev's on domain 1 (1.5 each, whole messages). Only the queue pair a byte travels on changes: the
+  // buffers, the flags and every sum are the same. -1: from the environment (DSGB10_RING_RSBAL), 0 if unset.
+  int rs_bal = -1;
+  // Proxy-side statistics per (op, size class), printed to stderr every stats_s seconds while there is traffic
+  // (diagnostics: every data chain is then signalled). -1: from the environment (DSGB10_COMM_STATS), 0 = off.
+  int stats_s = -1;
 };
 
 // Proxy-side timeline of one collective, CLOCK_MONOTONIC_RAW ns on this box (0: not seen).

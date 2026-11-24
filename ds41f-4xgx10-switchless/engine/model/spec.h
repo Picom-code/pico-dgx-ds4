@@ -38,6 +38,9 @@ struct Spec {
   // dspark::kBatchEnts), one gate kernel over the entries, and the publication. The one-session graphs
   // above never run any of it.
   std::map<int, cudaGraphExec_t> bgraphs;
+  // copy drafts (DSGB10_EXACT_SOLO): the graph of verify steps that carry a copy window (spec.cu spec_batch_graph)
+  std::map<int, cudaGraphExec_t> cgraphs;
+  size_t cnodes = 0;     // in the last copy graph's bodies
   int bents = 0;         // entries a batch step takes at most: min(kMaxSess, Options::slots)
   size_t bnodes = 0;     // in the last batch graph's bodies (the switch's and the ifs')
   int* row0 = nullptr;   // device [kMaxSess]: entry k's first row of the step
@@ -45,6 +48,16 @@ struct Spec {
   int* bent = nullptr;   // device [kMaxSess]: the entries on, in order (spec_batch_passes)
   int* pstab = nullptr;  // device [kMaxSess][ops::kDrafts]: the passes' slot tables, by the entries on
   unsigned* mism = nullptr;  // device: --bgraph-check's count of words a pass's drafts differ from draft()'s
+  // Copy drafts (DSGB10_COPY, ops.h CopyWin; the batch graph only, and only when on at its capture): an entry's
+  // rows may then pass kSessTok, so its final rows go to the draft module's windows dspark::kMaxAcc at a time (acc:
+  // each entry's accept under its if, its last kMaxAcc final rows; clp: the loop over the ones before them), and a
+  // wide step keeps its ratio-2 projections (csave) to put the compressor carries' last 16 FINAL rows back
+  // (the carry holds a call's last 16 rows by position, the rejected ones too).
+  bool copy = false;
+  int* acc = nullptr;      // device [3][kMaxSess]: count, pos0, row0 of each entry's accept
+  int* clp = nullptr;      // device [16]: the loop's accept: [0] count, [1] pos0, [2] row0, [3] its anchor (unused),
+                           // [4] entry, [5] its rows done; [8 .. 16) the slot table
+  float* csave = nullptr;  // device [3][2][kMaxRows][kHead]: kv source 0..2's projections and scores of the step's rows
   // prefill: main_hidden of the chunk's rows that enter the windows. Each rank computes the rows it owns
   // into its block of pf_mh ([4][C][15360] for C rows a rank at most), one all-gather shares them, then
   // accept() takes them kMaxAcc at a time.

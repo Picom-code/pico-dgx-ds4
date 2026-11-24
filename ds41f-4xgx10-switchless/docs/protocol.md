@@ -55,12 +55,12 @@ struct SubmitHeader {            // 72 bytes
   float    top_p;                // 1 = off
   uint32_t top_k;                // 0 = off
   uint32_t max_new_tokens;       // >= 1; the front-end has already clamped it to the context
-  uint32_t flags;                // 1 SEED, 2 KEEP (keep the session after DONE), 4 LOGPROBS
+  uint32_t flags;                // 1 SEED, 2 KEEP (keep the session after DONE), 4 LOGPROBS, 8 IMAGES, 16 PREDICTION
   uint32_t n_top_logprobs;       // 0..20, with LOGPROBS
   uint32_t prefix_hint;          // prompt tokens the front-end expects to match the session
   uint32_t n_stop_ids;           // token ids that end generation (the front-end sends EOS here)
   uint32_t n_prompt;             // >= 1
-  uint32_t reserved;
+  uint32_t reserved;             // with PREDICTION: the number of prediction token ids after prompt[]; else 0
 };
 
 struct DoneHeader {              // 56 bytes
@@ -155,6 +155,11 @@ reasoning when the prompt ends in `<think>`, a short answer that quotes the last
 tool result, and a DSML tool call when the last user message contains `MOCK_TOOL <name> <json
 arguments>`. `MOCK_LOOP` makes it repeat itself (to test the loop guard) and `MOCK_LONG <n>`
 streams n filler tokens.
+A `SUBMIT` with a prediction (`FLAG_PREDICTION`, copy drafts: [copy.md](copy.md)) carries the client's predicted
+output as token ids right after `prompt[]` (before an image part), their count in the header's `reserved` word.
+The ids only ever serve as drafts. Only requests with a prediction set the flag, and only a front-end started with
+`--prediction`; every other `SUBMIT` is the frame of before.
+
 A `SUBMIT` with images (`FLAG_IMAGES`) is taken under the checks rank 0 applies to its image part
 (1 to 100 spans of 3 to 1100 rows, exactly the spans' rows after them) and with its spans on the
 prompt's image placeholders; the rows themselves do not change the scripted answer. With a stand-in

@@ -21,6 +21,9 @@ fn usage() -> ! {
       --thinking                thinking on when a request does not say (default off)
       --no-thinking             thinking off when a request does not say (the default; the later
                                 of --thinking and --no-thinking wins); requests can override it
+      --prediction              pass a request's `prediction` (OpenAI's predicted outputs: type content)
+                                to the engine as drafts (an engine with DSGB10_COPY=1 only; off: ignored)
+      --prediction-max N        the most prediction tokens sent: 65536
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
       --no-loop-guard           do not stop repetition loops
       --dump-dir DIR            write each request, prompt and ids to DIR, and at its end the output's
@@ -124,6 +127,8 @@ fn serve(args: &[String]) {
         model_name: opt(args, "--model-name").unwrap_or_else(|| "deepseek-v4.1-flash-uncensored".into()),
         api_key,
         max_tokens_cap: parse_opt(args, "--max-tokens", 32768u32),
+        prediction: args.iter().any(|a| a == "--prediction"),
+        prediction_max: parse_opt(args, "--prediction-max", 65536usize),
         default_effort: parse_opt(args, "--effort", 75i64).clamp(1, 100),
         encoding: encoding_opt(args),
         default_thinking: default_thinking(args),

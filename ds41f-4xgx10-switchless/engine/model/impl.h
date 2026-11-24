@@ -109,6 +109,11 @@ struct Prefill;  // prefill.cu's buffers
 struct Store;    // state.cu's sessions
 struct Spec;     // spec.cu's draft module and spec steps
 
+// copy drafts: DSGB10_EXACT_SOLO (model.cu): the wide buckets with an exact body for one-entry steps; g_xbody: such a body
+// is being captured
+int exact_solo();
+extern bool g_xbody;
+extern bool g_ctail;  // copy drafts: a graph with the copy tail is being captured (its wide bodies save the carries)
 }  // namespace detail
 
 struct Model::Impl {
@@ -164,6 +169,9 @@ struct Model::Impl {
   int pos_group = 1;         // its runs of consecutive rows
   int route_shift = 0;       // Model::set_route_shift (bench)
   int route_group = 1;       // its rows per rotation
+  // DSGB10_GATE_SEP=MODE[,LO,HI]: in steps of LO..HI rows (default 2..4) the MoE's first kernel does not
+  // start under the router gate's GEMV: MODE 1 launches a no-op kernel between them. 0 / unset: today's launches.
+  int gate_sep = 0, gate_sep_lo = 2, gate_sep_hi = 4;
   uint64_t n_done = 0;       // known finished
   uint64_t last_n = 0;       // the last step waited for
   cudaEvent_t ev_beg[ops::kOutSlots], ev_end[ops::kOutSlots];
@@ -234,6 +242,7 @@ struct Model::Impl {
   std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
+  void spec_copy_save(int k, int R, cudaStream_t s);  // copy drafts: a wide spec body keeps kv source k's projections
   // stack4, the certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs):
   // a coarse read of every vocabulary row (the drafter's FP8 copy of the head) with a rigorous bound per row, one
   // cross-rank threshold per step row, and the exact head kernel on the CTAs that the bound cannot exclude. The
@@ -390,7 +399,7 @@ struct Model::Impl {
   uint64_t launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c);
   uint64_t launch_verify(const Sampling& sp, const SpecCfg& c, int pos_bound);
   // B3 (docs/batching.md): the batch spec step, drafts across sessions
-  cudaGraphExec_t spec_batch_graph(int ctx);
+  cudaGraphExec_t spec_batch_graph(int ctx, bool cg = false);  // cg: the copy graph (copy drafts)
   void spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b);
   int spec_batch_check(const SpecBatch& b, bool given);
   uint64_t launch_spec_batch(const SpecBatch& b);

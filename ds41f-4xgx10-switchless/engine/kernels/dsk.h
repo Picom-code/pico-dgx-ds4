@@ -152,13 +152,25 @@ void gemv_bf16x_norm_masked(const __nv_bfloat16* x, const __nv_bfloat16* norm_w,
 // wide64, the coded-head GEMM: gemv_bf16x_norm (coded) / gemv_bf16_norm over M <= 64 rows, fp32 out, the weights read
 // once for every group of 16 rows; the bits of calls of 16 rows in row order (M <= 16: that call).
 void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,
-                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st);
+                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st,
+                         __nv_bfloat16* pre = nullptr);
+// (pre: a buffer [M][K]; the rows are then normalised once into it by a small kernel instead of in every
+// CTA of the head kernel: the same bits)
 // wo_a: FP8 W [N][K] with [N/32][K/32] scales, widened to bf16 (exact; block scales <= 2^7);
 // block-diagonal: rows [g*group_rows, (g+1)*group_rows) read x[:, g*K:(g+1)*K]. x [M][N/group_rows*K].
 // With q/qs also act_quant(y) (wo_b's input; y may then be null); needs mt * wn = 4.
 void gemv_woa(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, int group_rows,
               __nv_bfloat16* y, GemvCfg cfg, bool cuda_cores, cudaStream_t st, uint8_t* q = nullptr,
               uint8_t* qs = nullptr);
+// exact wide steps (docs/copy.md): the row-group kernels of an exact wide step. M <= 64 rows; the weights are read once
+// for every group of 16 rows and each row's outputs are those of a call of at most 16 rows (so of an 8-row call), bit
+// for bit. M <= 16: that call. gemv_fp8_rows = gemv_fp8_multi; gemv_bf16_rows = gemv_bf16 (fp32 out, tensor cores,
+// mt 1); gemv_woa_rows = gemv_woa (mt 1).
+void gemv_fp8_rows(const uint8_t* xq, const uint8_t* xs, int M, const Fp8Seg* segs, int nseg, int K, GemvCfg cfg,
+                   cudaStream_t st);
+void gemv_bf16_rows(const __nv_bfloat16* x, int M, const uint8_t* W, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st);
+void gemv_woa_rows(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, int group_rows,
+                   __nv_bfloat16* y, GemvCfg cfg, cudaStream_t st, uint8_t* q = nullptr, uint8_t* qs = nullptr);
 // The same widening with one group (every row reads all of x [M][K]) and fp32 out: DSpark's FP8 head.
 void gemv_fp8w_f32(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, float* yf,
                    GemvCfg cfg, cudaStream_t st);
@@ -172,8 +184,11 @@ void gemv_fp4w_f32(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_
 // ---- norm_router.cu
 // y = bf16(w * (x * rsqrt(mean(x^2) + eps))), fp32 math, rows of D (multiple of 256, <= 8192);
 // with q/s non-null also act_quant(y) into them.
+// threads (exact; 0: D / 8): the CTA's threads, a multiple of 32 up to 1024. A row's sum of squares is added in an
+// order set by the thread count (common.cuh rmsnorm_scale), so with the thread count of a fused kernel (32 * wn * wk of
+// its GemvCfg) the outputs are that kernel's normed rows bit for bit; with D / 8 the 1/rms may differ in its last bit.
 void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float eps, __nv_bfloat16* y, uint8_t* q,
-             uint8_t* s, cudaStream_t st);
+             uint8_t* s, cudaStream_t st, int threads = 0);
 // Router selection from fp32 logits [M][E] (E <= 512): scores sqrt(softplus(l)), top-6 of
 // scores + bias (descending), weights = scores / (sum + 1e-20) * route_scale.
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,
@@ -181,7 +196,8 @@ void router_topk(const float* logits, const float* bias, int M, int E, int* idx,
 // wide64: the same with batch-aware re-routing (moe_routed's DSGB10_OEA): every row keeps its top k0, its other
 // picks prefer the step's core (the union of every row's top k0) among its top kp. One CTA. Lossy.
 void router_topk_oea(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale, int k0,
-                     int kp, cudaStream_t st);
+                     int kp, cudaStream_t st, const int* sess = nullptr, const int* rows = nullptr);
+// exact: sess / rows as moe_routed's oea_sess / oea_rows: a step of one session's rows gets router_topk's selection.
 
 // ---- MoE (routed MXFP4 experts + FP8 shared expert), per rank at TP=4: dim 5120, 576 intermediate
 
@@ -245,12 +261,24 @@ constexpr size_t moe_hs_offset(int M) { return (size_t)(row_budget(M) * kTopK + 
 // its first use (the kernels leave its task counters at zero).
 void moe(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, const float* wts, const MoeWeights& w, void* ws,
          float* y, MoeCfg cfg, cudaStream_t st);
+// exact wide: moe() for M <= 64 rows with the decode kernels' arithmetic and each expert of the step's union read once
+// (moe.cu, k_moe_up_rg / k_moe_down_rg): y is, row by row, what moe() gives for any call of 1..16 rows holding that row,
+// bit for bit. idx / wts from router_topk. ws: moe_rows_workspace_bytes() (no initialisation). gq: 0 (2 groups of 16
+// row slots a pass up to 32 rows, 4 above), or 2 / 4; + 16: read the raw scales even when w carries their 1-bit code
+// (c1 / c3, c2; the same bits either way).
+size_t moe_rows_workspace_bytes();
+void moe_rows(const uint8_t* xq, const uint8_t* xs, int M, const int* idx, const float* wts, const MoeWeights& w, void* ws,
+              float* y, cudaStream_t st, int gq = 0);
 // The same with the router's selection fused in: both kernels run router_topk's selection on the
 // gate's logits [M][E] (fp32, E <= 512) themselves, so no top-k launch sits between gate and MoE;
 // idx_out/wts_out [M][6] (optional) receive it.
 void moe_routed(const uint8_t* xq, const uint8_t* xs, int M, const float* logits, const float* bias, int E,
                 float route_scale, const MoeWeights& w, void* ws, float* y, MoeCfg cfg, cudaStream_t st,
-                int* idx_out = nullptr, float* wts_out = nullptr);
+                int* idx_out = nullptr, float* wts_out = nullptr, const int* oea_sess = nullptr,
+                const int* oea_rows = nullptr, int oea_row0 = 0);
+// exact: oea_sess / oea_rows (device memory: the step's row -> session table [rows] and its row count, read when the
+// kernel runs): DSGB10_OEA's re-routing then applies only to a call whose rows (the step's rows oea_row0 ..) are of
+// two or more sessions. Null: to every call of MINROWS rows, as before.
 
 // ---- Prefill (prefill.cu): GEMMs for chunks of M rows (any M >= 1; built for 128..8192) on tensor
 // cores, reading the same weight layouts as the decode kernels. Row-major activations and outputs.
@@ -299,8 +327,18 @@ struct PrefillTuning {
   int tord = -1;  // tile order: k > 0 one tile of the most-picked experts, then k of the fewest (0: descending; -1: the default)
   int upf = -1;  // up: weights prefetched into L2 this many chunks of 256 k ahead (0: none; -1: the default)
   int dgrp = -1, dring = 3;  // down: column blocks per CTA (0: one, k_moe_down_p; -1: the default), weight steps in flight (3 or 9)
+  // DSGB10_PF_TUNE (all 0 = off = the default tiles; each gives the default tiles' bits):
+  int gate_m = 0;  // the router gate (gemm_bf16_p with N = 384) in 32x32 tiles for calls of up to gate_m rows
+  int sh_m = 0;    // the shared expert's w1/w3 in 32x64 tiles for calls of up to sh_m rows
+  int down_m = 0;  // the down kernel by column groups (dgrp 10) and tile order 1 for chunks of down_m rows or more
 };
 void prefill_tuning(const PrefillTuning& t);
+// DSGB10_PF_TUNE=hc[=ROWS],gate[=M],sh[=M],small[=M],down[=M] (unset or empty: today's kernels). hc: the split mHC boundary
+// (hc_boundary_split) for chunks of up to ROWS rows a rank (default 344); gate / sh / small (= both): the small tiles
+// for calls of up to M rows (default 256); down: dgrp 10 + tord 1 from M rows (default 4096).
+// DSGB10_PF_TUNE=@FILE (tests): the same text read from FILE, re-read by prefill_tune_poll() when the file changes.
+void prefill_tune_env(int rank);
+void prefill_tune_poll();
 struct MoePCfg {
   int phases = 31;               // 1 bucketing, 2 shared expert, 4 routed up, 8 routed down, 16 combine
   cudaStream_t side = nullptr;   // if set, the shared expert's GEMMs run there, beside the routed experts
@@ -324,7 +362,9 @@ void moe_combine_rs(const comm::DevChannel& ch, void* ws, int M, int E, int rq, 
 // step reads next (model::Options::l2pf, on by default). It writes nothing the model reads.
 // A layer's weights the plan may prefetch, in the order its step reads them: wq_a + wkv, wq_b (+ the indexer's
 // wq_b), wo_a, wo_b, the router gate; each up to four tensors (weights, scales; n 0: none).
-enum { kL2pfWqa, kL2pfWqb, kL2pfWoa, kL2pfWob, kL2pfGate, kL2pfTargets };
+// kL2pfSh13, kL2pfSh2 = the shared expert's w1 + w3 and w2 (read by moe_up / moe_down after the gate);
+// only a DSGB10_L2PF plan prefetches them
+enum { kL2pfWqa, kL2pfWqb, kL2pfWoa, kL2pfWob, kL2pfGate, kL2pfSh13, kL2pfSh2, kL2pfTargets };
 struct L2pfTarget {
   const void* p[4];
   size_t n[4];
@@ -339,5 +379,25 @@ struct L2pfState {  // device memory: how far a layer's windows got (they run in
 // prefetch once the window's collective has arrived; nullptr for the attention.
 void l2pf_window(const L2pfTarget (&t)[kL2pfTargets], int layer, int window, int R, const unsigned long long* arrived,
                  const unsigned long long* finished, L2pfState* state, cudaStream_t s);
+// DSGB10_L2PF=SPEC or @FILE (unset: the kernel and launches above, unchanged). With it, every window
+// launches k_l2pf2, which takes its plan (targets) and budgets by row class from device memory, so a running engine
+// can be switched (a paired measurement in one engine start): l2pf_tune_poll() re-reads FILE when it changes.
+// SPEC: items separated by ';' or '/': "off" (the stock plan and budgets, computed on the device), "pace=GBPS", or
+// "cN:key=value,..." for row class N (0: 1 row, 1: 2-8 rows, 2: 9-16 rows, 3: 17+ rows) with keys
+// plan=wqa+wqb+woa+wob+gate+sh13+sh2, w1=A+B, w2=A+B, w3=A+B, w4=A+B (us = A + B (min(R, rcap) - 1)), w3i=US (W3 on the
+// indexer's layers), rcap=N, u1..u4=TARGET (the window prefetches no target after it). A class not named keeps the stock plan and budgets. It writes nothing the model reads.
+// more SPEC keys, all defaulting to today's behaviour: pN=US (window N's prefetch goes on for US after
+// its collective ARRIVED, on the targets from qN on; q1 wqb, q2 woa, q4 sh13 by default; pr=ROWS: only in steps of at
+// most ROWS rows) and the item
+// "d:d0=US,da=US,db=US,dh=US": the one-session DRAFT pass's sites (us of prefetch at the pace; 0 = nothing): d0 block 0's
+// attention weights from the pass's start, da a block's gate + shared expert under its attention all-reduce and mHC
+// front, db the next block's attention weights under the MoE all-reduce and the next mHC front, dh the draft head.
+inline constexpr int kL2pfDraftSites = 4;
+bool l2pf_draft_on();
+bool l2pf_draft(const void* const* p, const size_t* n, int count, int site, cudaStream_t s);
+void l2pf_tune_env(int rank);
+void l2pf_tune_poll();
+void l2pf_tune_tick();  // every 8th call polls (a decode step's launch, on every rank)
+bool l2pf_tuned();
 
 }  // namespace dsk

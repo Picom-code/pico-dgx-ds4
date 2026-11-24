@@ -24,13 +24,22 @@ class WeightFile;
 namespace dspark {
 
 inline constexpr int kBlocks = 3;   // mtp.0 .. mtp.2
-inline constexpr int kDraft = 5;    // block rows = drafts per pass (dspark_block_size)
+inline constexpr int kDraft = 7;    // block rows a pass can run AT MOST (buffers, ids [8], conf [16], a session's 8 rows)
+// blk7: the rows a pass really runs are set at start: draft_rows() for one-session draft() (DSGB10_DRAFT_MAX),
+// draft_rows_batch() for the batch passes (DSGB10_DRAFT_MAXB); both default to kDraftModel, the checkpoint's
+// dspark_block_size (5 = the behaviour before this change), and may go up to kDraft: the block then holds more
+// noise rows than the drafter was trained with (every draft is verified, so only the speed can change).
+inline constexpr int kDraftModel = 5;
+int draft_rows();        // 5..kDraft
+int draft_rows_batch();  // 5..kDraft
+inline int batch_ents() { return 16 / draft_rows_batch(); }             // entries of a narrow pass (the kernels' 16 rows)
+inline int batch_rows() { return batch_ents() * draft_rows_batch(); }  // its rows
 inline constexpr int kMaxAcc = 8;   // positions per accept() call
 inline constexpr int kMaxHidden = 64;  // rows of a main_hidden buffer, at most: a batch spec step's (B3; wide64: 64)
 // A batch spec step's draft pass over several entries (Draft::draft_batch, docs/batching.md B3 phase 2a): a pass
 // takes at most kBatchEnts entries, kDraft rows each, within the kernels' 16 rows (dsk::kMaxRows,
 // attn::kMaxDecodeRows); kMaxEnts entries keep an anchor and results (the runner's ops::kMaxSess).
-inline constexpr int kBatchEnts = 3, kBatchRows = kDraft * kBatchEnts, kMaxEnts = 16;
+inline constexpr int kMaxEnts = 16;  // blk7: kBatchEnts / kBatchRows are batch_ents() / batch_rows() above
 // wide64 (one-pass drafter): a pass of more than kBatchEnts entries (up to kWideEnts, kWideRows rows) runs its dense
 // projections as prefill GEMMs and its MoE as moe_prefill, the weights read once for every entry (~1 ulp from the
 // 15-row kernels: the drafts may differ, never the verified tokens). kCandStride: a pass's candidates per draft step.
@@ -41,8 +50,9 @@ inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 25
 inline constexpr int kExperts = 128, kTopK = 3, kNoiseToken = 128799;
 inline constexpr int kMainK = 3 * kDim;  // main_hidden: the inputs of layers 37, 38, 39, concatenated
 // stack4: the confidence MLP's shape (Draft::enable_cf): 3 scalars a depth in, one hidden layer, a logit a depth out
-inline constexpr int kCfIn = 3 * kDraft, kCfHid = 64;
-inline constexpr int kCfWords = 2 * kCfIn + kCfHid * kCfIn + kCfHid + kDraft * kCfHid + kDraft + kDraft;
+inline constexpr int kCfD = kDraftModel;  // blk7: the MLP's depths (deeper drafts keep the shipped head's logit)
+inline constexpr int kCfIn = 3 * kCfD, kCfHid = 64;
+inline constexpr int kCfWords = 2 * kCfIn + kCfHid * kCfIn + kCfHid + kCfD * kCfHid + kCfD + kCfD;
 
 // One block's tensors on this rank (docs/layout.md: names, cuts and tile layouts).
 struct BlockW {
@@ -118,6 +128,29 @@ void sim_fp8_l2(uint8_t* w, int N, int K, cudaStream_t st);
 // main_hidden [rows][15360] (rows <= kMaxHidden: a step's; accept() reads at most kMaxAcc of them), slot = layer - 37.
 void main_hidden(const uint16_t* x, int rows, int slot, uint16_t* mh, bool pdl, cudaStream_t s);
 
+// couple (DSGB10_GCOUPLE; Draft::set_couple): Gumbel-coupled drafts for sampled sessions on the Gumbel path. A session's
+// sampling as the runner's step input holds it (ops::StepSamp's layout; spec.cu asserts it), entry k's at samp[k].
+// For an entry with temperature T > 0 and the kNoiseGumbel bit in top_k, the Markov chain's pick at depth j is
+//   argmax over the WHOLE vocabulary of  dl[j][id] / (T * Td[j]) + g(seed, position of that draft's verify row, id),
+// g the request's own noise (model/sample.cu's hash: the row that verifies the draft adds the same g to the full model's
+// logits). The drafter does not know the full model's kept (top-p) set, so the pick is not restricted to a set; Td < 1
+// sharpens the drafter's distribution instead, which keeps its tail from winning (offline: Td 0.8 is within half a
+// point of a pick restricted to the drafter's own nucleus). Each depth conditions on the coupled pick before it (the
+// chain's token, the Markov embedding the confidence head reads). Every draft is still verified by the sampler: with
+// a given noise the emitted tokens are the same with any drafts; only how many are accepted changes.
+// Other entries (greedy, or not on the Gumbel path) keep the argmax of dl, bit for bit.
+struct NoiseSamp {
+  uint64_t seed;
+  float temperature;
+  float top_p;
+  int32_t top_k;
+  int32_t n_top;
+};
+inline constexpr int32_t kNoiseGumbel = 1 << 30;
+struct CoupleTd {
+  float inv[7];  // 1 / Td per depth (kDraft entries)
+};
+
 // A rank's argmax candidate over its vocab slice (id: the global token id).
 struct Cand {
   float v;
@@ -149,6 +182,12 @@ class Comm {
   virtual void argmax_rows(const Cand* src, Cand* dst, int rows, cudaStream_t s) {
     for (int r = 0; r < rows; ++r) argmax(src + r, dst + r, s);
   }
+  // the one-session draft pass's L2 prefetch (dsk::l2pf_draft; DSGB10_L2PF "d:" budgets). At `site`
+  // the pass names the weights it reads next; the runner may prefetch them on a side stream that starts when the
+  // kernels launched on s so far have ended, while the pass's collectives and mHC fronts leave DRAM idle. It writes
+  // nothing the pass reads. prefetch_join(s): s waits for that stream (the pass's end). Default: nothing.
+  virtual void prefetch(int site, const void* const* p, const size_t* n, int count, cudaStream_t s) {}
+  virtual void prefetch_join(cudaStream_t s) {}
 };
 // STAND-INs for timing one rank alone: every collective is one local PDL kernel that puts this rank's data where
 // the result would land (gathers fill every rank's slot with it, reductions take it as the sum).
@@ -223,7 +262,8 @@ class Draft {
   // The draft after the anchor p: *token (the token at p + 1) and four noise tokens at positions p + 1 .. p + 5
   // through the blocks and the head; then tokens() holds d1..d5, greedy drafts for positions p + 2 .. p + 6.
   // `slot` as accept()'s (kDraft entries, all the anchor's session's).
-  void draft(const int* token, cudaStream_t s, const int* slot = nullptr);
+  // blk7: rows > 0: this capture's pass runs that many block rows (5..draft_rows(); DSGB10_DRAFT_DYN's two bodies)
+  void draft(const int* token, cudaStream_t s, const int* slot = nullptr, int rows = 0);
   void use_slot(int s);
 
   // B3 phase 2a (docs/batching.md): one pass over the drafts of several entries (sessions), their rows side by
@@ -260,6 +300,10 @@ class Draft {
   // the 5 depths replaces confidence() / survival(). w: kCfWords floats (mu, sd, w1, b1, w2, b2, a), copied. Before any
   // capture of draft(). dbg 1 / 2: survival() carries the margins / the log p instead (measurement only).
   void enable_cf(const float* w, int dbg);
+  // couple: coupled drafts from now on (before any capture of draft() / draft_batch()): samp the device array of the
+  // step's sessions' sampling (entry k's at samp[k]; draft() reads samp[0]), td [kDraft] the drafter temperature
+  // factor per depth (> 0). Never called: the passes are today's (no kernel reads samp).
+  void set_couple(const NoiseSamp* samp, const float* td);
   const float* cf_raw() const { return cf_w_ ? cf_raw_ : nullptr; }  // device [16]: the MLP's inputs of the last draft()
 
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"; ProbeOut): enable_probe() once, before any capture
@@ -302,6 +346,12 @@ class Draft {
   int vrows_ = kVocabRank;
   float *cf_w_ = nullptr, *cf_rec_ = nullptr, *cf_grec_ = nullptr, *cf_raw_ = nullptr;  // stack4: the confidence MLP (enable_cf)
   int cf_dbg_ = 0;
+  int nd_cur_ = 0;  // blk7: the rows of the draft() being captured (mix())
+  const NoiseSamp* cpl_ = nullptr;  // couple: null = off
+  CoupleTd cpl_td_{};
+  float cpl_cf_[2] = {1.f, 0.f}, cpl_cfb_[2] = {1.f, 0.f};  // couple: the gate's logit for coupled drafts, A lg + B
+  bool cpl_cf_on_ = false, cpl_cfb_on_ = false;
+  float cf_tail_[2] = {1.f, 0.f};  // blk7 (DSGB10_CF_TAIL): the gate's logit of drafts past the MLP's depths, A c + B
   Buf* b_;
   int* ids_;
   float* conf_;

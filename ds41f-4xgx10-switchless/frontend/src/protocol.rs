@@ -25,9 +25,14 @@ pub const FLAG_KEEP: u32 = 2;
 pub const FLAG_LOGPROBS: u32 = 4;
 /// vision: the image part (vision::payload) follows prompt[]
 pub const FLAG_IMAGES: u32 = 8;
+/// copy drafts: the client's `prediction` as token ids after prompt[], their count in the header's
+/// reserved word. Drafts only (the engine verifies every token); only requests with a prediction set
+/// it, and only with `--prediction`.
+pub const FLAG_PREDICTION: u32 = 16;
 /// Opt into the ordinary connection-scoped RAM image cache when the engine also enables it.
-pub const FLAG_IMAGE_CACHE: u32 = 16;
-pub const FLAG_DURABLE_IMAGE_CACHE: u32 = 32;
+/// (32 and 64: 16 is FLAG_PREDICTION, merged first in v2)
+pub const FLAG_IMAGE_CACHE: u32 = 32;
+pub const FLAG_DURABLE_IMAGE_CACHE: u32 = 64;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
@@ -70,6 +75,8 @@ pub struct Submit {
     pub prompt: Vec<u32>,
     /// vision: the image part after prompt[] (with FLAG_IMAGES); None for text
     pub images: Option<Vec<u8>>,
+    /// copy drafts: the prediction's token ids (with FLAG_PREDICTION); empty for none
+    pub prediction: Vec<u32>,
 }
 
 impl Submit {
@@ -189,12 +196,16 @@ impl Frame {
             Frame::Submit(s) => {
                 let mut w = W::new(T_SUBMIT);
                 // the whole frame at once: growing by doubling would hold up to twice an image part
-                w.0.reserve_exact(SUBMIT_FIXED + 4 * (s.stop_ids.len() + s.prompt.len()) + s.images.as_ref().map_or(0, Vec::len));
+                let npred = if s.flags & FLAG_PREDICTION != 0 { s.prediction.len() as u32 } else { 0 };
+                w.0.reserve_exact(SUBMIT_FIXED + 4 * (s.stop_ids.len() + s.prompt.len() + npred as usize) + s.images.as_ref().map_or(0, Vec::len));
                 w.u64(s.req_id).u64(s.session_id).u64(s.base_session_id).u64(s.seed);
                 w.f32(s.temperature).f32(s.top_p).u32(s.top_k).u32(s.max_new_tokens);
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
-                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(0);
+                w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(npred);
                 w.u32s(&s.stop_ids).u32s(&s.prompt);
+                if npred > 0 {
+                    w.u32s(&s.prediction);
+                }
                 if let Some(img) = &s.images {
                     w.0.extend_from_slice(img);
                 }
@@ -267,9 +278,10 @@ impl Frame {
                 let prefix_hint = r.u32()?;
                 let n_stop = r.u32()? as usize;
                 let n_prompt = r.u32()? as usize;
-                r.u32()?;
+                let n_pred = r.u32()? as usize;
                 let stop_ids = r.u32s(n_stop)?;
                 let prompt = r.u32s(n_prompt)?;
+                let prediction = if flags & FLAG_PREDICTION != 0 { r.u32s(n_pred)? } else { Vec::new() };
                 // vision: the image part, taken only when it is laid out as rank 0 requires it
                 // (engine/server/serve.cpp): u32 n, n spans, then exactly the spans' rows
                 let images = if flags & FLAG_IMAGES != 0 {
@@ -308,6 +320,7 @@ impl Frame {
                     stop_ids,
                     prompt,
                     images,
+                    prediction,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -428,6 +441,7 @@ mod tests {
             stop_ids: vec![1, 2],
             prompt: vec![5; 1000],
             images: Some(img.clone()),
+            prediction: Vec::new(),
         };
         let b = Frame::Submit(s).encode();
         let want = 8 + SUBMIT_FIXED + 4 * 2 + 4 * 1000 + img.len();
@@ -463,6 +477,7 @@ mod tests {
             stop_ids: vec![1],
             prompt,
             images: Some(part.clone()),
+            prediction: Vec::new(),
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s.clone()));
@@ -504,11 +519,23 @@ mod tests {
             stop_ids: vec![1],
             prompt: vec![0, 10, 20],
             images: None,
+            prediction: Vec::new(),
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt
         assert_eq!(u32::from_le_bytes(b[8 + 64..8 + 68].try_into().unwrap()), 3); // n_prompt at offset 64
-        assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s));
+        assert_eq!(u32::from_le_bytes(b[8 + 68..8 + 72].try_into().unwrap()), 0); // reserved: no prediction
+        assert_eq!(Frame::decode(T_SUBMIT, &b[8..], |_| 0).unwrap(), Frame::Submit(s.clone()));
+        // copy drafts: a prediction rides after the prompt, its count in the reserved word; without the flag
+        // the frame is the one of before, whatever the field holds
+        let mut p = s.clone();
+        p.prediction = vec![5, 6];
+        assert_eq!(Frame::Submit(p.clone()).encode(), b);
+        p.flags |= FLAG_PREDICTION;
+        let bp = Frame::Submit(p.clone()).encode();
+        assert_eq!(bp.len(), b.len() + 8);
+        assert_eq!(u32::from_le_bytes(bp[8 + 68..8 + 72].try_into().unwrap()), 2);
+        assert_eq!(Frame::decode(T_SUBMIT, &bp[8..], |_| 0).unwrap(), Frame::Submit(p));
         let d = Done {
             req_id: 1,
             reason: DoneReason::Length,

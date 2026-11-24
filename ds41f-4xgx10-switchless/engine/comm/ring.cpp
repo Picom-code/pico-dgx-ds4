@@ -137,7 +137,7 @@ struct Link {
   int unsignaled = 0;
 };
 
-enum WrKind : uint64_t { kWrDirect = 0, kWrRelayToPrev = 1, kWrRelayToNext = 2 };
+enum WrKind : uint64_t { kWrDirect = 0, kWrRelayToPrev = 1, kWrRelayToNext = 2, kWrStat = 3 };
 inline uint64_t wr_id(WrKind k, uint64_t seq) { return (uint64_t(k) << 56) | seq; }
 
 // ---------------------------------------------------------------- TCP bootstrap
@@ -389,6 +389,27 @@ struct Ring::Impl {
   Link to_opp[kDomains];  // direct mode only: straight to the opposite rank
   bool direct = false;
   bool merge = false;  // direct mode: a small contribution goes to a neighbour as one write and one flag pair
+  int rs_bal = 0;      // direct mode: how a reduce-scatter's neighbour quarters use the two domains (Options::rs_bal)
+  // statistics (Options::stats_s): proxy thread only
+  int stats_s = 0;
+  struct StatPend {
+    uint64_t post_ns, sent_ns, first_arr, last_arr;
+    uint32_t nbytes, op;
+    int chains, cqes, got;
+  } sp[16]{};
+  struct StatBucket {
+    uint64_t n, bytes, all_ns, sent_ns, lag_ns, gap_ns, early_ns, piped, laggard;
+    uint64_t gh[4], gs_ns;  // gaps under 25 us / 100 us / 1 ms / longer, and the sum of those under 1 ms
+  } sb[2][33]{};
+  uint64_t stat_arrival = 1, stat_fin = 1, stat_prev_last = 0, stat_last_print = 0, stat_printed_n = 0, stat_n = 0;
+  void stat_sig(ibv_send_wr& w, uint64_t seq) {
+    if (!stats_s) return;
+    w.send_flags |= IBV_SEND_SIGNALED;
+    w.wr_id = wr_id(kWrStat, seq);
+    sp[seq % 16].chains++;
+  }
+  void stat_step();
+  void stat_print();
   int sock_next = -1, sock_prev = -1, sock_listen = -1;
   DevChannel dev{};
   unsigned long long* d_seq = nullptr;
@@ -433,6 +454,10 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
     const int v = o.direct >= 0 ? o.direct : (e ? atoi(e) : 0);
     I.direct = v != 0;
     I.merge = v >= 2;
+    const char* b = std::getenv("DSGB10_RING_RSBAL");
+    I.rs_bal = o.rs_bal >= 0 ? o.rs_bal : (b ? atoi(b) : 0);
+    const char* cs = std::getenv("DSGB10_COMM_STATS");
+    I.stats_s = o.stats_s >= 0 ? o.stats_s : (cs ? atoi(cs) : 0);
   }
   if (net || o.rank < 0) I.F = &fleet(o.fleet);
   if (o.rank >= kRanks) die("comm: rank %d, but the ring has %d", o.rank, kRanks);
@@ -516,6 +541,9 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
                  I.F ? I.F->rank[I.rank].name.c_str() : "loop", I.region.size, I.L.cap,
                  128 << I.to_next[0].mtu,
                  I.direct ? (I.merge ? ", direct to the opposite rank (no relays), merged small writes" : ", direct to the opposite rank (no relays)") : "");
+  if (I.rs_bal || I.stats_s)
+    std::fprintf(stderr, "comm: rank %d reduce-scatter domain balance %d%s, stats every %d s\n", I.rank, I.rs_bal,
+                 I.direct ? "" : " (ignored: not direct)", I.stats_s);
 }
 
 Ring::~Ring() {
@@ -646,6 +674,10 @@ int Ring::Impl::poll(Link& l) {
     uint64_t kind = wc[i].wr_id >> 56, seq = wc[i].wr_id & ((1ull << 56) - 1);
     if (kind == kWrRelayToPrev) done_relay_prev = seq;
     if (kind == kWrRelayToNext) done_relay_next = seq;
+    if (kind == kWrStat) {
+      StatPend& P = sp[seq % 16];
+      if (++P.cqes == P.chains) P.sent_ns = now_ns();
+    }
   }
   return n;
 }
@@ -773,6 +805,7 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
       if (op == kOpReduceScatter) c.write(*sd.l[0], mine + b.off, b.len, sd.buf + b.off);
       else c.write(*sd.l[0], mine, n, sd.buf);
       c.set_flag_pair(*sd.l[0], seq, n, op, sd.fa);
+      stat_sig(c.wr[c.n - 1], seq);
       post_chain(*sd.l[0], c.wr, c.n);
     } else if (!split) {
       Chain c;
@@ -780,13 +813,27 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
       c.set_flag(*sd.l[0], 0, seq, n, op, sd.fa);
       c.write(*sd.l[0], mine + b.off, b.len, sd.buf + b.off);
       c.set_flag(*sd.l[0], 1, seq, n, op, sd.fb);
+      stat_sig(c.wr[c.n - 1], seq);
       post_chain(*sd.l[0], c.wr, c.n);
     } else {
       Chain ca, cb;
-      ca.write(*sd.l[0], mine + a.off, a.len, sd.buf + a.off);
-      ca.set_flag(*sd.l[0], 0, seq, n, op, sd.fa);
-      cb.write(*sd.l[1], mine + b.off, b.len, sd.buf + b.off);
-      cb.set_flag(*sd.l[1], 0, seq, n, op, sd.fb);
+      if (direct && op == kOpReduceScatter && rs_bal) {
+        // nobody relays, so A is empty and today's B (the neighbour's whole quarter) loads domain 1 with 2.5 quarters
+        // against domain 0's 0.5. Spread it: in halves (1), or next's on domain 0 and prev's on domain 1 (2). The
+        // bytes land where they did; flag A follows what domain 0 carries, flag B what domain 1 carries.
+        const uint32_t h = rs_bal == 1 ? split_at(b.len) : sd.to_next ? b.len : 0;
+        ca.write(*sd.l[0], mine + b.off, h, sd.buf + b.off);
+        ca.set_flag(*sd.l[0], 0, seq, n, op, sd.fa);
+        cb.write(*sd.l[1], mine + b.off + h, b.len - h, sd.buf + b.off + h);
+        cb.set_flag(*sd.l[1], 0, seq, n, op, sd.fb);
+      } else {
+        ca.write(*sd.l[0], mine + a.off, a.len, sd.buf + a.off);
+        ca.set_flag(*sd.l[0], 0, seq, n, op, sd.fa);
+        cb.write(*sd.l[1], mine + b.off, b.len, sd.buf + b.off);
+        cb.set_flag(*sd.l[1], 0, seq, n, op, sd.fb);
+      }
+      stat_sig(ca.wr[ca.n - 1], seq);
+      stat_sig(cb.wr[cb.n - 1], seq);
       post_chain(*sd.l[0], ca.wr, ca.n);
       post_chain(*sd.l[1], cb.wr, cb.n);
     }
@@ -813,6 +860,7 @@ void Ring::Impl::post_opp(uint64_t seq, uint32_t n, uint32_t op) {
     Chain c;
     c.write(l, mine + off, len, L.opp[p] + off);
     c.set_flag_pair(l, seq, n, op, L.flag(p, kOpp0));
+    stat_sig(c.wr[c.n - 1], seq);
     post_chain(l, c.wr, c.n);
   } else {
     const uint32_t h = split_at(len);
@@ -821,6 +869,8 @@ void Ring::Impl::post_opp(uint64_t seq, uint32_t n, uint32_t op) {
     c0.set_flag(to_opp[0], 0, seq, n, op, L.flag(p, kOpp0));
     c1.write(to_opp[1], mine + off + h, len - h, L.opp[p] + off + h);
     c1.set_flag(to_opp[1], 0, seq, n, op, L.flag(p, kOpp1));
+    stat_sig(c0.wr[c0.n - 1], seq);
+    stat_sig(c1.wr[c1.n - 1], seq);
     post_chain(to_opp[0], c0.wr, c0.n);
     post_chain(to_opp[1], c1.wr, c1.n);
   }
@@ -854,6 +904,85 @@ void Ring::Impl::post_relay(bool to_prev_side, uint64_t seq, uint32_t n, uint32_
   }
 }
 
+// Statistics (Options::stats_s), direct mode. Per collective, on this box's clock: `sent` = own doorbell seen -> the
+// last of this rank's writes acknowledged (its data is in every peer's memory: time on the wire, with the peers'
+// traffic on the same ports); `all` = own doorbell -> the last of the six arrival flags (what a kernel that posts and
+// then waits sees; 0 and counted as `laggard` when everything was here before this rank posted); `lag` = all - sent
+// when positive (the peers posted later than this rank, or their path was slower); `early` = how long before this
+// rank's own post the last flag arrived, for the laggard ones; `gap` = the previous collective's last arrival -> this
+// doorbell (the GPU side: reduce, compute, copy in; `piped` counts posts made before the previous one had arrived).
+void Ring::Impl::stat_step() {
+  static const int ks[kNumWait] = {kFromPrevA, kFromPrevB, kFromNextA, kFromNextB, kOpp0, kOpp1};
+  {
+    StatPend& A = sp[stat_arrival % 16];
+    const int p = stat_arrival % kSlots;
+    for (int k = 0; k < kNumWait; k++)
+      if (!(A.got >> k & 1) && load_acquire(&flag(p, ks[k])->seq) == stat_arrival) {
+        A.got |= 1 << k;
+        A.last_arr = now_ns();
+        if (!A.first_arr) A.first_arr = A.last_arr;
+      }
+    if (A.got == (1 << kNumWait) - 1) {
+      A.got |= 1 << kNumWait;  // complete
+      stat_arrival++;
+    }
+  }
+  while (stat_fin < next_post && stat_fin < stat_arrival && sp[stat_fin % 16].sent_ns) {
+    StatPend& P = sp[stat_fin % 16];
+    int b = 0;
+    while (b < 32 && (1u << b) < P.nbytes) b++;
+    StatBucket& B = sb[P.op == kOpReduceScatter][b];
+    B.n++, B.bytes += P.nbytes;
+    B.sent_ns += P.sent_ns - P.post_ns;
+    if (P.last_arr > P.post_ns) {
+      B.all_ns += P.last_arr - P.post_ns;
+      if (P.last_arr > P.sent_ns) B.lag_ns += P.last_arr - P.sent_ns;
+    } else {
+      B.laggard++, B.early_ns += P.post_ns - P.last_arr;
+    }
+    if (stat_prev_last) {
+      if (P.post_ns >= stat_prev_last) {
+        const uint64_t g = P.post_ns - stat_prev_last;
+        if (g < 50000000ull) B.gap_ns += g;  // not the idle time
+        B.gh[g < 25000 ? 0 : g < 100000 ? 1 : g < 1000000 ? 2 : 3]++;
+        if (g < 1000000) B.gs_ns += g;
+      } else {
+        B.piped++;
+      }
+    }
+    stat_prev_last = P.last_arr;
+    P.got = 0, P.first_arr = P.last_arr = 0;
+    stat_fin++, stat_n++;
+  }
+  if (!(++stat_last_print & 0xfff)) {
+    static uint64_t next_ns = 0;
+    const uint64_t t = now_ns();
+    if (!next_ns) next_ns = t + (uint64_t)stats_s * 1000000000ull;
+    if (t >= next_ns) {
+      next_ns = t + (uint64_t)stats_s * 1000000000ull;
+      if (stat_n != stat_printed_n) stat_print();
+      stat_printed_n = stat_n;
+    }
+  }
+}
+
+void Ring::Impl::stat_print() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  for (int o = 0; o < 2; o++)
+    for (int b = 0; b <= 32; b++) {
+      const StatBucket& B = sb[o][b];
+      if (!B.n) continue;
+      std::fprintf(stderr,
+                   "comm-stats t=%ld rank=%d op=%s le=%u n=%lu bytes=%lu all_us=%.0f sent_us=%.0f lag_us=%.0f gap_us=%.0f "
+                   "early_us=%.0f piped=%lu laggard=%lu g25=%lu g100=%lu g1000=%lu gmore=%lu gshort_us=%.0f\n",
+                   (long)ts.tv_sec, rank, o ? "rs" : "ax", b >= 32 ? 0xffffffffu : 1u << b, (unsigned long)B.n,
+                   (unsigned long)B.bytes, B.all_ns / 1e3, B.sent_ns / 1e3, B.lag_ns / 1e3, B.gap_ns / 1e3, B.early_ns / 1e3,
+                   (unsigned long)B.piped, (unsigned long)B.laggard, (unsigned long)B.gh[0], (unsigned long)B.gh[1],
+                   (unsigned long)B.gh[2], (unsigned long)B.gh[3], B.gs_ns / 1e3);
+    }
+}
+
 // Diagnostics: answer each GPU post by setting the six wait flags locally.
 void Ring::Impl::loopback_loop() {
   while (!stop.load(std::memory_order_relaxed)) {
@@ -884,6 +1013,11 @@ void Ring::Impl::proxy_loop() {
       if (load_acquire(&f->seq) == next_post) {
         io_fence();
         if (next_post < tr.size()) tr[next_post].post = now_ns();
+        if (stats_s) {
+          StatPend& P = sp[next_post % 16];
+          P.post_ns = now_ns(), P.sent_ns = 0, P.chains = P.cqes = 0;
+          P.nbytes = load_relaxed(&f->nbytes), P.op = load_relaxed(&f->op);
+        }
         post_direct(next_post, load_relaxed(&f->nbytes), load_relaxed(&f->op));
         next_post++;
         worked = true;
@@ -935,6 +1069,7 @@ void Ring::Impl::proxy_loop() {
         rounds = 1023;  // backed off: check after every round
       }
     }
+    if (stats_s) stat_step();
     if (next_arrival < tr.size()) {
       const int p = next_arrival % kSlots;
       static const int ks[kNumWait] = {kFromPrevA, kFromPrevB, kFromNextA, kFromNextB, kOpp0, kOpp1};
@@ -947,6 +1082,7 @@ void Ring::Impl::proxy_loop() {
       if (got == kNumWait) next_arrival++;
     }
   }
+  if (stats_s && stat_n != stat_printed_n) stat_print();
 }
 
 }  // namespace comm

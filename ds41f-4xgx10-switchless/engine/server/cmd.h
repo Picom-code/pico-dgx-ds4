@@ -107,15 +107,25 @@ struct Cmd {
   float spec_thresh = -1.f;  // verify d_j while survival[j - 1] >= this; < 0: lambda * dC (SpecRate)
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};  // ms: a step of one row, each further row (dC), a draft pass
   int32_t spec_force = -1;   // kCmdRows: draft from this token, not the sampled one (teacher-forced checks)
-  int32_t spec_probe[model::ops::kDrafts] = {-1, -1, -1, -1, -1};  // kCmdRows, EXPERIMENT: SpecCfg::probe
+  int32_t spec_probe[model::ops::kDrafts] = {-1, -1, -1, -1, -1, -1, -1};  // kCmdRows, EXPERIMENT: SpecCfg::probe
   // the gate (model::ops kGate*): kGateThresh uses spec_thresh / spec_cost, the others spec_row_ms, the
   // ms of a step verifying 0..5 drafts with its draft pass (measured at 1k of context, docs/engine.md)
   int32_t spec_gate = model::ops::kGateThresh;
-  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f};
+  float spec_row_ms[model::ops::kDrafts + 1] = {21.10f, 25.38f, 29.26f, 32.76f, 35.61f, 38.70f, 41.70f, 44.70f};
   // kCmdDecode: the drafts' rate (SpecRate) to start from: a request decoded in slices goes on with the
   // last slice's (DecodeEnd::spec_tok, spec_ms)
   double spec_tok = 1, spec_ms = 0;
+  // copy drafts (server/copy.h): kCmdTokens: the request's prediction, n_pred token ids, follows the prompt's
+  // payload (0: none; the slot's earlier one is dropped either way)
+  int32_t n_pred = 0;
+  // copy drafts (DSGB10_COPY_DELTA): kCmdTokens: delta = 1: the tokens start where the ranks' history of the slot stops
+  // being the prompt's; hist_hash: copy_hist_hash of the pos0 tokens below them (a rank that holds others dies)
+  int32_t delta = 0;
+  uint64_t hist_hash = 0;
 };
+
+// copy drafts: slot s's prediction (the client's `prediction` text as token ids; n = 0: none), kept until the next
+void set_prediction(int slot, const int32_t* t, int n);
 
 Cmd bcast(comm::Ring& ring, const Cmd& mine);
 // c's state operations, on every rank before c's own work, with the sessions c uses pinned in the
@@ -163,7 +173,8 @@ uint64_t run_rows(model::Model& m, const Cmd& c);
 // emits its accepted drafts and the token after them, and chooses the next step's rows, which is queued
 // before it ends with its rows left to the device. Stops act per token: what follows a stop token in
 // its step is dropped.
-enum : uint32_t { kEndStop, kEndLength, kEndCancel, kEndContext, kEndPause };
+// kEndSwitch: inside decode_loop only (copy drafts: the request goes on in the other kind of step)
+enum : uint32_t { kEndStop, kEndLength, kEndCancel, kEndContext, kEndPause, kEndSwitch };
 struct DecodeEnd {
   int sampled = 0;     // tokens sampled: tok_1 .. tok_sampled
   int fed = 0;         // positions pos0 .. pos0 + fed - 1 hold the KV of tok_0 .. tok_{fed-1} now
@@ -181,6 +192,7 @@ struct DecodeEnd {
   float gate_min = 0, gate_max = 0;
   int gate_n = 0;
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) at the end: the next slice's start
+  int copy_steps = 0, copy_rows = 0, copy_acc = 0;  // copy drafts: steps with them, their drafts, the accepted ones
   void gate(float t) {
     gate_min = gate_n ? std::min(gate_min, t) : t, gate_max = gate_n ? std::max(gate_max, t) : t;
     gate_sum += t, ++gate_n;
@@ -263,8 +275,14 @@ struct SpecBatchStats {
   double gpu_ms[model::kMaxRows + 1] = {};  // the steps' GPU ms by their rows, summed (past the first few)
   int gpu_n[model::kMaxRows + 1] = {};
 };
+// Copy drafts (server/copy.h, DSGB10_COPY=1): every entry whose reply repeats its prompt (or its prediction) offers
+// the device a copy window per step. solo (decode_loop's use, one entry): the control word ends the entry as it ends
+// the speculative loop (any bit: kEndCancel), and after `solo` steps without a copy the entry ends with kEndSwitch;
+// ext: its copy state, kept by the caller.
+struct CopySrc;
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                       const OnBatch& on, SpecBatchStats* st = nullptr);
+                                       const OnBatch& on, SpecBatchStats* st = nullptr, CopySrc* ext = nullptr,
+                                       int solo = 0);
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
 // next step's Engram lookups were submitted, and when the step after was launched.

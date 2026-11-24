@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png?v=5" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
+  <img src="assets/banner.png?v=6" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
 </p>
 
 <p align="center">
@@ -21,43 +21,57 @@
 
 ## ✧ the numbers
 
-<p align="center"><img src="assets/c16.png?v=5" alt="16-user throughput" width="80%"></p>
-<p align="center"><img src="assets/c1.png?v=5" alt="single-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c16.png?v=6" alt="16-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c1.png?v=6" alt="single-user throughput" width="80%"></p>
 
 ```
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
 │ chat, 1 user, 320 prompts│ -            │ 90.3 (86.2)  │ -          │
-│ chat, 1 user, 3 prompts  │ 80           │ 85           │ 64         │
-│ code, 1 user, 3 prompts  │ 140          │ 144          │ 117        │
+│ chat, 1 user, 3 prompts  │ 80           │ 84           │ 64         │
+│ code, 1 user, 3 prompts  │ 140          │ 147          │ 117        │
 │ code, 1 user, 320 prompts│ -            │ 133.6 (128.2)│ -          │
-│ 8 users, distinct        │ -            │ 307          │ -          │
-│ 16 users, distinct       │ -            │ 376          │ -          │
+│ file rewrite, 1 user     │ -            │ 365-468      │ -          │
+│ 8 users, distinct        │ -            │ 345          │ -          │
+│ 16 users, distinct       │ -            │ 413          │ -          │
 │ 16 users, copies         │ 177          │ 441          │ 427        │
 │ agents (8 x 80-300K ctx) │ ~150         │ 260-270      │ -          │
-│ prefill                  │ 10k          │ 10k          │ 5.3k       │
+│ prefill                  │ 10k          │ 10.8k        │ 5.3k       │
 │ max context              │ 256K         │ 1M           │ 1M         │
-│ images                   │ no           │ yes          │ -          │
-│ quality (qeval /75)      │ 71           │ 71-72        │ 70         │
+│ images, video            │ no           │ yes          │ -          │
+│ quality (qeval /75)      │ 71           │ 71           │ 70         │
 └──────────────────────────┴──────────────┴──────────────┴────────────┘
   tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · temp 0 · (in brackets: before stack4 + stack5)
-  Headline single-user: 90 chat (mean over 320 held-out prompts) / 144 code (3-prompt bench).
+  Headline single-user: 90 chat (mean over 320 held-out prompts) / 147 code (3-prompt bench).
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
-  Single-user = 27-run medians of our bench on the live build, 2026-11-11: 84.6 / 144.0
+  Single-user 3-prompt rows = 9-run medians of our bench on a test port, 2026-11-19, four cold
+    starts: chat 83.6 / 84.1 / 84.6 / 83.8, code 149.6 / 145.4 / 151.9 / 143.1 (2026-11-11, the
+    build before: 84.6 / 144.0). One-user chat is unchanged: the gains of this release are in
+    shared steps, prompt reading, sampled requests and long code. The 320-prompt rows were not
+    re-run for this release (140 of the prompts: same texts as the build they were measured on).
+  Before 2026-11-19 this line read: 27-run medians on the live build, 2026-11-11: 84.6 / 144.0
     (2026-11-10, before stack5: 82.7 / 142.6; the medians swing by ±3 between runs). The
     paired rows are the proof: the same 320 held-out prompts, same texts: chat 86.2 exact
     build -> 89.5 with stack4 -> 90.3 with stack5 (89.2 without it, same binary, same hour).
   On sparkDash 1.8.8's method (live build, 2026-11-11): prose 102.0, code 164.6; catalogs
     80.7 / 132.4 / 156.0 (before stack5, same binary, same hour: 100.6 / 163.0;
     78.8 / 128.8 / 154.1). Upstream README: 95 / 151.
-  16 users = medians of 3 runs on the live build, 2026-11-11 (distinct 374 / 376 / 378,
-    copies 441 / 448 / 439). 8 users and agents: gate runs on a test port, same build.
+  16 users distinct = mean of 8 runs on a test port, 2026-11-19 (407.8 - 419.4; the build
+    before: 374 / 376 / 378). 8 users distinct: 340 and 350 (two runs). Prefill: a 48.7K-token
+    cold prompt, 8-10 starts (36K tokens: 10.7k; 8.7K tokens: 9.3k; 948K tokens: 10.2k). Copies
+    and agents were not re-run for this release and still show the build before (copies
+    441 / 448 / 439, 2026-11-11).
+  File rewrite = a reply that repeats its prompt with one edit (copy drafts, docs/copy.md): 1K /
+    4K / 8K-token files 365-370 / 459-465 / 468 tok/s, the same texts as without the feature
+    (164). Several rewrites at once gain almost nothing.
     Reproduce the bench rows with tools/bench/bench.py.
   A lossy relaxed-accept experiment (103 / 163) was tried and removed.
 ```
+
+A standard benchmark, by kind of text: NVIDIA's SPEED-Bench (880 prompts in 11 categories, replies up to 8,192 tokens) run with NVIDIA AIPerf, one stream and 16 streams, with draft acceptance per category: [docs/speed-bench.md](ds41f-4xgx10-switchless/docs/speed-bench.md).
 
 ## ✧ what changed
 
@@ -76,6 +90,11 @@
   learned gate ....... DSGB10_CF_MLP=FILE, a small MLP decides how many drafts a step verifies
   certified head ..... DSGB10_CERT=1, greedy steps read a coarse head + only the rows that can win
   direct ring ........ DSGB10_RING_DIRECT=2, on a switch each rank writes to every rank itself (no relays)
+  v2: shared steps ... wide-step collectives, shared expert on a side stream, L2 prefetch, gate separation (same bits)
+  v2: sampled ........ DSGB10_GSAMPLE=1, Gumbel-max sampler + drafts with the same noise (same distribution)
+  v2: exact repeats .. DSGB10_REUSE_EXACT=1, a re-sent prompt gets its first reply
+  v2: copy drafts .... DSGB10_COPY=1, replies that repeat the prompt or a `prediction` verified 64 rows a step (same bits)
+  v2: more media ..... thinking options, 100 images per request, video input (pull requests by MiaAI-Lab)
   (removed) relaxed accept: lossy single-user experiment, not part of the build (CHANGES.md #12)
 ```
 
@@ -158,8 +177,11 @@ This is the exact build behind the numbers above (the engine source in this repo
   3  gate weights ... copy ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin to the SAME path on
                       all four boxes (e.g. ~/cfmlp_cml.bin). The engine exits at start without it.
   4  engine args .... the block below, through service.sh
-  5  images ......... optional: start tools/vision/vision_encoder.py on rank 0 and add
-                      --vision-addr 127.0.0.1:18950 to the front-end's arguments (docs/vision.md)
+  5  images, video .. optional: start tools/vision/vision_encoder.py on rank 0 (video_frames.py
+                      beside it) and add --vision-addr 127.0.0.1:18950 to the front-end's
+                      arguments (docs/vision.md). Up to 100 images a request; caps:
+                      --max-image-rows 40000, --max-image-rows-in-flight 80000 (429 above it;
+                      we serve with 40000: one full image request at a time)
   6  check .......... python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions c1 27
                       python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions distinct 16
 ```
@@ -171,14 +193,29 @@ DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
   --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 \
   --setenv DSGB10_CF_MLP=~/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 \
-  --setenv DSGB10_CERT=1 --setenv DSGB10_RING_DIRECT=2"
-# DSGB10_RING_DIRECT=2 only when all four boxes are on one switch (every rank reaches every
-# rank in one hop). On upstream's cabled ring leave it out.
+  --setenv DSGB10_CERT=1 --setenv DSGB10_RING_DIRECT=2 \
+  --setenv DSGB10_WIDE_SH=1 --setenv DSGB10_WIDE_AR=2 \
+  --setenv DSGB10_L2PF=d:d0=50,da=40,db=60,dh=35/c2:plan=wqa+wqb+woa+wob+gate+sh13+sh2,u1=wob,u2=wob,u3=wob,u4=sh2,w1=110,w2=50,w3=20,w3i=40,w4=60 \
+  --setenv DSGB10_PF_TUNE=hc,small,down \
+  --setenv DSGB10_DRAFT_MAX=7 --setenv DSGB10_DRAFT_DYN=5 \
+  --setenv DSGB10_REUSE_EXACT=1 \
+  --setenv DSGB10_RING_RSBAL=1 --setenv DSGB10_HEADG=2 \
+  --setenv DSGB10_GSAMPLE=1 --setenv DSGB10_GCOUPLE=0.8 \
+  --setenv DSGB10_GATE_SEP=1 \
+  --setenv DSGB10_COPY=1 --setenv DSGB10_COPY_LOG=1 --setenv DSGB10_COPY_ENTER=32 \
+  --setenv DSGB10_COPY_SHARED=0 --setenv DSGB10_COPY_ROWS=64 \
+  --setenv DSGB10_NORM_EXACT=1 --setenv DSGB10_WIDE_EXACT=95 --setenv DSGB10_WIDE_EXACT_MT=2 \
+  --setenv DSGB10_EXACT_SOLO=136 --setenv DSGB10_COPY_SW=1 --setenv DSGB10_COPY_DELTA=1"
+# DSGB10_RING_DIRECT=2 and DSGB10_RING_RSBAL=1 only when all four boxes are on one switch (every
+# rank reaches every rank in one hop). On upstream's cabled ring leave both out.
+# The DSGB10_L2PF budgets and DSGB10_GATE_SEP were fitted on GB10; every variable defaults to off.
+# The last three lines are copy drafts (docs/copy.md); add --prediction to the front-end's arguments
+# to accept the `prediction` request field. We serve the front-end with
+#   --vision-addr 127.0.0.1:18950 --prediction --max-image-rows-in-flight 40000
 ```
 
-What to expect on that bench with nothing else on the endpoint: chat about 80-85 and code about 140-145 for one user
-(chat runs swing between ~75 and ~95 by prompt), about 376 tok/s for 16 users with different prompts, about 441 with
-repeated prompts. The 90.3 chat figure is the mean over our 320 held-out prompts, a different and larger prompt set.
+What to expect on that bench with nothing else on the endpoint: chat about 80-85 and code about 143-152 for one user
+(chat runs swing between ~75 and ~95 by prompt), about 410 tok/s for 16 users with different prompts. The 90.3 chat figure is the mean over our 320 held-out prompts, a different and larger prompt set.
 The confidence-gate weights were fitted on this checkpoint (DeepSeek V4.1 Flash, 1017 build); on another checkpoint the
 output stays the model's own, but the gain may differ.
 
@@ -190,6 +227,7 @@ Drop `DSGB10_OEA` for a strictly lossless multi-user build (details:
 ```
   engine, kernels, RoCE ring, drafter ...... Andy Shu, blaesus/dsgx10 (MIT)  ♡ thank you
   multi-user, 1M context, wide step ........ Pico (Patrick Moorhead), this fork
+  thinking options, 100 images, video ...... MiaAI-Lab (pull requests #4, #5, #6)
   model, DSpark drafter .................... DeepSeek
   stack4 ideas ............................. Carryover Drafting, certhead, CSV-Decode, FR-Spec, TVP (see above)
 ```

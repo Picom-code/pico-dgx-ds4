@@ -16,7 +16,7 @@ using bf16 = __nv_bfloat16;
 // so the next step can be queued while one runs); step_in copies the next slot to device memory first
 // thing, so one captured graph serves every step of its row count.
 constexpr int kInSlots = 4;
-constexpr int kDrafts = 5;  // DSpark's drafts per pass (dspark::kDraft)
+constexpr int kDrafts = 7;  // DSpark's drafts per pass AT MOST (dspark::kDraft; blk7: the passes run dspark::draft_rows())
 enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 // How a spec step chooses the next step's drafts (StepIn::gate; spec.cu k_spec_next):
 // - kGateThresh: draft j while survival[j - 1] >= thresh;
@@ -33,11 +33,27 @@ constexpr int kLowRows = 8;
 constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : R <= kDecodeRows ? kDecodeRows : kMaxRows; }
 constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
 static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
+// couple (DSGB10_GSAMPLE, model.h gsample_top_k): a sampled session on the Gumbel path carries this bit in StepSamp::top_k
+// (its real top-k in the bits below). Its truncated (top-p / top-k) rows then take the Gumbel-max winner among the SAME kept
+// tokens today's sampler keeps (noise hashed from seed, position and token id, as the untruncated sampler's), and its
+// drafts may be coupled (DSGB10_GCOUPLE, dspark.h). Never set unless DSGB10_GSAMPLE is: every path is then today's.
+constexpr int32_t kSampGumbel = 1 << 30;
+// Copy drafts (DSGB10_COPY, docs/copy.md): the host's predicted tokens for entries of a batch verify step, by
+// position. Window w says "entry ent's token at position pos0 + j is copy_tok[off + j]", j < n; [0] is a token the
+// host knows. The device uses a window when the entry's first row (its real token, at a position inside the window)
+// equals the window's token there; the entry's drafts are then the (at most max) tokens after it instead of the draft
+// module's (spec_batch.h). Every draft is verified as any draft is, so a wrong window costs rows, never a token.
+// mode bit 0: only when the draft module's own gated drafts agree with the window.
+constexpr int kCopyWin = 4;    // windows a step
+constexpr int kCopyTok = 256;  // their tokens, in all
+struct CopyWin {
+  int32_t ent, pos0, off, n, max, mode;
+};
 struct StepSamp {  // one session's sampling (model::Sampling)
   uint64_t seed;
   float temperature;  // 0: greedy
   float top_p;        // 1: off
-  int32_t top_k;      // 0: off
+  int32_t top_k;      // 0: off; couple: bit kSampGumbel set (with top_k > 0 as an int): the session is on the Gumbel path
   int32_t n_top;      // top logprobs per row, 0..kTopLogprobs
 };
 struct StepIn {
@@ -82,6 +98,11 @@ struct StepIn {
   // wide64: the gate's step-cost model (ms) by the rows R a step runs: R <= kDecodeRows: wcost[0] + wcost[1] R; a
   // wide bucket of Rb rows: wcost[2] + wcost[3] Rb (DSGB10_WIDE_COST; fit to serve's GPU ms by rows, 2026-11-05: 26, 2.1, 56, 1.6)
   float wcost[4];
+  // copy drafts (above): read only when sbatch = 1 and copy_on = 1. copy_cap: the step's rows in all, at most, once a
+  // window is used (the entries' own rows always fit; a step already in a wide bucket may fill that bucket)
+  int32_t copy_on, copy_cap;
+  CopyWin copy[kCopyWin];
+  int32_t copy_tok[kCopyTok];
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
@@ -91,7 +112,7 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
 constexpr int kTopLogprobs = 20;  // top logprobs per row, at most
 constexpr int kCand = 64;         // candidates per rank and row for top-k / top-p / top logprobs
 constexpr int kOutSlots = 4;
-constexpr int kProbeWords = 100;  // sizeof(dspark::ProbeOut) / 4
+constexpr int kProbeWords = 20 * kDrafts;  // sizeof(dspark::ProbeOut) / 4
 struct SampleRow {
   int32_t token;
   float logprob;   // of token under softmax(logits / T) (T = 1 when greedy), before top-k / top-p

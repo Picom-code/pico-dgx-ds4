@@ -229,6 +229,139 @@ constexpr auto gemv_fp8_kernel() {
   else return k_gemv_fp8_r16<TILED, NORM>;
 }
 
+// exact wide: the row-group GEMV for wide steps (17..64 rows). k_gemv_fp8_r16 (one tile per warp) for G groups of 16
+// activation rows in one launch: every weight step is loaded once (the 16-row kernel's loads), then each group's MMAs
+// run on it. A row keeps the 16-row kernel's arithmetic: its warp's k slice, the MMAs in step order, the fixed-order
+// sum over the slices, one bf16 rounding. So the outputs are those of G calls of at most 16 rows (and of 8-row calls),
+// bit for bit, for 1/G of the weight bytes.
+template <bool TILED, int G, int MT>
+__global__ void __launch_bounds__(512, 1) k_gemv_fp8_rg(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs,
+                                                         int M, Segs segs, int K, int wn, int wk) {
+  constexpr int RB = kMaxRows, KUL = MT == 1 ? kU : 2;  // MT tiles of 8 weight rows per warp (the same bits for any MT)
+  extern __shared__ float red[];  // [wk][RB][rows_cta]
+  const int rows_cta = wn * 8 * MT;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int wi_n = warp % wn, wi_k = warp / wn;
+  const int r_cta = blockIdx.x * rows_cta;
+  int si = 0;
+  while (si + 1 < segs.n && r_cta >= segs.row0[si + 1]) ++si;
+  const uint8_t* __restrict__ W = segs.s[si].W;
+  const uint8_t* __restrict__ S = segs.s[si].S;
+  const int N = segs.s[si].N;
+  const int n_cta = r_cta - segs.row0[si];
+  const int KB = K / 32, P = K / 64;
+  const int p0 = (P * wi_k) / wk, p1 = (P * (wi_k + 1)) / wk;
+  const uint8_t* wrow[MT];
+  const uint8_t* srow[MT];
+#pragma unroll
+  for (int i = 0; i < MT; ++i) {
+    int n = n_cta + wi_n * 8 * MT + 8 * i;
+    n = n < N ? n : 0;
+    wrow[i] = TILED ? W + (size_t)(n / 8) * 8 * K + g * 64 + 16 * t : W + (size_t)(n + g) * K + 16 * t;
+    srow[i] = S + (size_t)(n / 32) * KB;
+  }
+  const int off = 16 * (t & 1) + 8 * (t >> 1);
+  const bool odd = lane & 1, lo = t < 2;
+  const uint8_t* xa = xq + (size_t)g * K + off;                 // group 0's row g; row g + 8 at + 8 K, group q at + 16 q K
+  const uint8_t* xsm = xs + (size_t)(odd ? g + 8 : g) * KB;     // the scale row this lane gives the MMA
+  uint32_t lm = 0, lm2 = 0;                                     // bit q: group q's row g / g + 8 is live
+#pragma unroll
+  for (int q = 0; q < G; ++q) {
+    const int mq = M - RB * q;
+    lm |= (uint32_t)(g < mq) << q, lm2 |= (uint32_t)(g + 8 < mq) << q;
+  }
+  float c[G][MT][4];
+#pragma unroll
+  for (int q = 0; q < G; ++q)
+#pragma unroll
+    for (int i = 0; i < MT; ++i) c[q][i][0] = c[q][i][1] = c[q][i][2] = c[q][i][3] = 0.f;
+
+  uint4 ba[KUL][MT], bb[KUL][MT];
+  auto load_w = [&](uint4 (&b)[KUL][MT], int p) {
+#pragma unroll
+    for (int u = 0; u < KUL; ++u)
+      if (p + u < p1)
+#pragma unroll
+        for (int i = 0; i < MT; ++i) b[u][i] = ldg_stream128(wrow[i] + (p + u) * (TILED ? 512 : 64));
+  };
+  auto comp = [&](const uint4 (&b)[KUL][MT], int p) {
+#pragma unroll
+    for (int u = 0; u < KUL; ++u) {
+      if (p + u >= p1) break;
+      const int kb = 2 * (p + u);
+      uint2 a0[G], a1[G], d0[G], d1[G];
+      uint32_t f0[G], f1[G];
+#pragma unroll
+      for (int q = 0; q < G; ++q) {
+        const bool v1 = lm >> q & 1u, v2 = lm2 >> q & 1u, sv = odd ? v2 : v1;
+        const uint8_t* ar = xa + (size_t)q * RB * K + kb * 32;
+        a0[q] = a1[q] = d0[q] = d1[q] = make_uint2(0, 0);
+        if (v1) a0[q] = __ldg(reinterpret_cast<const uint2*>(ar)), a1[q] = __ldg(reinterpret_cast<const uint2*>(ar + 32));
+        if (v2)
+          d0[q] = __ldg(reinterpret_cast<const uint2*>(ar + (size_t)8 * K)),
+          d1[q] = __ldg(reinterpret_cast<const uint2*>(ar + (size_t)8 * K + 32));
+        const uint8_t* sr = xsm + (size_t)q * RB * KB + kb;
+        f0[q] = sv ? __ldg(sr) : 127u, f1[q] = sv ? __ldg(sr + 1) : 127u;
+      }
+#pragma unroll
+      for (int i = 0; i < MT; ++i) {
+        const uint32_t sfb0 = __ldg(srow[i] + kb), sfb1 = __ldg(srow[i] + kb + 1);
+        const uint4 w = b[u][i];
+        const uint32_t s0 = lo ? w.z : w.x, s1 = lo ? w.w : w.y;
+        const uint32_t r0 = __shfl_xor_sync(0xffffffffu, s0, 2), r1 = __shfl_xor_sync(0xffffffffu, s1, 2);
+        const uint32_t b00 = lo ? w.x : r0, b01 = lo ? w.y : r1, b10 = lo ? r0 : w.z, b11 = lo ? r1 : w.w;
+#pragma unroll
+        for (int q = 0; q < G; ++q) {
+          mma_e4m3_e4m3(c[q][i], a0[q].x, d0[q].x, a0[q].y, d0[q].y, b00, b01, f0[q], sfb0);
+          mma_e4m3_e4m3(c[q][i], a1[q].x, d1[q].x, a1[q].y, d1[q].y, b10, b11, f1[q], sfb1);
+        }
+      }
+    }
+  };
+  load_w(ba, p0);
+  pdl_launch_dependents();
+  pdl_wait();
+  for (int p = p0; p < p1; p += 2 * KUL) {
+    if (p + KUL < p1) load_w(bb, p + KUL);
+    comp(ba, p);
+    if (p + KUL >= p1) break;
+    if (p + 2 * KUL < p1) load_w(ba, p + 2 * KUL);
+    comp(bb, p + KUL);
+  }
+  __nv_bfloat16* __restrict__ y = segs.s[si].y;
+#pragma unroll
+  for (int q = 0; q < G; ++q) {  // each group through the 16-row kernel's reduction
+    const int mq = min(RB, M - RB * q);
+#pragma unroll
+    for (int i = 0; i < MT; ++i) {
+      const int r = wi_n * 8 * MT + 8 * i + 2 * t;
+      red[(wi_k * RB + g) * rows_cta + r] = c[q][i][0];
+      red[(wi_k * RB + g) * rows_cta + r + 1] = c[q][i][1];
+      red[(wi_k * RB + g + 8) * rows_cta + r] = c[q][i][2];
+      red[(wi_k * RB + g + 8) * rows_cta + r + 1] = c[q][i][3];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < mq * rows_cta; idx += blockDim.x) {
+      const int m = idx / rows_cta, rr = idx - m * rows_cta;
+      if (n_cta + rr >= N) continue;
+      float v = 0.f;
+      for (int j = 0; j < wk; ++j) v += red[(j * RB + m) * rows_cta + rr];
+      y[(size_t)(RB * q + m) * N + n_cta + rr] = __float2bfloat16_rn(v);
+    }
+    __syncthreads();
+  }
+}
+
+template <bool TILED, int G, int MT>
+void launch_fp8_rg(const uint8_t* xq, const uint8_t* xs, int M, const Segs& segs, int K, GemvCfg cfg, cudaStream_t st) {
+  const int rows_cta = cfg.wn * 8 * MT;
+  for (int i = 0; i < segs.n; ++i)
+    if (segs.s[i].N % rows_cta) die("gemv_fp8 (groups): segment %d has N=%d, not a multiple of %d", i, segs.s[i].N, rows_cta);
+  const size_t smem = (size_t)std::max(cfg.wk * kMaxRows * rows_cta, 256 + kMaxRows) * sizeof(float);
+  launch_pdl(k_gemv_fp8_rg<TILED, G, MT>, dim3(segs.row0[segs.n] / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st, cfg.pdl,
+             xq, xs, M, segs, K, cfg.wn, cfg.wk);
+}
+
 // Persistent version: k_gemv_fp8's arithmetic for mt = wn = 1 (tiles of 8 weight rows, wk warps along
 // K) with tiled weights, on a grid of about one CTA per SM, each taking a contiguous run of tiles.
 // Warp w streams slice w of every tile of its run through a ring of S 512-byte stages in shared
@@ -558,6 +691,32 @@ void tile_fp8(const uint8_t* src, uint8_t* dst, int N, int K, cudaStream_t st) {
 void gemv_fp8_multi(const uint8_t* xq, const uint8_t* xs, int M, const Fp8Seg* seg, int nseg, int K, GemvCfg cfg,
                     cudaStream_t st) {
   dispatch_fp8<false>(xq, xs, M, seg, nseg, K, cfg, NormIn{}, st);
+}
+
+void gemv_fp8_rows(const uint8_t* xq, const uint8_t* xs, int M, const Fp8Seg* seg, int nseg, int K, GemvCfg cfg,
+                   cudaStream_t st) {
+  if (M <= kMaxRows) return gemv_fp8_multi(xq, xs, M, seg, nseg, K, cfg, st);
+  if (M > 4 * kMaxRows || K % 64 || nseg < 1 || nseg > kMaxSegs || cfg.wn * cfg.wk > 16)
+    die("gemv_fp8_rows: unsupported call M=%d K=%d nseg=%d", M, K, nseg);
+  Segs segs{};
+  segs.n = nseg;
+  segs.row0[0] = 0;
+  for (int i = 0; i < nseg; ++i) segs.s[i] = seg[i], segs.row0[i + 1] = segs.row0[i] + seg[i].N;
+  if (cfg.mt != 1 && cfg.mt != 2) die("gemv_fp8_rows: mt=%d (1 or 2)", cfg.mt);
+  switch (((M + kMaxRows - 1) / kMaxRows * 2 + cfg.tiled) * 2 + (cfg.mt == 2)) {
+    case 8: launch_fp8_rg<false, 2, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 9: launch_fp8_rg<false, 2, 2>(xq, xs, M, segs, K, cfg, st); break;
+    case 10: launch_fp8_rg<true, 2, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 11: launch_fp8_rg<true, 2, 2>(xq, xs, M, segs, K, cfg, st); break;
+    case 12: launch_fp8_rg<false, 3, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 13: launch_fp8_rg<false, 3, 2>(xq, xs, M, segs, K, cfg, st); break;
+    case 14: launch_fp8_rg<true, 3, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 15: launch_fp8_rg<true, 3, 2>(xq, xs, M, segs, K, cfg, st); break;
+    case 16: launch_fp8_rg<false, 4, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 17: launch_fp8_rg<false, 4, 2>(xq, xs, M, segs, K, cfg, st); break;
+    case 18: launch_fp8_rg<true, 4, 1>(xq, xs, M, segs, K, cfg, st); break;
+    case 19: launch_fp8_rg<true, 4, 2>(xq, xs, M, segs, K, cfg, st); break;
+  }
 }
 
 void gemv_fp8_norm(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const Fp8Seg* seg, int nseg,
