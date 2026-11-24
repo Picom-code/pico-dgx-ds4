@@ -288,6 +288,27 @@ python3 engine/server/tests/serve_test.py --socket ~/test.sock --ced    # serve_
 engine/server/run4.sh stop
 ```
 
+**8b. Check that a request gets a reply.** A request that gets no reply is an error, and the
+engine's watchdog reports it 120 s later as `watchdog: step running for 120 s, aborting` with rank 0
+exiting `rc 3`. Send one request and check the code and the body, not only that the service started:
+
+```bash
+K=$(cat ~/dsgb10-data/dev-api-key)
+curl -s -m 150 -o /tmp/reply.json -w 'http=%{http_code} time=%{time_total}\n' \
+  -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
+  http://127.0.0.1:18893/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Count to five."}],"max_tokens":40}'
+grep -c '"finish_reason":"stop"' /tmp/reply.json                       # 1 is a reply, 0 is not
+```
+
+The expected output is `http=200` in under a second and a `1` from the `grep`. An observed failure
+on 2026-11-24 at commit `922dddb1`, with `--max-ctx 1048576 --slots 16 --big-slots 4`, was
+`http=500 time=120.355227` and a `0`, with `engine connection lost` in the body. The freeze is
+intermittent: the same command answered 10 of 10 requests in one batch and froze in another, and the
+README default `--max-ctx 262144` both answered and froze. `nvidia-smi --query-gpu=utilization.gpu`
+reads a constant 96 % on GB10 even when idle, so it does not show the freeze; `nvidia-smi dmon -s p`
+does, drawing 16 W sustained against 13 W for a request that answers.
+
 **9. Measure.** `bench/bench.py` (decode by prompt type, cold prefill, agentic turns) against any
 OpenAI-compatible endpoint, `bench/bench_record.py` (it, with every request recorded), `bench.py --modes
 edit` (pi-style coding tasks) and `bench/sparkdash/part.sh` (MiaAI-Lab's sparkDash): their commands are
