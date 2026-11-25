@@ -90,7 +90,6 @@ pub struct App {
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
-    generation_tokens: AtomicU64,
     completion_metrics: Mutex<CompletionMetrics>,
 }
 
@@ -108,7 +107,6 @@ impl App {
             sessions: Mutex::new(SessionTable::new(256, 16 << 20)),
             think_end_id,
             counter: AtomicU64::new(0),
-            generation_tokens: AtomicU64::new(0),
             completion_metrics: Mutex::default(),
         })
     }
@@ -276,7 +274,7 @@ async fn health(State(app): State<Arc<App>>) -> Response {
 /// Prometheus exposition with the TensorFold names consumed by sparkDash.
 async fn metrics(State(app): State<Arc<App>>) -> Response {
     let (running, waiting) = app.gate.load();
-    let generated = app.generation_tokens.load(Ordering::Relaxed);
+    let generated = app.engine.generation_tokens();
     let completed = *app.completion_metrics.lock().unwrap();
     let body = format!(
         "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
@@ -737,7 +735,6 @@ impl Gen {
                 EngineEvent::Tokens(t) => {
                     if !t.ids.is_empty() {
                         self.first_token.get_or_insert_with(Instant::now);
-                        self.app.generation_tokens.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                     }
                     for &id in &t.ids {
                         self.ids.push(id);

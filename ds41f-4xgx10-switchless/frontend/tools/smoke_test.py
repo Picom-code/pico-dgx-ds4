@@ -2,22 +2,33 @@
 """End-to-end checks of `dsfront serve` against `dsfront mock-engine` (stdlib only).
 
     dsfront mock-engine --socket S &
-    dsfront serve --engine-socket S --api-key-file K &
-    smoke_test.py http://127.0.0.1:18890 K [LOG]     # LOG: dsfront serve's stderr, for its "plan:" lines
+    dsfront serve --engine-socket S --api-key-file K --admin-socket A &
+    smoke_test.py http://127.0.0.1:18890 K [LOG] [--admin-socket A]
 
 Covers the OpenAI surface pi uses: models, auth, streaming and not, reasoning_content, tool calls
 and a tool-result turn (with prefix reuse reported in cached_tokens), usage, stop strings,
 max_tokens, the loop guard, bad requests, a client that disconnects, and concurrent requests.
+Use the mock engine's default prefill speed and token delay. LOG is dsfront's stderr for its
+"plan:" lines. The optional admin socket must belong to this isolated mock fixture.
 """
+import argparse
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
+import socket
 import sys
 import threading
 import time
 import urllib.parse
 
-BASE = urllib.parse.urlparse(sys.argv[1])
-KEY = open(sys.argv[2]).read().strip()
+parser = argparse.ArgumentParser()
+parser.add_argument("url")
+parser.add_argument("key_file")
+parser.add_argument("log", nargs="?")
+parser.add_argument("--admin-socket")
+args = parser.parse_args()
+BASE = urllib.parse.urlparse(args.url)
+KEY = open(args.key_file).read().strip()
 FAILS = []
 
 
@@ -38,8 +49,19 @@ def metrics():
         response = c.getresponse()
         assert response.status == 200, response.status
         assert response.getheader("Content-Type") == "text/plain; version=0.0.4"
+        lines = response.read().decode().splitlines()
+        types = set(line for line in lines if line.startswith("# TYPE "))
+        assert types == {
+            "# TYPE tensorfold:requests_running gauge",
+            "# TYPE tensorfold:requests_waiting gauge",
+            "# TYPE tensorfold:generation_tokens_total counter",
+            "# TYPE tensorfold:prompt_tokens_total counter",
+            "# TYPE tensorfold:prompt_tokens_cached_total counter",
+            "# TYPE tensorfold:time_to_first_token_seconds summary",
+            "# TYPE tensorfold:request_prefill_seconds summary",
+        }, f"unexpected Prometheus types: {types}"
         return {name.removeprefix("tensorfold:"): float(value)
-                for line in response.read().decode().splitlines() if line.startswith("tensorfold:")
+                for line in lines if line.startswith("tensorfold:")
                 for name, value in [line.split()]}
     finally:
         c.close()
@@ -53,8 +75,10 @@ def check_metrics(before, usage):
           and delta["prompt_tokens_cached_total"] == cached,
           "metrics match prompt and reused tokens in API usage")
     check(delta["generation_tokens_total"] == usage["completion_tokens"], "metrics count generated tokens")
+    # The stock mock sleeps for one second per 20,000 uncached prompt tokens.
+    expected_prefill = (usage["prompt_tokens"] - cached) / 20000
     check(delta["request_prefill_seconds_count"] == delta["time_to_first_token_seconds_count"] == 1
-          and 0 < delta["request_prefill_seconds_sum"] <= delta["time_to_first_token_seconds_sum"],
+          and expected_prefill / 2 <= delta["request_prefill_seconds_sum"] <= delta["time_to_first_token_seconds_sum"],
           "one completed request contributes engine prefill and frontend TTFT")
 
 
@@ -73,7 +97,7 @@ def request(method, path, body=None, key=KEY):
         return r.status, data
 
 
-def stream(body, read_events=None):
+def stream(body, read_events=None, observe=None):
     """Streamed chat: (events, raw lines). Stops after read_events events if given (and drops the connection)."""
     c = conn()
     c.request("POST", "/v1/chat/completions", body=json.dumps(dict(body, stream=True)),
@@ -93,11 +117,55 @@ def stream(body, read_events=None):
             events.append("[DONE]")
             break
         events.append(json.loads(data))
+        if observe:
+            observe(events)
         if read_events and len(events) >= read_events:
             c.close()
             return events
     c.close()
     return events
+
+
+def check_held_metrics(path):
+    def admin(command):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(5)
+            c.connect(path)
+            c.sendall((command + "\n").encode())
+            with c.makefile() as reply:
+                return reply.readline().strip()
+
+    first_content = []
+
+    def record_first_content(events):
+        choices = events[-1].get("choices", [])
+        if not first_content and choices and choices[0]["delta"].get("content"):
+            first_content.append(time.monotonic())
+
+    before = metrics()
+    body = {"messages": [{"role": "user", "content": "MOCK_LONG 100"}]}
+    assert admin("hold 0") == "ok"
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        started = time.monotonic()
+        reply = executor.submit(stream, body, observe=record_first_content)
+        try:
+            deadline = started + 3
+            held = metrics()
+            while held["requests_waiting"] == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                held = metrics()
+            check((held["requests_running"], held["requests_waiting"]) == (0, 1),
+                  "metrics distinguish the held request from a running request")
+            wait_started = time.monotonic()
+            time.sleep(0.35)
+            deliberate_wait = time.monotonic() - wait_started
+        finally:
+            assert admin("release") == "ok"
+        check(reply.result()[-1] == "[DONE]", "held request completes after release")
+    after = metrics()
+    ttft = after["time_to_first_token_seconds_sum"] - before["time_to_first_token_seconds_sum"]
+    check(first_content and deliberate_wait <= ttft <= first_content[0] - started,
+          "frontend TTFT includes the gate hold and ends before the first content is received")
 
 
 def collect(events):
@@ -231,9 +299,25 @@ def main():
         check(s == 400 and "error" in b, f"400 for {what}")
 
     # a client that goes away mid-stream, then the server still answers
-    ev = stream({"messages": [{"role": "user", "content": "MOCK_LONG 3000"}]}, read_events=20)
+    before = metrics()
+
+    def observe_active(events):
+        if len(events) != 20:
+            return
+        active = metrics()
+        check((active["requests_running"], active["requests_waiting"]) == (1, 0),
+              "metrics count the frontend request while its stream is open")
+        check(active["generation_tokens_total"] > before["generation_tokens_total"],
+              "generation advances before the request completes")
+
+    ev = stream({"messages": [{"role": "user", "content": "MOCK_LONG 3000"}]}, read_events=20, observe=observe_active)
     check(len(ev) == 20, "read part of a long stream, then disconnect")
     time.sleep(0.3)
+    after = metrics()
+    complete = ("prompt_tokens_total", "prompt_tokens_cached_total",
+                "request_prefill_seconds_count", "time_to_first_token_seconds_count")
+    check(all(after[name] == before[name] for name in complete),
+          "an abandoned stream leaves completed request counters unchanged")
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "still alive?"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: still alive?", "server answers after a disconnect")
 
@@ -251,9 +335,9 @@ def main():
     c2, p2 = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0), u.get("prompt_tokens", 0)
     check(s1 == 200 and s2 == 200 and 0.9 * p2 < c2 < p2,
           f"a conversation with another's system text but a later time reuses what comes before the time (cached {c2} of {p2})")
-    if len(sys.argv) > 3:
+    if args.log:
         time.sleep(0.2)
-        plans = [l for l in open(sys.argv[3]).read().splitlines() if " plan: " in l]
+        plans = [l for l in open(args.log).read().splitlines() if " plan: " in l]
         check(len(plans) >= 2 and ", new: " in plans[-2] and ", a fork of " in plans[-1] and " ids in common" in plans[-1],
               f"the log says where each started: {plans[-2:]}")
 
@@ -268,6 +352,9 @@ def main():
     [t.start() for t in th]
     [t.join() for t in th]
     check(all(r and r["finish"] == "stop" and r["content"].count("word") == 100 for r in results), f"8 concurrent streams ({time.time() - t0:.1f} s)")
+
+    if args.admin_socket:
+        check_held_metrics(args.admin_socket)
 
     print(f"{len(FAILS)} failures")
     sys.exit(1 if FAILS else 0)

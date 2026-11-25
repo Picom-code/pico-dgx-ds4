@@ -55,14 +55,15 @@ on rank 0 (ready in ~6 min).
 ## Scrape inference metrics
 
 Scrape `GET /metrics` on the rank-zero `dsfront` HTTP port. It serves Prometheus
-text 0.0.4 without a key, like `/health`. Keep this route on the monitoring
-network or restrict it at the reverse proxy if the API is exposed. Use one
-scrape target per serving frontend for a four-rank ring. sparkDash's Pico
+text 0.0.4 on every configured listen address. Like `/health`, it is readable
+without a key even when the API requires one. Restrict access at the network
+boundary or at a reverse proxy if untrusted clients can reach the server.
+Use one address per serving frontend as a scrape target. sparkDash's Pico
 collector already reads the `tensorfold:` series.
 
 | Series (all prefixed with `tensorfold:`) | Type | What it measures |
 | --- | --- | --- |
-| `requests_running`, `requests_waiting` | Gauge | In-flight requests at the frontend and requests waiting at its gate |
+| `requests_running`, `requests_waiting` | Gauge | Requests past the frontend gate and requests still waiting there |
 | `generation_tokens_total` | Counter | Token IDs received from the engine, including in-flight work and tokens the frontend may suppress |
 | `prompt_tokens_total` | Counter | Full prompt length for completed requests with a first token |
 | `prompt_tokens_cached_total` | Counter | Reused KV prefix within those prompts |
@@ -79,5 +80,6 @@ ratios unavailable when the denominator is zero.
 
 A `dsfront` restart resets these counters. After a decreasing counter or
 a known restart, use the next scrape as a fresh baseline before deriving a
-rate. Display an unavailable scrape as missing data. Inference metrics are
-reported separately from host memory and scheduler state.
+rate. Display an unavailable scrape as missing data. The gate gauges describe
+the HTTP frontend. Rank-zero scheduler depth and host memory are separate
+measurements.
