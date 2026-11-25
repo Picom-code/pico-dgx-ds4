@@ -155,6 +155,12 @@ impl Gate {
         self.st.lock().unwrap().closing = true;
     }
 
+    /// (in flight, waiting at the gate): the two gauges `/metrics` exports.
+    pub fn load(&self) -> (u32, u32) {
+        let s = self.st.lock().unwrap();
+        (s.in_flight, s.waiting)
+    }
+
     pub fn status(&self, connected: bool) -> String {
         let s = self.st.lock().unwrap();
         format!(
@@ -242,6 +248,7 @@ mod tests {
         };
         // a request in flight: no hold
         let p = g.enter_when(&on).await.unwrap();
+        assert_eq!(g.load(), (1, 0));
         assert!(g.hold(Duration::ZERO).unwrap_err().starts_with("busy: in_flight 1"));
         drop(p);
         // it just ended: not idle for a minute
@@ -254,9 +261,11 @@ mod tests {
         let t = tokio::spawn(async move { g2.enter_when(&on2).await.map(|_| ()) });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(g.status(true).contains("waiting 1"));
+        assert_eq!(g.load(), (0, 1));
         assert!(g.hold(Duration::ZERO).is_ok(), "held stays held");
         assert_eq!(g.command("release", true), "ok");
         assert_eq!(t.await.unwrap(), Ok(()));
+        assert_eq!(g.load(), (0, 0));
         assert!(g.status(true).contains("waiting 0") && g.status(true).contains("passed 1"));
         // the engine away: a request waits the hold limit, then is refused
         up.store(false, Ordering::SeqCst);

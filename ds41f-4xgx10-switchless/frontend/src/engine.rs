@@ -32,6 +32,7 @@ struct Inner {
     path: PathBuf,
     conn: Mutex<Conn>,
     next_req: AtomicU64,
+    generation_tokens: AtomicU64,
     info: watch::Sender<Option<HelloEngine>>,
 }
 
@@ -44,7 +45,13 @@ impl EngineClient {
     /// Start connecting to the engine socket (in the background, forever).
     pub fn start(path: PathBuf) -> EngineClient {
         let (info, _) = watch::channel(None);
-        let inner = Arc::new(Inner { path, conn: Mutex::new(Conn::default()), next_req: AtomicU64::new(1), info });
+        let inner = Arc::new(Inner {
+            path,
+            conn: Mutex::new(Conn::default()),
+            next_req: AtomicU64::new(1),
+            generation_tokens: AtomicU64::new(0),
+            info,
+        });
         tokio::spawn(run(inner.clone()));
         EngineClient { inner }
     }
@@ -52,6 +59,10 @@ impl EngineClient {
     /// The engine's HELLO while connected.
     pub fn info(&self) -> Option<HelloEngine> {
         self.inner.info.borrow().clone()
+    }
+
+    pub(crate) fn generation_tokens(&self) -> u64 {
+        self.inner.generation_tokens.load(Ordering::Relaxed)
     }
 
     pub async fn wait_connected(&self, timeout: Duration) -> Option<HelloEngine> {
@@ -179,6 +190,8 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
         };
         match frame {
             Ok(Frame::Tokens(t)) => {
+                // The engine has already generated these IDs even if the HTTP request stops reading.
+                inner.generation_tokens.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
                 let c = inner.conn.lock().unwrap();
                 if let Some(p) = c.pending.get(&t.req_id) {
                     let _ = p.tx.send(Event::Tokens(t));
@@ -196,4 +209,73 @@ async fn connection(inner: &Arc<Inner>, stream: UnixStream) -> Result<(), String
     };
     writer.abort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn generation_counts_tokens_before_delivery_and_after_receiver_drop() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            let (info, _) = watch::channel(None);
+            let inner = Arc::new(Inner {
+                path: PathBuf::new(),
+                conn: Mutex::new(Conn::default()),
+                next_req: AtomicU64::new(1),
+                generation_tokens: AtomicU64::new(0),
+                info,
+            });
+            let client = EngineClient { inner: inner.clone() };
+            let task = tokio::spawn(async move { connection(&inner, socket).await });
+            let (ty, payload) = read_frame(&mut peer).await.unwrap().unwrap();
+            assert!(matches!(Frame::decode(ty, &payload, |_| 0).unwrap(), Frame::Hello { version: VERSION }));
+            let hello = Frame::HelloEngine(HelloEngine { version: VERSION, max_context: 128, vocab_size: 10, eos_id: 1, max_sessions: 2, name: "test".into() });
+            peer.write_all(&hello.encode()).await.unwrap();
+            assert!(client.wait_connected(Duration::from_secs(2)).await.is_some());
+
+            let submit = |session_id| Submit {
+                req_id: 0,
+                session_id,
+                base_session_id: 0,
+                seed: 0,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                max_new_tokens: 9,
+                flags: 0,
+                n_top_logprobs: 0,
+                prefix_hint: 0,
+                stop_ids: vec![1],
+                prompt: vec![4],
+                images: None,
+                prediction: Vec::new(),
+            };
+            let (request, pending) = client.submit(submit(1)).unwrap();
+            let (marker, mut marker_events) = client.submit(submit(2)).unwrap();
+            for req_id in [request, marker] {
+                let (ty, payload) = read_frame(&mut peer).await.unwrap().unwrap();
+                assert!(matches!(Frame::decode(ty, &payload, |_| 0).unwrap(), Frame::Submit(s) if s.req_id == req_id));
+            }
+
+            let tokens = |ids| Frame::Tokens(Tokens { req_id: request, ids, logprobs: None, top: None }).encode();
+            peer.write_all(&tokens(vec![5, 6, 7])).await.unwrap();
+            // DONE for a second request proves the real reader processed the earlier TOKENS frame.
+            let done = Frame::Done(Done {
+                req_id: marker, reason: DoneReason::Cancelled, prompt_tokens: 1, cached_tokens: 0,
+                completion_tokens: 0, queue_us: 0, prefill_us: 0, decode_us: 0, error: String::new(),
+            });
+            peer.write_all(&done.encode()).await.unwrap();
+            assert!(matches!(marker_events.recv().await, Some(Event::Done(d)) if d.req_id == marker));
+            assert_eq!(pending.len(), 1, "the first tokens are still buffered for the HTTP request");
+            assert_eq!(client.generation_tokens(), 3, "decoded tokens count before HTTP delivery");
+
+            drop(pending);
+            peer.write_all(&tokens(vec![8, 9])).await.unwrap();
+            drop(peer);
+            task.await.unwrap().unwrap();
+            assert_eq!(client.generation_tokens(), 5, "decoded tokens count after the HTTP request drops");
+        }).await.expect("rank-zero exchange timed out");
+    }
 }

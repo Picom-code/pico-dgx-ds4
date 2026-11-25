@@ -51,3 +51,35 @@ job's driver that holds a want across its parts keeps the service from taking th
 candidate 4's start waited 44 minutes so). To bring the kit back: `service.sh stop`, then
 `cd ~/ai/dsv41-4x-ring && nohup setsid ./start-tp4.sh serve > logs-tp4/serve-launch.log 2>&1 < /dev/null &`
 on rank 0 (ready in ~6 min).
+
+## Scrape inference metrics
+
+Scrape `GET /metrics` on the rank-zero `dsfront` HTTP port. It serves Prometheus
+text 0.0.4 on every configured listen address. Like `/health`, it is readable
+without a key even when the API requires one. Restrict access at the network
+boundary or at a reverse proxy if untrusted clients can reach the server.
+Use one address per serving frontend as a scrape target. sparkDash's Pico
+collector already reads the `tensorfold:` series.
+
+| Series (all prefixed with `tensorfold:`) | Type | What it measures |
+| --- | --- | --- |
+| `requests_running`, `requests_waiting` | Gauge | Requests past the frontend gate and requests still waiting there |
+| `generation_tokens_total` | Counter | Token IDs received from the engine, including in-flight work and tokens the frontend may suppress |
+| `prompt_tokens_total` | Counter | Full prompt length for completed requests with a first token |
+| `prompt_tokens_cached_total` | Counter | Reused KV prefix within those prompts |
+| `time_to_first_token_seconds_sum`, `_count` | Summary | Time from the chat handler to the first model token for those requests |
+| `request_prefill_seconds_sum`, `_count` | Summary | Prefill time for those requests, reported by the engine in `Done.prefill_us` |
+
+Use consecutive successful scrapes of the same process. Divide the generation
+counter delta by elapsed wall time for windowed decode tokens per second.
+Subtract the cached delta from the prompt delta for computed prefill tokens.
+Divide that difference by the engine prefill time delta for prefill tokens
+per second, or divide the cached delta by the prompt delta for the reuse
+fraction. Divide the TTFT sum delta by its count delta for mean TTFT. Leave
+ratios unavailable when the denominator is zero.
+
+A `dsfront` restart resets these counters. After a decreasing counter or
+a known restart, use the next scrape as a fresh baseline before deriving a
+rate. Display an unavailable scrape as missing data. The gate gauges describe
+the HTTP frontend. Rank-zero scheduler depth and host memory are separate
+measurements.

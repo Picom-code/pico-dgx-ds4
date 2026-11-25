@@ -233,6 +233,7 @@ them). A job through ring.sh or run4.sh borrows the ring once the service has ha
 **7. Use it.** dsfront serves OpenAI's chat completions (`POST /v1/chat/completions`, streamed with
 `"stream": true`, `tools` answered by `tool_calls`), `GET /v1/models` and `GET /health`, under the name
 `--model-name` gives (`deepseek-v4.1-flash-uncensored` by default; a request's `model` is ignored).
+It also serves [`GET /metrics`](docs/operations.md#scrape-inference-metrics) for Prometheus and sparkDash.
 Thinking is off unless asked for: by a request (a top-level `"reasoning_effort"`, `"reasoning":
 {"effort": ...}` or `{"enabled": true}`, `"chat_template_kwargs": {"thinking": true}`, or the request's
 own switch `"thinking": {"type": "enabled"}` / `true`), or for every request that does not say by
@@ -433,7 +434,8 @@ which install `fleet.conf` beside it.
 **The front-end** reads the tokenizer from `/data/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/tokenizer.json`
 unless given `--tokenizer PATH` (through service.sh: `DSGB10_FRONT_ARGS="--tokenizer PATH"`); the
 original's tokenizer.json is the same file. It serves `GET /v1/models`, `POST /v1/chat/completions`
-(OpenAI's API, with the key as a bearer token) and `GET /health`, and names the model
+(OpenAI's API, with the key as a bearer token), `GET /health`, and
+[`GET /metrics`](docs/operations.md#scrape-inference-metrics), and names the model
 `deepseek-v4.1-flash-uncensored` (`--model-name`). A greedy answer depends on the session state its
 request resumes from: sent twice, the same request can differ after its first tokens, because a
 regenerate reruns its last positions through the decode step ([engine § Serving](docs/engine.md#serving)).
