@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from uuid import uuid4
 
 parser = argparse.ArgumentParser()
 parser.add_argument("url")
@@ -221,7 +222,8 @@ def main():
 
     before = metrics()
     check(before["requests_running"] == before["requests_waiting"] == 0, "idle gate gauges are zero")
-    s, b = request("POST", "/v1/chat/completions", {"messages": [SYSTEM, {"role": "user", "content": "Hello there"}]})
+    cold_system = {"role": "system", "content": f"{uuid4().hex} {SYSTEM['content']}"}
+    s, b = request("POST", "/v1/chat/completions", {"messages": [cold_system, {"role": "user", "content": "Hello there"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
     check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off (the default)")

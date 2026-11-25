@@ -76,7 +76,7 @@ def exercise(port, peer, reader, token):
 
     def done(request, reason, prompt, cached, generated, prefill, error=b""):
         send_frame(peer, 0x83, struct.pack("<QIIIIQQQII", request, reason, prompt, cached,
-                                          generated, 0, prefill, 0, len(error), 0) + error)
+                                          generated, 11_000, prefill, 23_000, len(error), 0) + error)
 
     def completed(samples):
         return tuple(samples[name] for name in (
@@ -84,7 +84,8 @@ def exercise(port, peer, reader, token):
             "request_prefill_seconds_count", "time_to_first_token_seconds_count"))
 
     generation = "generation_tokens_total"
-    wait_for_samples(lambda samples: samples["requests_running"] == 0)
+    start = wait_for_samples(lambda samples: samples["requests_running"] == 0)
+    assert start[generation] == 0, start
     with ThreadPoolExecutor(1) as executor:
         # Offsets and values come from the wire contract, independent of HTTP usage.
         good = executor.submit(chat, "known metrics")
@@ -92,12 +93,13 @@ def exercise(port, peer, reader, token):
         assert prompt > 2
         time.sleep(0.1)  # Make frontend TTFT strictly larger than the scripted 70 ms prefill.
         tokens(request, [token])
-        done(request, 0, prompt, 2, 1, 70_000)
+        # Report a different DONE prompt length to pin the exporter to SUBMIT.
+        done(request, 0, prompt + 7, 2, 1, 70_000)
         status, body = good.result()
         assert status == 200 and body["usage"]["prompt_tokens"] == prompt, body
         samples = get_samples()
         assert completed(samples) == (prompt, 2, 0.07, 1, 1), f"wire prompt, cache and prefill: {samples}"
-        assert samples["time_to_first_token_seconds_sum"] > 0.07, samples
+        assert samples[generation] == 1 and samples["time_to_first_token_seconds_sum"] > 0.07, samples
 
         for name, ids, reason, expected_status in (
             ("no tokens", None, 2, 200), ("empty frame", [], 0, 200), ("engine error", [token], 4, 500),
