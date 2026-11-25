@@ -31,6 +31,33 @@ def conn():
     return http.client.HTTPConnection(BASE.hostname, BASE.port, timeout=60)
 
 
+def metrics():
+    c = conn()
+    try:
+        c.request("GET", "/metrics")
+        response = c.getresponse()
+        assert response.status == 200, response.status
+        assert response.getheader("Content-Type") == "text/plain; version=0.0.4"
+        return {name.removeprefix("tensorfold:"): float(value)
+                for line in response.read().decode().splitlines() if line.startswith("tensorfold:")
+                for name, value in [line.split()]}
+    finally:
+        c.close()
+
+
+def check_metrics(before, usage):
+    after = metrics()
+    delta = {name: value - before[name] for name, value in after.items()}
+    cached = usage["prompt_tokens_details"]["cached_tokens"]
+    check(delta["prompt_tokens_total"] == usage["prompt_tokens"]
+          and delta["prompt_tokens_cached_total"] == cached,
+          "metrics match prompt and reused tokens in API usage")
+    check(delta["generation_tokens_total"] == usage["completion_tokens"], "metrics count generated tokens")
+    check(delta["request_prefill_seconds_count"] == delta["time_to_first_token_seconds_count"] == 1
+          and 0 < delta["request_prefill_seconds_sum"] <= delta["time_to_first_token_seconds_sum"],
+          "one completed request contributes engine prefill and frontend TTFT")
+
+
 def request(method, path, body=None, key=KEY):
     c = conn()
     headers = {"Content-Type": "application/json"}
@@ -107,10 +134,13 @@ def main():
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}, key=None)
     check(s == 401, "a missing key is rejected")
 
+    before = metrics()
+    check(before["requests_running"] == before["requests_waiting"] == 0, "idle gate gauges are zero")
     s, b = request("POST", "/v1/chat/completions", {"messages": [SYSTEM, {"role": "user", "content": "Hello there"}]})
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
     check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off (the default)")
+    check_metrics(before, b["usage"])
 
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}],
                    "reasoning_effort": "none", "chat_template_kwargs": {"thinking": True}})
@@ -176,10 +206,12 @@ def main():
     msgs2 = msgs + [{"role": "assistant", "content": o["content"] or None, "reasoning_content": o["reasoning"],
                      "tool_calls": [{"id": call["id"], "type": "function", "function": {"name": "read", "arguments": call["arguments"]}}]},
                     {"role": "tool", "tool_call_id": call["id"], "content": "line one\nline two"}]
+    before = metrics()
     o2 = collect(stream(dict(body, messages=msgs2)))
     check(o2["content"] == "The tool returned: line one line two" and o2["finish"] == "stop", "answer after the tool result")
     cached = o2["usage"]["prompt_tokens_details"]["cached_tokens"]
     check(cached >= first_total - 1, f"tool-result turn reuses the whole previous turn (cached {cached} of {o2['usage']['prompt_tokens']}, previous turn {first_total})")
+    check_metrics(before, o2["usage"])
 
     # stop strings, max_tokens, loop guard
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello stopword here"}], "stop": ["stopword"]})

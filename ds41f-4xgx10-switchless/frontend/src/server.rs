@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP server: /v1/models, /v1/chat/completions (streaming and not), /health.
+//! OpenAI-compatible HTTP server: /v1/models, /v1/chat/completions, /health, and /metrics.
 //!
 //! Requests are rendered with the publisher's chat encoding the way the kit's SGLang does it (tools
 //! hosted on a leading system message, effort tiers from chat_template_kwargs or reasoning_effort),
@@ -70,6 +70,16 @@ pub struct ServerConfig {
 /// requests may need more (--max-body-mb); see docs/vision.md for what a large body costs in memory.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
+/// Scrapes read completed-request counters together so their deltas cover the same requests.
+#[derive(Clone, Copy, Default)]
+struct CompletionMetrics {
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    ttft: Duration,
+    prefill: Duration,
+    count: u64,
+}
+
 pub struct App {
     pub cfg: ServerConfig,
     pub tok: Arc<Tokenizer>,
@@ -80,6 +90,8 @@ pub struct App {
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
+    generation_tokens: AtomicU64,
+    completion_metrics: Mutex<CompletionMetrics>,
 }
 
 impl App {
@@ -87,7 +99,18 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
-        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        Arc::new(App {
+            cfg,
+            tok,
+            engine,
+            gate,
+            image_rows,
+            sessions: Mutex::new(SessionTable::new(256, 16 << 20)),
+            think_end_id,
+            counter: AtomicU64::new(0),
+            generation_tokens: AtomicU64::new(0),
+            completion_metrics: Mutex::default(),
+        })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -128,7 +151,11 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     let max_body = app.cfg.max_body_bytes;
-    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    let routes = Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat));
     body_limit(routes, max_body).with_state(app)
 }
 
@@ -244,6 +271,31 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "engine not connected\n").into_response()
     }
+}
+
+/// Prometheus exposition with the TensorFold names consumed by sparkDash.
+async fn metrics(State(app): State<Arc<App>>) -> Response {
+    let (running, waiting) = app.gate.load();
+    let generated = app.generation_tokens.load(Ordering::Relaxed);
+    let completed = *app.completion_metrics.lock().unwrap();
+    let body = format!(
+        "# TYPE tensorfold:requests_running gauge\ntensorfold:requests_running {running}\n\
+# TYPE tensorfold:requests_waiting gauge\ntensorfold:requests_waiting {waiting}\n\
+# TYPE tensorfold:generation_tokens_total counter\ntensorfold:generation_tokens_total {generated}\n\
+# TYPE tensorfold:prompt_tokens_total counter\ntensorfold:prompt_tokens_total {}\n\
+# TYPE tensorfold:prompt_tokens_cached_total counter\ntensorfold:prompt_tokens_cached_total {}\n\
+# TYPE tensorfold:time_to_first_token_seconds summary\ntensorfold:time_to_first_token_seconds_sum {}\n\
+tensorfold:time_to_first_token_seconds_count {}\n\
+# TYPE tensorfold:request_prefill_seconds summary\ntensorfold:request_prefill_seconds_sum {}\n\
+tensorfold:request_prefill_seconds_count {}\n",
+        completed.prompt_tokens,
+        completed.cached_tokens,
+        completed.ttft.as_secs_f64(),
+        completed.count,
+        completed.prefill.as_secs_f64(),
+        completed.count,
+    );
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], body).into_response()
 }
 
 async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
@@ -667,6 +719,7 @@ struct Gen {
     gen_ends: Vec<usize>,
     stopped: Option<Finish>,
     done: bool,
+    received_at: Instant,
     t0: Instant,
     first_token: Option<Instant>,
 }
@@ -682,7 +735,10 @@ impl Gen {
             };
             match ev {
                 EngineEvent::Tokens(t) => {
-                    self.first_token.get_or_insert_with(Instant::now);
+                    if !t.ids.is_empty() {
+                        self.first_token.get_or_insert_with(Instant::now);
+                        self.app.generation_tokens.fetch_add(t.ids.len() as u64, Ordering::Relaxed);
+                    }
                     for &id in &t.ids {
                         self.ids.push(id);
                         if self.stopped.is_some() {
@@ -754,6 +810,15 @@ impl Gen {
                     let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
+                    if let Some(first_token) = self.first_token {
+                        let mut completed = self.app.completion_metrics.lock().unwrap();
+                        let prompt = usage.prompt as u64;
+                        completed.prompt_tokens += prompt;
+                        completed.cached_tokens += u64::from(usage.cached).min(prompt);
+                        completed.ttft += first_token - self.received_at;
+                        completed.prefill += Duration::from_micros(d.prefill_us);
+                        completed.count += 1;
+                    }
                     if let Some(dir) = &self.app.cfg.dump_dir {
                         // the output's ids: the first `kept` count as output, the rest came after a stop
                         let rec = json!({"req_id": self.req_id, "ids": self.ids, "kept": self.kept, "finish": finish.as_str(),
@@ -807,13 +872,13 @@ impl Drop for Gen {
     }
 }
 
-async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError> {
+async fn start(app: &Arc<App>, p: &Prepared, pass: Pass, received_at: Instant) -> Result<Gen, ApiError> {
     let unavailable = |msg: String| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), msg);
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
     };
     if !p.images.is_empty() {
-        return start_images(app, p, pass, info).await;
+        return start_images(app, p, pass, info, received_at).await;
     }
     let (plan, released, prediction) = {
         let app2 = app.clone();
@@ -902,6 +967,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         gen_ends: Vec::new(),
         stopped: None,
         done: false,
+        received_at,
         t0: Instant::now(),
         first_token: None,
     })
@@ -910,7 +976,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
 /// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
 /// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
 /// never sees, so text requests' prefix reuse is untouched.
-async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
+async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine, received_at: Instant) -> Result<Gen, ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
     let Some(addr) = app.cfg.vision_addr.clone() else {
         return Err(bad("image, audio and video input are not supported".into()));
@@ -982,12 +1048,14 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         gen_ends: Vec::new(),
         stopped: None,
         done: false,
+        received_at,
         t0: Instant::now(),
         first_token: None,
     })
 }
 
 async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
+    let received_at = Instant::now();
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
@@ -1015,7 +1083,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     // timeout sees bytes; refused, it ends with an error event. Anything else waits here, refused with
     // 503 and Retry-After.
     if p.stream && !app.gate.open(app.engine.info().is_some()) {
-        return stream(app, p, req, None);
+        return stream(app, p, req, None, received_at);
     }
     let pass = match app.gate.enter(&app.engine).await {
         Ok(pass) => pass,
@@ -1026,9 +1094,9 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         }
     };
     if p.stream {
-        return stream(app, p, req, Some(pass));
+        return stream(app, p, req, Some(pass), received_at);
     }
-    let mut gen = match start(&app, &p, pass).await {
+    let mut gen = match start(&app, &p, pass, received_at).await {
         Ok(g) => g,
         Err(e) => return e.response(),
     };
@@ -1081,7 +1149,7 @@ fn dump(app: &App, req: &Value, p: &Prepared, gen: &Gen) {
 /// A streamed answer. Without a pass it waits at the gate first: the stream starts at once with a
 /// comment saying why, and a refusal (the hold limit, a shutdown) is its error event. Any stream gets
 /// a comment after KEEP_ALIVE without an event (waiting at the gate, or for a long prefill).
-fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Response {
+fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>, received_at: Instant) -> Response {
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(async move {
         let last = |e: ApiError| {
@@ -1108,7 +1176,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                 }
             }
         };
-        let mut gen = match start(&app, &p, pass).await {
+        let mut gen = match start(&app, &p, pass, received_at).await {
             Ok(g) => g,
             Err(e) => return last(e).await,
         };
