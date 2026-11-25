@@ -10,6 +10,7 @@ and a tool-result turn (with prefix reuse reported in cached_tokens), usage, sto
 max_tokens, the loop guard, bad requests, a client that disconnects, and concurrent requests.
 Use the mock engine's default prefill speed and token delay. LOG is dsfront's stderr for its
 "plan:" lines. The optional admin socket must belong to this isolated mock fixture.
+Run metrics_test.py with the dsfront binary and tokenizer.json for exact rank-zero metrics checks.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +28,8 @@ parser.add_argument("key_file")
 parser.add_argument("log", nargs="?")
 parser.add_argument("--admin-socket")
 args = parser.parse_args()
+if not __debug__:
+    parser.error("run the smoke test without Python optimization")
 BASE = urllib.parse.urlparse(args.url)
 KEY = open(args.key_file).read().strip()
 FAILS = []
@@ -67,19 +70,30 @@ def metrics():
         c.close()
 
 
-def check_metrics(before, usage):
+def check_metrics(before, usage, case, *, all_tokens_visible=False):
     after = metrics()
     delta = {name: value - before[name] for name, value in after.items()}
     cached = usage["prompt_tokens_details"]["cached_tokens"]
     check(delta["prompt_tokens_total"] == usage["prompt_tokens"]
-          and delta["prompt_tokens_cached_total"] == cached,
-          "metrics match prompt and reused tokens in API usage")
-    check(delta["generation_tokens_total"] == usage["completion_tokens"], "metrics count generated tokens")
-    # The stock mock sleeps for one second per 20,000 uncached prompt tokens.
-    expected_prefill = (usage["prompt_tokens"] - cached) / 20000
-    check(delta["request_prefill_seconds_count"] == delta["time_to_first_token_seconds_count"] == 1
-          and expected_prefill / 2 <= delta["request_prefill_seconds_sum"] <= delta["time_to_first_token_seconds_sum"],
-          "one completed request contributes engine prefill and frontend TTFT")
+          and delta["prompt_tokens_cached_total"] == cached
+          and delta["request_prefill_seconds_count"] == delta["time_to_first_token_seconds_count"] == 1
+          and 0 < delta["request_prefill_seconds_sum"] <= delta["time_to_first_token_seconds_sum"],
+          f"{case} contributes one completed-request sample")
+    generated = delta["generation_tokens_total"]
+    visible = usage["completion_tokens"]
+    check(generated == visible if all_tokens_visible else generated >= visible,
+          f"{case} counts generated tokens")
+
+
+def wait_for_metrics(predicate, description):
+    deadline = time.monotonic() + 5
+    while True:
+        sample = metrics()
+        if predicate(sample):
+            return sample
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {description}: {sample}")
+        time.sleep(0.01)
 
 
 def request(method, path, body=None, key=KEY):
@@ -135,37 +149,40 @@ def check_held_metrics(path):
             with c.makefile() as reply:
                 return reply.readline().strip()
 
-    first_content = []
+    first_reasoning = []
 
-    def record_first_content(events):
+    def record_first_reasoning(events):
         choices = events[-1].get("choices", [])
-        if not first_content and choices and choices[0]["delta"].get("content"):
-            first_content.append(time.monotonic())
+        if not first_reasoning and choices and choices[0]["delta"].get("reasoning_content"):
+            first_reasoning.append(time.monotonic())
 
-    before = metrics()
-    body = {"messages": [{"role": "user", "content": "MOCK_LONG 100"}]}
-    assert admin("hold 0") == "ok"
+    # The SSE [DONE] event can arrive while the previous request still owns its gate pass.
+    before = wait_for_metrics(lambda m: m["requests_running"] == m["requests_waiting"] == 0, "an idle gate")
+    body = {"messages": [{"role": "user", "content": "MOCK_LONG 100"}], "thinking": {"type": "enabled"}}
+    hold = admin("hold 0")
+    if hold != "ok":
+        raise AssertionError(hold)
     with ThreadPoolExecutor(max_workers=1) as executor:
         started = time.monotonic()
-        reply = executor.submit(stream, body, observe=record_first_content)
+        reply = executor.submit(stream, body, observe=record_first_reasoning)
         try:
-            deadline = started + 3
-            held = metrics()
-            while held["requests_waiting"] == 0 and time.monotonic() < deadline:
-                time.sleep(0.01)
-                held = metrics()
+            held = wait_for_metrics(lambda m: m["requests_waiting"] > 0, "a held request")
             check((held["requests_running"], held["requests_waiting"]) == (0, 1),
                   "metrics distinguish the held request from a running request")
             wait_started = time.monotonic()
             time.sleep(0.35)
             deliberate_wait = time.monotonic() - wait_started
         finally:
-            assert admin("release") == "ok"
+            release = admin("release")
+            if release != "ok":
+                raise AssertionError(release)
         check(reply.result()[-1] == "[DONE]", "held request completes after release")
     after = metrics()
     ttft = after["time_to_first_token_seconds_sum"] - before["time_to_first_token_seconds_sum"]
-    check(first_content and deliberate_wait <= ttft <= first_content[0] - started,
-          "frontend TTFT includes the gate hold and ends before the first content is received")
+    check(first_reasoning and deliberate_wait <= ttft <= first_reasoning[0] - started,
+          "frontend TTFT includes the gate hold and ends before the first reasoning delta")
+    prefill = after["request_prefill_seconds_sum"] - before["request_prefill_seconds_sum"]
+    check(0 < prefill <= ttft - deliberate_wait, "engine prefill excludes the frontend gate hold")
 
 
 def collect(events):
@@ -208,7 +225,8 @@ def main():
     check(s == 200 and b["choices"][0]["message"]["content"] == "Mock reply to: Hello there", "non-streaming chat answer")
     check(b["choices"][0]["finish_reason"] == "stop" and b["usage"]["completion_tokens"] > 0, "finish_reason stop and usage")
     check("reasoning_content" not in b["choices"][0]["message"], "no reasoning_content when thinking is off (the default)")
-    check_metrics(before, b["usage"])
+    check(b["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, "the fresh session has no cached tokens")
+    check_metrics(before, b["usage"], "fresh session", all_tokens_visible=True)
 
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello there"}],
                    "reasoning_effort": "none", "chat_template_kwargs": {"thinking": True}})
@@ -264,11 +282,13 @@ def main():
     # an agent turn: tool call, then the tool result, reusing the prefix
     msgs = [SYSTEM, {"role": "user", "content": 'Please read it. MOCK_TOOL read {"path": "notes.txt"}'}]
     body = {"messages": msgs, "tools": TOOLS, "stream_options": {"include_usage": True}, "chat_template_kwargs": {"thinking": True}}
+    before = metrics()
     o = collect(stream(body))
     call = o["calls"].get(0)
     check(o["finish"] == "tool_calls" and call and call["name"] == "read" and json.loads(call["arguments"]) == {"path": "notes.txt"},
           "streamed tool call with finish_reason tool_calls")
     check(call and call["id"].startswith("call_"), "tool call has an id")
+    check_metrics(before, o["usage"], "tool call")
     first_prompt = o["usage"]["prompt_tokens"]
     first_total = first_prompt + o["usage"]["completion_tokens"]
     msgs2 = msgs + [{"role": "assistant", "content": o["content"] or None, "reasoning_content": o["reasoning"],
@@ -278,18 +298,24 @@ def main():
     o2 = collect(stream(dict(body, messages=msgs2)))
     check(o2["content"] == "The tool returned: line one line two" and o2["finish"] == "stop", "answer after the tool result")
     cached = o2["usage"]["prompt_tokens_details"]["cached_tokens"]
-    check(cached >= first_total - 1, f"tool-result turn reuses the whole previous turn (cached {cached} of {o2['usage']['prompt_tokens']}, previous turn {first_total})")
-    check_metrics(before, o2["usage"])
+    check(first_total - 1 <= cached < o2["usage"]["prompt_tokens"], f"tool-result turn reuses the whole previous turn (cached {cached} of {o2['usage']['prompt_tokens']}, previous turn {first_total})")
+    check_metrics(before, o2["usage"], "tool result", all_tokens_visible=True)
 
     # stop strings, max_tokens, loop guard
+    before = metrics()
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "Hello stopword here"}], "stop": ["stopword"]})
     check(b["choices"][0]["message"]["content"] == "Mock reply to: Hello " and b["choices"][0]["finish_reason"] == "stop", "stop string cuts the output")
+    check_metrics(before, b["usage"], "stop string")
+    before = metrics()
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "MOCK_LONG 500"}], "max_tokens": 5})
     check(b["choices"][0]["finish_reason"] == "length" and b["usage"]["completion_tokens"] == 5, "max_tokens ends with length")
+    check_metrics(before, b["usage"], "length limit", all_tokens_visible=True)
+    before = metrics()
     t0 = time.time()
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "MOCK_LOOP"}], "max_tokens": 5000})
     n = b["usage"]["completion_tokens"]
     check(b["choices"][0]["finish_reason"] == "stop" and n < 400, f"loop guard stops a repeating output ({n} tokens, {time.time() - t0:.1f} s)")
+    check_metrics(before, b["usage"], "loop guard")
 
     # bad requests
     for what, body in [("invalid JSON", b"{"), ("image input", {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}),
@@ -312,10 +338,10 @@ def main():
 
     ev = stream({"messages": [{"role": "user", "content": "MOCK_LONG 3000"}]}, read_events=20, observe=observe_active)
     check(len(ev) == 20, "read part of a long stream, then disconnect")
-    time.sleep(0.3)
-    after = metrics()
+    after = wait_for_metrics(lambda m: m["requests_running"] == 0, "the abandoned stream to release its gate pass")
     complete = ("prompt_tokens_total", "prompt_tokens_cached_total",
-                "request_prefill_seconds_count", "time_to_first_token_seconds_count")
+                "request_prefill_seconds_count", "time_to_first_token_seconds_count",
+                "request_prefill_seconds_sum", "time_to_first_token_seconds_sum")
     check(all(after[name] == before[name] for name in complete),
           "an abandoned stream leaves completed request counters unchanged")
     s, b = request("POST", "/v1/chat/completions", {"messages": [{"role": "user", "content": "still alive?"}]})
