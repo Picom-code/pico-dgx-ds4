@@ -153,7 +153,9 @@ the same value the reply carries as `hash`. A request that repeats an image (a t
 figure in two turns) is then served from memory: 1-4 ms per image instead of 100-400 ms, and nothing else changes,
 because the rows handed to the engine are identical byte for byte. Evicted oldest-first; `--cache-mb 0` turns it off.
 Measured with 10 images in a 73k-token transcript, which the front end re-sends on every turn: 3.5-3.8 s of ViT per
-request before, 1-4 ms after the first turn.
+request before, 1-4 ms after the first turn. The cache belongs to the encoder process and keys on the image's bytes
+alone: the rows are a function of those bytes and of the checkpoint the process was started with, so another
+checkpoint, or a restart, starts empty.
 
 If the encoder is down, image requests answer 503 and text requests are unaffected. Tests: `tools/vision/imgtest.py`
 (correctness + TTFT), `tools/vision/conc_img.py` (8 users + one image / text control).

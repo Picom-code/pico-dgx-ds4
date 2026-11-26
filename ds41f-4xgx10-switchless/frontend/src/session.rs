@@ -713,6 +713,61 @@ mod tests {
         assert_eq!(plan2.ids, ids2);
     }
 
+    /// The engine's reuse is positional: nothing before the position the plan names is recomputed. A cut
+    /// inside an image span would split the placeholder run and reuse half an image's rows, so every cut
+    /// must fall at a span boundary.
+    #[test]
+    fn a_cut_never_lands_inside_an_image_span() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let mut t = SessionTable::new(64, 1 << 20);
+        let head = "<｜System｜>You answer about screenshots.<｜User｜>what is this?";
+        let hashes = [7u64];
+        let p1 = format!("{head}{}", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids1, spans1) = with_images(&tok, &p1, &[5], &hashes);
+        let (plan, _) = t.plan_images(&p1, &tok, &spans1, &ids1);
+        let gen = tok.encode("A screenshot.");
+        t.finish_images(plan.session_id, &p1, &plan.ids, &spans1, &gen, &tok);
+        let (start, rows, _) = spans1[0];
+        let (s0, s1) = (start as usize, (start + rows) as usize);
+        // a follow-up that keeps the head and the placeholder, then a tail cut short at every byte: the
+        // cut follows the span's own end, whatever the tail's length
+        let tail = "A screenshot.</think>and this?";
+        for n in 0..=tail.len() {
+            let p2 = format!("{head}{}{}", crate::encoding::IMAGE_PLACEHOLDER, &tail[..n]);
+            let (ids2, spans2) = with_images(&tok, &p2, &[5], &hashes);
+            let (pl, _) = t.plan_images(&p2, &tok, &spans2, &ids2);
+            if pl.session_id != plan.session_id {
+                t.abandon(pl.session_id);
+            }
+            assert!(pl.reused <= s0 || pl.reused >= s1, "a cut at {} splits the span {s0}..{s1} (tail {n} bytes)", pl.reused);
+        }
+        // a follow-up whose text diverges before the placeholder cannot reach into it either
+        let p3 = format!("<｜System｜>You answer about screenshots.<｜User｜>what is that?{}", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids3, spans3) = with_images(&tok, &p3, &[5], &hashes);
+        let (pl3, _) = t.plan_images(&p3, &tok, &spans3, &ids3);
+        assert!(pl3.reused <= s0, "{} of the span {s0}..{s1}", pl3.reused);
+    }
+
+    /// The table's format changed (DSFT0002: a session carries its image spans). A file of the previous
+    /// format is refused, not misread, and goes once read, so the next start begins clean.
+    #[test]
+    fn a_table_of_the_previous_format_is_refused() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let dir = std::env::temp_dir().join(format!("dsfront-old-table-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("front.table");
+        let t = SessionTable::new(8, 1 << 20);
+        assert_eq!(t.save(&path, 3600), Ok(0), "an empty table: the header alone");
+        let mut b = std::fs::read(&path).unwrap();
+        b[..8].copy_from_slice(b"DSFT0001");
+        std::fs::write(&path, &b).unwrap();
+        let mut u = SessionTable::new(8, 1 << 20);
+        assert_eq!(u.load(&path, &tok, 3600), Err("not a saved table".into()));
+        assert!(!path.exists(), "the old table goes once read");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_saved_table_keeps_its_images() {
         let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
