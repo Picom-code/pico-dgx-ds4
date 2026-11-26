@@ -13,42 +13,45 @@ states both.
 
 Three checkpoints appear in these docs. They are different sets of weights with the same
 architecture, config, tokenizer and tensor formats, and each is named by one canonical
-string. A figure belongs to the checkpoint its section names; a figure that names none is
-`deepseekflash41-uncensored`'s, because that is the checkpoint the engine was built and
-validated on.
+string. **One is supported: `deepseekflash41`. The other two are deprecated** — they were
+served in the past and are kept here so an older figure can be traced to its weights.
 
 | Canonical string | Checkpoint | Revision | Status |
 | --- | --- | --- | --- |
-| `deepseekflash41-1017` | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | `1bae0e10` | **served since 2026-10-18 11:56** |
-| `deepseekflash41` | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `fb2764a5` | **the checkpoint the published figures are measured on** |
-| `deepseekflash41-uncensored` | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | `d61c59ea` | **deprecated: served until 2026-10-18, no longer served** |
+| `deepseekflash41` | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `fb2764a5` | **supported: the checkpoint the published figures are measured on** |
+| `deepseekflash41-1017` | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | `1bae0e10` | **deprecated: served 2026-10-18 onward, no longer supported** |
+| `deepseekflash41-uncensored` | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | `d61c59ea` | **deprecated: served until 2026-10-18, no longer supported** |
 
-### `deepseekflash41-1017`: what production serves now
+A figure belongs to the checkpoint its section names. A figure that names none is
+`deepseekflash41-uncensored`'s, because that is the checkpoint the engine was built and
+validated on.
 
-`deepseekflash41-1017` is deepseek-ai's update at `1bae0e10`. It has the same architecture,
-config, tokenizer and tensors as `deepseekflash41`, and new values in every shard, the Engram
-tables included. Its rank files and Engram shards are cut with the same tools. dsfront follows
-its chat encoding with `--encoding 1017`
+### `deepseekflash41`: the supported checkpoint
+
+`deepseekflash41` is deepseek-ai's official checkpoint at `fb2764a5`. **It is the only
+supported checkpoint.** Since 2026-10-13 the figures to publish are measured on it: "Where it
+stands" below, with the SGLang kit measured on the same checkpoint the same day, and the
+reference hashes ([engine.md](docs/engine.md#the-official-checkpoints-weights-2026-10-13)). It
+has the same 96,085 tensors as `deepseekflash41-uncensored` and gives the same conversion plan
+for every rank (`dsw_convert --plan`, 2026-10-13).
+
+### `deepseekflash41-1017`: deprecated
+
+`deepseekflash41-1017` is deepseek-ai's update at `1bae0e10`. **It is deprecated: production
+served it from 2026-10-18 and no longer supports it.** It has the same architecture, config,
+tokenizer and tensors as `deepseekflash41`, and new values in every shard, the Engram tables
+included. Its rank files and Engram shards are cut with the same tools. dsfront follows its
+chat encoding with `--encoding 1017`
 ([engine § The front-end against its references](docs/engine.md#the-front-end-against-its-references-2026-10-11)).
-Production has served it since 2026-10-18 11:56.
-
-### `deepseekflash41`: the checkpoint the published figures are measured on
-
-`deepseekflash41` is deepseek-ai's official checkpoint at `fb2764a5`. Since 2026-10-13 the
-figures to publish are measured on it: "Where it stands" below, with the SGLang kit measured on
-the same checkpoint the same day, and the reference hashes
-([engine.md](docs/engine.md#the-official-checkpoints-weights-2026-10-13)). It has the same
-96,085 tensors as `deepseekflash41-uncensored` and gives the same conversion plan for every rank
-(`dsw_convert --plan`, 2026-10-13).
 
 ### `deepseekflash41-uncensored`: deprecated
 
 `deepseekflash41-uncensored` is dealignai's community variant at `d61c59ea` (MIT, derived from
-`deepseekflash41`). It shares the official checkpoint's architecture, config, tokenizer and
-tensor formats, and differs in the values of shards 13–39 (layers 10–36). **Production served
-it until 2026-10-18 and no longer serves it.** The engine was built and validated on it, so
-the correctness figures in these docs (the golden data from `model.py`, the SGLang comparisons)
-are its unless they name another checkpoint
+`deepseekflash41`). **It is deprecated: production served it until 2026-10-18 and no longer
+supports it.** It shares the official checkpoint's architecture, config, tokenizer and tensor
+formats, and differs in the values of shards 13–39 (layers 10–36). The engine was built and
+validated on it, so the correctness figures in these docs (the golden data from `model.py`,
+the SGLang comparisons) are its unless they name another checkpoint
 ([docs/review/kit.md](docs/review/kit.md), [docs/review/correctness.md](docs/review/correctness.md)).
 
 ### The served model name
@@ -200,10 +203,10 @@ directory, unless a step says otherwise; the times are this project's. Each comm
   g++ 13.3 (C++20), the Rust toolchain (cargo 1.97) and Python 3.12.
 - Disk, best NVMe: on each box its weight file (77.7 GB), its Engram shards (50.7 GB) and 64 GiB to spill
   to; on rank 0 also the checkpoint (510 GB) and room to make one rank's files. A rank takes ~90 GiB of memory.
-- The checkpoint. `deepseekflash41` at `fb2764a5`: measurements from 2026-10-13 on use it, and
-  step 8's hashes are its. `deepseekflash41-1017` at `1bae0e10` is what production serves, and
-  its rank files are cut with the same tools. The engine converts either checkpoint's FP8 and
-  FP4 weights to its own layout and re-quantises nothing.
+- The checkpoint. `deepseekflash41` at `fb2764a5` is the supported checkpoint: measurements
+  from 2026-10-13 on use it, and step 8's hashes are its. `deepseekflash41-1017` at
+  `1bae0e10` is deprecated; its rank files are cut with the same tools. The engine converts
+  either checkpoint's FP8 and FP4 weights to its own layout and re-quantises nothing.
 
 **2. Build** in the image, for `sm_121a` (GB10 alone) with CUDA 13.0's `nvcc`. The
 [Dockerfile](Dockerfile) holds the toolchain the section "What the build and the
@@ -504,10 +507,10 @@ header gives the commands) checks it end to end against `dsfront mock-engine`, w
   ranks 1–3 by SSH without a password.
 
 **The weights.** The engine was built and validated on `deepseekflash41-uncensored` at
-`d61c59ea` ([DESIGN](DESIGN.md#target)). `deepseekflash41` at `fb2764a5` has the same 96,085
-tensors and gives the same conversion plan for every rank (`dsw_convert --plan`, 2026-10-13).
-Production serves `deepseekflash41-1017` at `1bae0e10`, whose rank files and Engram shards are
-cut with the same tools. Each box needs:
+`d61c59ea` ([DESIGN](DESIGN.md#target)). `deepseekflash41` at `fb2764a5` is the supported
+checkpoint: it has the same 96,085 tensors and gives the same conversion plan for every rank
+(`dsw_convert --plan`, 2026-10-13). `deepseekflash41-1017` at `1bae0e10` is deprecated, and its
+rank files and Engram shards are cut with the same tools. Each box needs:
 
 - its rank's weight file, 72.4 GiB, made by `dsw_convert`, which needs the GPU
   ([docs/layout.md](docs/layout.md#tools));
