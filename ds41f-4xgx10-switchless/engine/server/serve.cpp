@@ -60,8 +60,10 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -70,6 +72,8 @@
 #include <random>
 #include <set>
 #include <thread>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -78,6 +82,8 @@
 #include "model/nvtx.h"
 #include "common/frontend_protocol.h"
 #include "common/keepfile.h"
+#include "server/durable_images.h"
+#include "server/image_prefix.h"
 
 namespace srv {
 namespace {
@@ -383,6 +389,12 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  int durable_prompt = 0;  // completed ordinary request awaiting an idle checkpoint write
+  bool image = false; // image sessions never enter the general spill/keep files
+  std::weak_ptr<Conn> image_owner;
+  std::vector<fe::ImageSpan> image_spans;
+  std::vector<uint16_t> image_rows;
+  double image_used = 0;
   // WARM (DSGB10_REUSE_EXACT): positions [0, pf) of the history hold what the prefill path computed (a cold
   // prefill's bits); from pf on they are the decode step's (generated tokens, a step of prompt rows)
   int pf = 0;
@@ -517,13 +529,26 @@ void add(DecodeEnd& a, const DecodeEnd& b) {
 class Server {
  public:
   Server(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o, Io& io, size_t budget)
-      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {}
+      : m_(m), ring_(ring), wd_(wd), o_(o), io_(io), budget_(budget), slot_(m.slots(), 0) {
+    if (!o.durable_image_dir.empty() && !durable_.open(o, m_, ring_))
+      die("serve: cannot open ordinary image checkpoint index");
+  }
 
   // Requests let go after their session's last one ended first, then those that waited for a slot (when
   // one is there), then the front-end's frames, then a run of the requests decoding (run).
   void loop() {
     while (!g_stop) {
       sweep();
+      // A disk write never starts ahead of queued work or while peers decode.
+      if (durable_.enabled() && flying_.empty() && ready_.empty() && wait_.empty() && !io_.submit_waiting())
+        publish_image();
+      if (ordinary_image_cache_enabled()) {
+        const double now = now_s();
+        if (now >= next_image_prune_) {
+          prune_images();
+          next_image_prune_ = now + 1;
+        }
+      }
       Event e;
       if (!ready_.empty()) {
         Request rq = std::move(ready_.front());
@@ -549,6 +574,12 @@ class Server {
     for (std::deque<Request>* d : {&ready_, &held_, &wait_}) {
       for (const Request& rq : *d) done(rq, fe::kCancelled, 0, 0, now_s(), 0), Io::forget(rq);
       d->clear();
+    }
+    if (ordinary_image_cache_enabled()) {
+      std::vector<uint64_t> images;
+      for (const auto& [id, s] : sess_)
+        if (s.image) images.push_back(id);
+      for (const uint64_t id : images) release(id);
     }
     keep();
     bcast(ring_, Cmd{});  // stop the other ranks
@@ -789,6 +820,84 @@ class Server {
           break;
         }
   }
+  // The image cache belongs to one live opted-in frontend connection. Its
+  // completed sessions are immutable, so active requests always fork.
+  void prune_images() {
+    std::vector<uint64_t> drop;
+    std::vector<std::pair<double, uint64_t>> active;
+    size_t bytes = 0;
+    const double now = now_s();
+    for (const auto& [id, s] : sess_) {
+      if (s.image_spans.empty()) continue;
+      const auto owner = s.image_owner.lock();
+      if (!owner || owner->dead || image_prefix::expired(now, s.image_used)) {
+        drop.push_back(id);
+      } else {
+        active.emplace_back(s.image_used, id);
+        bytes += s.image_rows.capacity() * sizeof(uint16_t);
+      }
+    }
+    if (!image_prefix::within_budget(active.size(), bytes)) {
+      std::sort(active.begin(), active.end());
+      size_t i = 0;
+      while (!image_prefix::within_budget(active.size() - i, bytes)) {
+        const uint64_t id = active[i++].second;
+        drop.push_back(id);
+        bytes -= sess_.at(id).image_rows.capacity() * sizeof(uint16_t);
+      }
+    }
+    for (const uint64_t id : drop) release(id);
+  }
+  static bool ordinary_image_cache_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_IMAGE_PREFIX_CACHE");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+  bool image_cache_enabled(const Request& rq) const {
+    return ordinary_image_cache_enabled() && !rq.spans.empty() &&
+           (rq.h.flags & image_prefix::kFlagCache) && rq.h.base_session_id == 0 &&
+           rq.img.capacity() <= image_prefix::kMaxRowBytes / sizeof(uint16_t);
+  }
+  bool durable_request(const Request& rq) const {
+    return durable_.enabled() && image_cache_enabled(rq) && (rq.h.flags & image_prefix::kFlagDurable);
+  }
+  void publish_image() {
+    for (auto& [id, x] : sess_) {
+      if (!x.durable_prompt) continue;
+      const int n = std::exchange(x.durable_prompt, 0);
+      const auto info = m_.state_info(x.h);
+      const int last_image = x.image_spans.back().start + x.image_spans.back().rows;
+      int best = -1;
+      // Prefer a window slightly inside the submitted prompt, before its mutable
+      // answer framing. Prefer covering every screenshot; then consider older ones.
+      std::tuple<bool, bool, int> best_key{};
+      for (const int snap : info.snaps) {
+        const int q = snap & ~1;
+        if (q < 128 || snap > n || (x.slot < 0 && q > info.saved) ||
+            q < static_cast<int>(x.image_spans.front().start + x.image_spans.front().rows)) continue;
+        bool split = false;
+        for (const auto& img : x.image_spans)
+          if (img.start < static_cast<unsigned>(snap) && img.start + img.rows > static_cast<unsigned>(q)) split = true;
+        if (split) continue;
+        auto key = std::make_tuple(q >= last_image, q <= n - kReplay, q);
+        if (key > best_key) best = snap, best_key = key;
+      }
+      if (best < 0) continue;
+      const int q = best & ~1;
+      Cmd c{};
+      c.op = kCmdState;
+      c.slot = x.slot;
+      c.ops[c.n_ops++] = {kStMarkOrdinaryDurable, x.h, 0, 0};
+      if (info.saved < q) c.ops[c.n_ops++] = {kStSave, x.h, info.saved, q};
+      issue(c);
+      const bool enc = std::find(x.enc_snaps.begin(), x.enc_snaps.end(), best) != x.enc_snaps.end();
+      durable_.save(m_, ring_, x.h, rng_(), x.hist, x.image_spans, x.image_rows,
+                    best, enc, static_cast<uint64_t>(unix_now()), o_.durable_image_bytes);
+      return;
+    }
+  }
   // Least recently used sessions out until the store fits the budget: spilled to the disk tier (one live
   // in a slot saved first, and the slot let go), or freed without one. Sessions in flight stay.
   void evict(uint64_t keep) {
@@ -800,15 +909,17 @@ class Server {
       auto victim = sess_.end();
       for (auto it = sess_.begin(); it != sess_.end(); ++it)
         if (it->first != keep && !flying_.count(it->first) && std::find(out.begin(), out.end(), it->first) == out.end() &&
-            (victim == sess_.end() || it->second.used < victim->second.used) &&
+            (victim == sess_.end() || (it->second.image != victim->second.image
+                 ? it->second.image : it->second.used < victim->second.used)) &&
             !(disk && m_.state_info(it->second.h).on_disk))
           victim = it;
       if (victim == sess_.end()) break;
       const size_t b = m_.state_info(victim->second.h).bytes;
-      std::printf("serve: %s session %016llx (%.1f MiB, %zu positions)\n", disk ? "spill" : "evict",
+      const bool spill = disk && !victim->second.image;
+      std::printf("serve: %s session %016llx (%.1f MiB, %zu positions)\n", spill ? "spill" : "evict",
                   (unsigned long long)victim->first, b / 1048576.0, victim->second.hist.size());
       bytes -= std::min(bytes, b);
-      if (disk) {
+      if (spill) {
         if (victim->second.slot >= 0) persist_slot(victim->second.slot, true);  // what it holds live goes with it
         v.push_back({kStSpill, victim->second.h, 0, 0});
         out.push_back(victim->first);
@@ -852,10 +963,11 @@ class Server {
 
   // The restart point for continuing session s (its state live or stored) after a common prefix of p,
   // for a prompt of n positions.
-  Plan choose(const Session& s, bool live, int p, int n) const {
+  Plan choose(const Session& s, bool live, int p, int n, bool after_save = false) const {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
-    p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
+    // A stored session's compressed caches go only as far as its saved pages.
+    if (!live && !after_save) p = std::min(p, info.saved);
     const int lvl = reuse_exact();
     if (lvl >= 2) p = std::min(p, s.pf);  // WARM: never from positions the decode step computed
     auto consider = [&](int q, int how, int snap) {
@@ -882,7 +994,10 @@ class Server {
                                                                  : from_ring(end, std::min(p, n - kReplay), lo, clo, w);
     };
     if (live) consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kLive, -1);
-    if (info.end_pos >= 0) consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
+    if (after_save && info.end_pos != (int)s.hist.size())
+      consider(ring((int)s.hist.size(), s.lo, s.clo, s.w, s.dec_lo), kEnd, -1);
+    else if (info.end_pos >= 0)
+      consider(ring(info.end_pos, s.end_lo, s.end_clo, s.end_w, s.end_dec_lo), kEnd, -1);
     for (const int sn : info.snaps) {
       const int q = sn & 1 ? sn - 1 : sn;
       if (q <= p && usable(q, std::find(s.enc_snaps.begin(), s.enc_snaps.end(), sn) == s.enc_snaps.end()))
@@ -944,10 +1059,15 @@ class Server {
     const fe::SubmitHeader& h = f.rq.h;
     f.t_start = now_s();
     const int n = (int)f.rq.prompt.size();
+    const bool image = !f.rq.spans.empty();
+    const Session* existing = find(h.session_id);
+    const Session* base = h.base_session_id ? find(h.base_session_id) : nullptr;
     std::string err;
     if (n < 1) err = "empty prompt";
     else if (n >= o_.max_ctx) err = "a prompt of " + std::to_string(n) + " tokens does not fit the context of " + std::to_string(o_.max_ctx);
     else if (h.session_id == 0) err = "session id 0";
+    else if ((existing && (existing->image || image)) || (image && h.base_session_id) || (base && base->image))
+      err = "invalid image session lineage";
     else if (h.max_new_tokens < 1) err = "max_new_tokens 0";
     else if (f.rq.stop.size() > (size_t)kMaxStop) err = "more than " + std::to_string(kMaxStop) + " stop ids";
     else if (!(h.temperature >= 0.f) || !(h.top_p > 0.f && h.top_p <= 1.f)) err = "bad sampling parameters";
@@ -1014,22 +1134,86 @@ class Server {
     Session* src = S;
     uint64_t src_id = h.session_id;
     if (!S && h.base_session_id) src = find(h.base_session_id), src_id = h.base_session_id;
-    // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
-    // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
-    // state goes to the store, and the fork starts from there in a slot of its own.
     const int need = need_clamped(f.rq);
+    const bool image_request = !resume && !f.rq.spans.empty();
+    int p = 0;
     int s = S ? S->slot : -1;
-    if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;  // a small slot: the session moves to a big one
-    if (!S && src && src->slot >= 0) {
-      if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
-      else persist_slot(src->slot, false);
+    Plan pl;
+    Session disk_source;
+    if (image_request && image_cache_enabled(f.rq)) {
+      // Preview each candidate without allocating state or disturbing the slots.
+      // An off-slot live source can save its state, but the store can run out of
+      // room. Materialize only the winner, then check what actually survived.
+      auto select = [&](bool allow_save) {
+        const double now = now_s();
+        bool save_best = false;
+        std::tuple<int, int, uint64_t, uint64_t> best_key{};
+        src = nullptr;
+        p = 0, s = -1, pl = Plan{};
+        for (auto& [id, candidate] : sess_) {
+          if (candidate.image_spans.empty() || flying_.count(id) || f.rq.conn->dead ||
+              candidate.image_owner.lock() != f.rq.conn ||
+              image_prefix::expired(now, candidate.image_used)) continue;
+          const int common_tokens = std::min(lcp(candidate.hist, prompt), n - 1);
+          const int same = (int)image_prefix::common(common_tokens, fe::kImageDim, candidate.image_spans,
+                                                    candidate.image_rows, f.rq.spans, f.rq.img);
+          if (same == 0) continue;
+          const bool live = candidate.slot >= 0 && !keep.count(id) && fits(candidate.slot, need);
+          Plan restart = choose(candidate, live, same, n);
+          bool save = false;
+          if (allow_save && !live && candidate.slot >= 0) {
+            const Plan saved = choose(candidate, false, same, n, true);
+            if (saved.q > restart.q) restart = saved, save = true;
+          }
+          if (restart.q == 0) continue;
+          // A live restart avoids loading compressed pages. At equal stored
+          // positions, prefer one that needs no new save before it can load.
+          const int cost = live ? 0 : save ? 2 : 1;
+          const auto key = std::make_tuple(restart.q, -cost, candidate.used, UINT64_MAX - id);
+          if (key <= best_key) continue;
+          best_key = key;
+          src = &candidate, src_id = id, p = same, s = live ? candidate.slot : -1, pl = restart;
+          save_best = save;
+        }
+        return save_best;
+      };
+      if (select(true)) {
+        persist_slot(src->slot, false);
+        forget_evicted();
+        select(false);
+      }
+      // Disk records omit the prefill frontier required by exact level 2.
+      if (!pl.q && reuse_exact() < 2 && durable_request(f.rq)) {
+        const auto hit = durable_.load(m_, ring_, next_h_, prompt, f.rq.spans, f.rq.img,
+                                       static_cast<uint64_t>(unix_now()), o_.ced);
+        if (hit) {
+          disk_source.h = hit->h;
+          if (hit->encoder_only) disk_source.enc_snaps.push_back(hit->snap);
+          src = &disk_source;
+          src_id = 0;
+          s = -1;
+          p = hit->pos;
+          pl = Plan{hit->pos, kSnap, hit->snap};
+        }
+      }
+    } else if (!image_request) {
+      // The session's own slot, or its base's when the base is idle and fits.
+      // A base in flight keeps its slot and saves its state for the fork.
+      if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;
+      if (!S && src && src->slot >= 0) {
+        if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
+        else persist_slot(src->slot, false);
+      }
     }
     if (s < 0) s = pick_slot(keep, need);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
-    const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
-    const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
+    if (!image_request && src) {
+      p = std::min(lcp(src->hist, prompt), n - 1);
+      pl = choose(*src, src_live, p, n);
+    }
     const int q = pl.q;
+    if (image_request && q > 0) src->image_used = now_s();
     const int lvl = reuse_exact();
     const int src_pf = src ? src->pf : 0;  // WARM: the source's prefill frontier (S may be src: read it now)
     bool all_pf = true;                    // every row of this run went through the prefill path
@@ -1050,7 +1234,7 @@ class Server {
       } else {
         const int k = S ? std::snprintf(from, sizeof from, "its own history: common prefix %d ids", p)
                         : std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
-                                        (unsigned long long)h.base_session_id, p);
+                                        (unsigned long long)src_id, p);
         if (pl.how == kCold && k > 0 && k < (int)sizeof from) {
           const int r = first_restart(*src);
           if (r < 0) std::snprintf(from + k, sizeof from - k, ", and it has no restart point");
@@ -1071,6 +1255,8 @@ class Server {
     if (!S) {
       Session ns;
       ns.h = next_h_++;
+      ns.image = !f.rq.spans.empty();
+      if (ns.image && ordinary_image_cache_enabled()) v.push_back({kStMarkRamOnly, ns.h, 0, 0});
       S = &sess_.emplace(h.session_id, std::move(ns)).first->second;
     }
     if (src) {
@@ -1149,11 +1335,12 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (disk_source.h) state({{kStFree, disk_source.h, 0, 0}});
       if (copy_on) {  // the request's prediction, to every rank (none: the slot's earlier one is dropped)
         if (c.n_pred > 0) bcast_payload(ring_, f.rq.pred.data(), f.rq.pred.size() * 4, 0);
         set_prediction(s, f.rq.pred.data(), c.n_pred);
       }
-      if (!f.rq.spans.empty()) images(f.rq);
+      if (!f.rq.spans.empty()) images(f.rq, q);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
@@ -1260,22 +1447,28 @@ class Server {
     return true;
   }
 
-  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
-  void images(const Request& rq) {
+  // PR #9's suffix-only image transfer. The first unreused span can straddle q.
+  void images(const Request& rq, int q) {
+    size_t skipped_rows = 0;
+    const size_t first = image_prefix::suffix(rq.spans, q, skipped_rows);
+    if (first == rq.spans.size()) return;
     const double t0 = now_s();
     Cmd c{};
     c.op = kCmdImages;
-    c.n = (int)rq.spans.size();
+    c.n = (int)(rq.spans.size() - first);
     issue(c);
-    std::vector<int32_t> lh(2 * rq.spans.size());
-    for (size_t i = 0; i < rq.spans.size(); ++i)
-      lh[i] = (int32_t)rq.spans[i].start, lh[rq.spans.size() + i] = (int32_t)(rq.spans[i].start + rq.spans[i].rows);
-    bcast_payload(ring_, lh.data(), lh.size() * 4, 0);
-    std::vector<uint16_t> rows(rq.img);
-    bcast_payload(ring_, rows.data(), rows.size() * 2, 0);
+    std::vector<int32_t> lh(2 * c.n);
+    for (int i = 0; i < c.n; ++i) {
+      const auto& span = rq.spans[first + i];
+      lh[i] = (int32_t)span.start;
+      lh[c.n + i] = (int32_t)(span.start + span.rows);
+    }
+    std::vector<uint16_t> rows(rq.img.begin() + skipped_rows * fe::kImageDim, rq.img.end());
+    bcast_payload(ring_, lh.data(), lh.size() * sizeof(int32_t), 0);
+    bcast_payload(ring_, rows.data(), rows.size() * sizeof(uint16_t), 0);
     m_.set_images(c.n, lh.data(), lh.data() + c.n, rows.data());
-    std::printf("serve: req %llu images: %d spans, %zu rows, sent to every rank in %.1f ms\n",
-                (unsigned long long)rq.h.req_id, c.n, rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
+    std::printf("serve: req %llu images: %d of %zu spans, %zu rows, sent to every rank in %.1f ms\n",
+                (unsigned long long)rq.h.req_id, c.n, rq.spans.size(), rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
   }
 
   bool ended(Flight& f, uint32_t why) {
@@ -1613,12 +1806,26 @@ class Server {
   void finish(Flight& f, uint32_t why) {
     const fe::SubmitHeader& h = f.rq.h;
     if (f.t_done <= 0) done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+    const bool cancelled = !f.rq.spans.empty() && Io::cancelled(f.rq);
     Io::forget(f.rq);
     const double t_end = f.t_done > 0 ? f.t_done : now_s();  // DSGB10_END_EARLY: its DONE went out inside its run
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
-    Session* S = (h.flags & fe::kFlagKeep) && !released ? find(h.session_id) : nullptr;
+    Session* S = !released ? find(h.session_id) : nullptr;
+    if (S && S->image) {
+      if (!cancelled && (why == fe::kStop || why == fe::kLength || why == fe::kContext) && image_cache_enabled(f.rq)) {
+        if (durable_request(f.rq)) S->durable_prompt = static_cast<int>(f.rq.prompt.size());
+        S->image_spans = std::move(f.rq.spans);
+        S->image_rows = std::move(f.rq.img);
+        S->image_owner = f.rq.conn;
+        S->image_used = t_end;
+      } else {
+        S = nullptr;
+      }
+    } else if (!(h.flags & fe::kFlagKeep)) {
+      S = nullptr;
+    }
     if (S) thin(*S);
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
@@ -1665,7 +1872,12 @@ class Server {
     for (auto it = held_.begin(); it != held_.end();)  // the session's held requests go on, in order
       if (it->h.session_id == h.session_id) ready_.push_back(std::move(*it)), it = held_.erase(it);
       else ++it;
-    evict(h.session_id);
+    if (S && S->image) {
+      prune_images();
+      evict(0);
+    } else {
+      evict(h.session_id);
+    }
   }
 
   Session* find(uint64_t id) {
@@ -1680,6 +1892,8 @@ class Server {
   Io& io_;
   const size_t budget_;  // the store's bytes kept between requests (the rest: room for the next one)
   std::map<uint64_t, Session> sess_;
+  DurableImages durable_;
+  double next_image_prune_ = 0;
   std::vector<uint64_t> slot_;  // the session whose working state each slot holds (0: none)
   std::deque<Flight> rot_;      // requests between their first token and their end, in turn
   std::deque<Request> held_, ready_, wait_;  // submits for a session in flight; those let go when it ended;

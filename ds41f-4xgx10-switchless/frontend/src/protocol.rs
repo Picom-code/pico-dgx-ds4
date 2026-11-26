@@ -29,6 +29,10 @@ pub const FLAG_IMAGES: u32 = 8;
 /// reserved word. Drafts only (the engine verifies every token); only requests with a prediction set
 /// it, and only with `--prediction`.
 pub const FLAG_PREDICTION: u32 = 16;
+/// Opt into the ordinary connection-scoped RAM image cache when the engine also enables it.
+/// (32 and 64: 16 is FLAG_PREDICTION, merged first in v2)
+pub const FLAG_IMAGE_CACHE: u32 = 32;
+pub const FLAG_DURABLE_IMAGE_CACHE: u32 = 64;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
