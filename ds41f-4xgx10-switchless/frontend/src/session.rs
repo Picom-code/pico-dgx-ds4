@@ -685,7 +685,12 @@ mod tests {
         let (start, rows, _) = spans1[0];
         let span_end = (start + rows) as usize;
         assert!(plan2.reused >= span_end, "the image is inside the reused prefix: {} of {span_end}", plan2.reused);
-        assert_eq!(plan2.ids[..plan2.reused], ids1[..plan2.reused], "the reused ids are the session's own");
+        // The reused prefix is the session's own ids: turn 1's prompt AND the ids it generated, which
+        // turn 2's prompt repeats. (Compared against the session, not against ids1: a cut may sit past
+        // the prompt, in the generated text.)
+        let have = &t.sessions[&plan.session_id].ids;
+        assert!(plan2.reused <= have.len(), "reused {} of {} ids", plan2.reused, have.len());
+        assert_eq!(plan2.ids[..plan2.reused], have[..plan2.reused], "the reused ids are the session's own");
     }
 
     #[test]
