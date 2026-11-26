@@ -533,10 +533,15 @@ to another eligible checkpoint or recomputation.
 
 The disk tier survives process restarts and has no time-based expiry. It evicts
 older entries as the configured namespace reaches its entry or byte limit.
-Disabling it, changing the namespace, or using the kept-session `forget` command
-does not erase older durable files. To purge a namespace, stop the service and
-remove its `ordinary-image[.<disk-tag>].<namespace>` directory from all ranks'
-disk directories.
+An ordinary stop preserves the checkpoints. While the service is stopped,
+`service.sh forget` clears its generated `ordinary-image.service.*` namespaces
+on every configured rank, including older asset epochs. `service.sh stop --forget`
+stops the service and performs the same cleanup. A worker failure returns a
+nonzero status. Restore connectivity and rerun forget to finish.
+
+With `DSGB10_REUSE_EXACT=2`, disk image records cannot establish how much of
+the prefix came from prefill. The server uses an eligible RAM checkpoint or
+prefills the request again. Exact levels 0 and 1 permit a disk restore.
 
 Run the CPU regressions from this recipe's directory with a C++20 compiler.
 

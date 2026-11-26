@@ -1182,7 +1182,8 @@ class Server {
         forget_evicted();
         select(false);
       }
-      if (!pl.q && durable_request(f.rq)) {
+      // Disk records omit the prefill frontier required by exact level 2.
+      if (!pl.q && reuse_exact() < 2 && durable_request(f.rq)) {
         const auto hit = durable_.load(m_, ring_, next_h_, prompt, f.rq.spans, f.rq.img,
                                        static_cast<uint64_t>(unix_now()), o_.ced);
         if (hit) {

@@ -62,6 +62,8 @@ struct Server {
   } o_;
   std::vector<int> slot_sizes{2048, 2048};
   bool enabled = true;
+  int exact_level = 0;
+  int reuse_exact() const { return exact_level; }
   int persisted = 0;
   bool save_has_room = false;
   bool durable_enabled = false;
@@ -228,7 +230,14 @@ int main() {
   result = server.restart(f);
   assert(result.id == 0 && result.plan.q == 768 && result.plan.how == kSnap);
   assert(!result.source_live && server.durable_.attempts == 1);
+  // Disk records cannot prove which positions were computed by prefill.
+  server.exact_level = 2;
+  assert(server.restart(f).plan.q == 0);
+  assert(server.durable_.attempts == 1);
+  server.exact_level = 1;
+  assert(server.restart(f).plan.q == 768);
+  assert(server.durable_.attempts == 2);
   server.durable_.hit.reset();
   assert(server.restart(f).plan.q == 0);
-  assert(server.durable_.attempts == 2);
+  assert(server.durable_.attempts == 3);
 }

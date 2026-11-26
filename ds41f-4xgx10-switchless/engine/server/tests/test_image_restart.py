@@ -12,7 +12,7 @@ def main():
     engine = Path(__file__).resolve().parents[2]
     source = (engine / "server/serve.cpp").read_text()
     start = source.index("    // ---- the slot, where the state comes from")
-    end = source.index("    NVTX_RANGE", start)
+    end = source.index("    const int lvl = reuse_exact();", source.index("    const int q = pl.q;", start))
     with tempfile.TemporaryDirectory(prefix="pico-image-restart-") as temp:
         folder = Path(temp)
         (folder / "restart.inc").write_text(source[start:end])
