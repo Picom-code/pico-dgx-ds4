@@ -60,8 +60,8 @@ __device__ __forceinline__ uint64_t nz_mix64(uint64_t x) {
 __device__ __forceinline__ float nz_gumbel(uint64_t seed, int pos, int id) {
   const uint64_t base = nz_mix64(seed) ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ull);
   const uint64_t h = nz_mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull);
-  const float u = ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f);
-  return -logf(-logf(u));
+  const float x = fminf(((float)(h >> 32) + 0.5f) * 2.3283064365386963e-10f, 0.99999994f);
+  return -logf(-log1pf(-x));
 }
 
 // ---- kernels ------------------------------------------------------------------------------------------------

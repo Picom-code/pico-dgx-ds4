@@ -53,7 +53,13 @@ __device__ __forceinline__ uint64_t mix64(uint64_t x) {
   x ^= x >> 32;
   return x;
 }
-__device__ __forceinline__ float unit(uint64_t h) { return ((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f); }
+__device__ __forceinline__ float unit(uint64_t h) {
+  return fminf(((float)(h >> 40) + 0.5f) * (1.0f / 16777216.0f), 0.99999994f);
+}
+__device__ __forceinline__ float gumbel(uint64_t h) {
+  const float x = fminf(((float)(h >> 32) + 0.5f) * 2.3283064365386963e-10f, 0.99999994f);
+  return -logf(-log1pf(-x));
+}
 
 __device__ __forceinline__ bool better(float a, int ia, float b, int ib) { return a > b || (a == b && ia < ib); }
 
@@ -175,7 +181,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
         z += expf((e[c] - m) * invT);
         if (!greedy) {
           const int id = vocab0 + 4 * i + c;
-          const float g = e[c] * invT - logf(-logf(unit(mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull))));
+          const float g = e[c] * invT + gumbel(mix64(base + (uint64_t)id * 0xD1B54A32D192ED03ull));
           if (g > gv) gv = g, gi = id, gl = e[c];
         }
       }
@@ -350,7 +356,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
           float bg = -INFINITY;
           int bid = INT_MAX;
           for (int i = 0; i < keep; ++i) {
-            const float g = uv[i] * invT - logf(-logf(unit(mix64(base + (uint64_t)ui[i] * 0xD1B54A32D192ED03ull))));
+            const float g = uv[i] * invT + gumbel(mix64(base + (uint64_t)ui[i] * 0xD1B54A32D192ED03ull));
             if (better(g, ui[i], bg, bid)) bg = g, bid = ui[i], pick = i;
           }
         } else {
