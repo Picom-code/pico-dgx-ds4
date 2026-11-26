@@ -38,6 +38,39 @@ RoCE fabric with *RoCEnante* (b12x's one-shot RDMA all-reduce). *pi*: the coding
 ([earendil-works/pi](https://github.com/earendil-works/pi)) that uses the service. *dsfront* is the
 front-end, *dsgb10_rank* the engine's process on each box. From the model: *CED*, the causal
 encoder-decoder, whose prefill runs the 20 encoder layers over the prompt and the decoder over its last
+
+## Two cablings: switchless and switched
+
+This repository is named for the switchless cabling and was built on it. Both
+cablings run the same engine and the same collectives; they differ in how many
+hops a contribution takes to reach the box opposite, and in one flag.
+
+| | switchless (a cabled ring) | switched |
+|---|---|---|
+| What connects the boxes | one ConnectX-7 cable per pair of neighbours: port f0 of rank r to port f1 of rank r+1, and rank 3's f0 to rank 0's f1 | one switch, every box on it; each box reaches the other three in one hop |
+| What the fleet file sets | `NEXT_DEV0` and `PREV_DEV0` name **different** devices, and `NEXT_IP0` and `PREV_IP0` name **different** addresses | `NEXT_DEV0` and `PREV_DEV0` name the **same** device, and `NEXT_IP0` and `PREV_IP0` the **same** address |
+| How a rank reaches the box opposite | in two hops: it writes to a neighbour, and that neighbour's CPU proxy forwards half to the box opposite | in one hop: the rank writes to the box opposite itself |
+| `DSGB10_RING_DIRECT` | must stay unset or `0`; the box opposite is not reachable in one hop | `2`; every rank writes to all three others itself |
+| 10 KB all-reduce, median | 14.45 µs | 9.89 µs |
+| GPU step at one row | — | 0.21 ms shorter than the relay path |
+
+`docs/stack5.md` measures the switched column: the 10 KB all-reduce falls from
+14.45 µs to 9.89 µs, and the GPU step is 0.21 ms shorter at one row and 0.59 ms
+at six. On the 320 held-out prompts that is chat 89.16 to 90.28 tok/s (+1.26 %),
+code 131.32 to 133.62 (+1.75 %) and math 136.99 to 139.46 (+1.81 %), with the
+same texts. The buffers, the six arrival flags, the device kernels and the
+order of every sum are unchanged, so both cablings give the same bits.
+
+**This fleet is switched.** The four boxes sit on one 200G switch, so the
+"ring" is logical only. Evidence on dgx1: `ip -d link show enp1s0f1np1` prints
+a `switchid`, and the fleet file sets `RANK0_NEXT_IP0` and `RANK0_PREV_IP0` to
+the same address `10.10.10.1`. To use the switched path, set
+`DSGB10_RING_DIRECT=2` on all four boxes; the bootstrap stops if the ranks
+disagree on the mode (`engine/comm/ring.cpp:591`).
+
+A switchless fleet must leave the flag off, because the box opposite is not
+reachable in one hop there.
+
 128 tokens ([ced.md](docs/ced.md)); *SWA*, sliding-window attention; *mHC*, the hyper-connections that
 carry the residual as four mixed copies; *Engram*, the n-gram lookup tables of layers 1 and 14
 ([engram.md](docs/engram.md)); *DSpark*, the model's own draft module for speculative decoding (what
@@ -137,8 +170,24 @@ directory, unless a step says otherwise; the times are this project's. Each comm
   at revision `fb2764a5`: measurements from 2026-10-13 on use it, and step 8's hashes are its. The
   engine converts its FP8 and FP4 weights to its own layout and re-quantises nothing.
 
-**2. Build** on rank 0, for `sm_121a` (GB10 alone) with CUDA 13.0's `nvcc`; the scripts copy the binaries
-to the other boxes. More jobs take more memory, and an OOM can hang a GB10:
+**2. Build** in the image, for `sm_121a` (GB10 alone) with CUDA 13.0's `nvcc`. The
+[Dockerfile](Dockerfile) holds the toolchain the section "What the build and the
+ring need" lists, so the build does not depend on what rank 0 happens to have
+installed. Build the image on rank 0, then copy the binaries to the other boxes.
+More jobs take more memory, and an OOM can hang a GB10:
+
+```bash
+docker build -t dsgb10-build .                                      # 2 s + 54 s
+id=$(docker create dsgb10-build)
+docker cp "$id:/src/engine/build/server/dsgb10_rank" engine/build/server/
+docker cp "$id:/src/frontend/target/release/dsfront" frontend/target/release/
+docker rm "$id"
+```
+
+The image carries the toolchain and the two binaries, not the weights. Mount the
+weights, the Engram shards and the fleet file when you run the engine, as the
+steps below do. To build without a container instead, run the two commands the
+Dockerfile runs:
 
 ```bash
 cmake -S engine -B engine/build && cmake --build engine/build -j4    # 2 s + 54 s
