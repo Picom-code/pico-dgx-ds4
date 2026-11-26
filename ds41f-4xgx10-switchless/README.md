@@ -2,26 +2,60 @@
 
 One configuration of [dsgx10](../README.md). It was developed as **dsgb10**, and that name stays on its binaries (`dsgb10_rank`), on its files on the boxes (`/data/dsgb10`, `~/dsgb10`) and on the service. Commands below run from this directory.
 
-A from-scratch inference engine for **DeepSeek-V4.1-Flash** on **four GB10 boxes**
-(rank 0, ranks 1, 2, 3) cabled in a switchless ConnectX-7 ring. It is specialised to that
-one model and that one fleet, and it aims at prefill and single-stream decode speed for agentic use.
-The checkpoint it was built and validated on is a community variant,
-[dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8)
-at revision `d61c59ea` (MIT, derived from deepseek-ai/DeepSeek-V4.1-Flash): it shares the official checkpoint's
-architecture, config, tokenizer and tensor formats, and differs in the values of shards 13–39 (layers 10–36).
-Production served that variant until 2026-10-18, and its served model name, `deepseek-v4.1-flash-uncensored`,
-reflects it. Since 2026-10-18 11:56 production serves
-[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) at `1bae0e10`, deepseek-ai's
-update with the same architecture, config, tokenizer and tensors and new values in every shard, the Engram tables
-included. Its rank files and Engram shards are cut with the same tools, and dsfront follows its chat encoding with
-`--encoding 1017` ([engine § The front-end against its references](docs/engine.md#the-front-end-against-its-references-2026-10-11)).
-The served name is unchanged.
-Since 2026-10-13 the figures to publish are measured on deepseek-ai's official checkpoint,
-[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) at `fb2764a5`: "Where it stands"
-below, with the SGLang kit measured on the same checkpoint the same day, and the reference hashes
-([engine.md](docs/engine.md#the-official-checkpoints-weights-2026-10-13)). The other figures in these docs,
-correctness included (the golden data from `model.py`, the SGLang comparisons), are the variant's unless they name
-the official checkpoint ([docs/review/kit.md](docs/review/kit.md), [docs/review/correctness.md](docs/review/correctness.md)).
+A from-scratch inference engine for **deepseekflash41** on **four GB10 boxes**
+(rank 0, ranks 1, 2, 3). It is specialised to that one model and that one fleet, and it aims
+at prefill and single-stream decode speed for agentic use. The repository is named for a
+switchless ConnectX-7 ring, which is the cabling it was written for; the fleet it runs on here
+is one 200G switch instead, and [Two cablings](#two-cablings-switchless-and-switched) below
+states both.
+
+## The checkpoints
+
+Three checkpoints appear in these docs. They are different sets of weights with the same
+architecture, config, tokenizer and tensor formats, and each is named by one canonical
+string. A figure belongs to the checkpoint its section names; a figure that names none is
+`deepseekflash41-uncensored`'s, because that is the checkpoint the engine was built and
+validated on.
+
+| Canonical string | Checkpoint | Revision | Status |
+| --- | --- | --- | --- |
+| `deepseekflash41-1017` | [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) | `1bae0e10` | **served since 2026-10-18 11:56** |
+| `deepseekflash41` | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | `fb2764a5` | **the checkpoint the published figures are measured on** |
+| `deepseekflash41-uncensored` | [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8) | `d61c59ea` | **deprecated: served until 2026-10-18, no longer served** |
+
+### `deepseekflash41-1017`: what production serves now
+
+`deepseekflash41-1017` is deepseek-ai's update at `1bae0e10`. It has the same architecture,
+config, tokenizer and tensors as `deepseekflash41`, and new values in every shard, the Engram
+tables included. Its rank files and Engram shards are cut with the same tools. dsfront follows
+its chat encoding with `--encoding 1017`
+([engine § The front-end against its references](docs/engine.md#the-front-end-against-its-references-2026-10-11)).
+Production has served it since 2026-10-18 11:56.
+
+### `deepseekflash41`: the checkpoint the published figures are measured on
+
+`deepseekflash41` is deepseek-ai's official checkpoint at `fb2764a5`. Since 2026-10-13 the
+figures to publish are measured on it: "Where it stands" below, with the SGLang kit measured on
+the same checkpoint the same day, and the reference hashes
+([engine.md](docs/engine.md#the-official-checkpoints-weights-2026-10-13)). It has the same
+96,085 tensors as `deepseekflash41-uncensored` and gives the same conversion plan for every rank
+(`dsw_convert --plan`, 2026-10-13).
+
+### `deepseekflash41-uncensored`: deprecated
+
+`deepseekflash41-uncensored` is dealignai's community variant at `d61c59ea` (MIT, derived from
+`deepseekflash41`). It shares the official checkpoint's architecture, config, tokenizer and
+tensor formats, and differs in the values of shards 13–39 (layers 10–36). **Production served
+it until 2026-10-18 and no longer serves it.** The engine was built and validated on it, so
+the correctness figures in these docs (the golden data from `model.py`, the SGLang comparisons)
+are its unless they name another checkpoint
+([docs/review/kit.md](docs/review/kit.md), [docs/review/correctness.md](docs/review/correctness.md)).
+
+### The served model name
+
+The served name is `deepseek-v4.1-flash-uncensored` and it is unchanged across all three
+checkpoints, so a request's `model` field does not say which weights answered. The name is a
+string dsfront reports; it is not the checkpoint's canonical string.
 
 "From scratch" means C++/CUDA (runtime API + inline PTX), ibverbs, and plain Linux I/O for the engine,
 with a Rust front-end for HTTP, tokenisation and chat encoding. It does not build on vLLM, SGLang,
@@ -82,7 +116,7 @@ owner* owns the boxes and decides what ships.
 
 ## Where it stands (2026-10-13)
 
-On deepseek-ai's official checkpoint, with release candidate 5's engine code (built from 530af7f), through the
+On `deepseekflash41` at `fb2764a5`, with release candidate 5's engine code (built from 530af7f), through the
 front-end, against the SGLang kit
 ([MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks) at
 `cad252b`, v2.1, TP=4 over NCCL, as it served on this ring before this engine) on the same checkpoint and ring the
@@ -110,7 +144,7 @@ a given server state, and a repeat answered from another state of the same promp
 10 repeats on some prompts), as it does between any two stacks that sum in another order
 ([correctness review](docs/review/correctness.md)). As pi uses it (the agentic-edit
 bench at dsfront's sampling defaults, thinking off, twelve tasks three times): 138.5 and 134.2 s end to end,
-decoding at 137.4 and 138.5 tok/s, with 229–230 ms to the first token (median). On the variant the engine was
+decoding at 137.4 and 138.5 tok/s, with 229–230 ms to the first token (median). On `deepseekflash41-uncensored`, the checkpoint the engine was
 built on, release candidate 5 decoded 75.7 / 111.7 / 109.2 / 149.8 tok/s that morning, at the same prefill and
 agentic times ([history](docs/engine.md#where-it-stands-on-release-candidate-5-2026-10-13)). Details in
 [docs/engine.md](docs/engine.md#where-it-stands-on-the-official-checkpoint-2026-10-13).
@@ -118,7 +152,7 @@ agentic times ([history](docs/engine.md#where-it-stands-on-release-candidate-5-2
 The table compares dsgb10 with the MiaAI kit's TP4 line
 ([knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4),
 on a switched RoCE fabric), whose decode figures were the best published for four GB10s at the
-checkpoint's native precision on 2026-10-13; both run deepseek-ai's official checkpoint. It uses that project's
+checkpoint's native precision on 2026-10-13; both run `deepseekflash41`. It uses that project's
 own benchmark, [sparkDash](https://github.com/MiaAI-Lab/sparkDash) 1.8.8, on its own prompts (256 tokens, greedy,
 one stream; ours the mean of two sessions, the kit's the better of two sweeps). No published native-precision
 four-GB10 figure we found beats ours on any row; the nearest is spark-ds41f's code step, 1.7 % shorter but
@@ -138,7 +172,7 @@ code prompt, against the kit's 31.2–32.5 ms at 2.27 and 37.4–37.8 ms at 3.87
 prompts (v2.2); neither that nor the catalogs is like for like
 ([details](docs/engine.md#where-it-stands-on-the-official-checkpoint-2026-10-13)).
 
-**Several streams at once** (2026-10-13, on the variant weights; [batching.md](docs/batching.md#b3-the-build-2026-10-13)):
+**Several streams at once** (2026-10-13, on `deepseekflash41-uncensored`; [batching.md](docs/batching.md#b3-the-build-2026-10-13)):
 with four slots, up to eight requests decode together, each with its own drafts. Four streams of different text
 (1k-token prompts, 512 tokens each, `bench/multistream.py`) decode 136 tok/s in all, three 127, two 109, one
 alone 97; batches without drafts (the step before) gave 121 / 107 / 88, and one stream at a time gives 97
@@ -166,9 +200,10 @@ directory, unless a step says otherwise; the times are this project's. Each comm
   g++ 13.3 (C++20), the Rust toolchain (cargo 1.97) and Python 3.12.
 - Disk, best NVMe: on each box its weight file (77.7 GB), its Engram shards (50.7 GB) and 64 GiB to spill
   to; on rank 0 also the checkpoint (510 GB) and room to make one rank's files. A rank takes ~90 GiB of memory.
-- The checkpoint, [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
-  at revision `fb2764a5`: measurements from 2026-10-13 on use it, and step 8's hashes are its. The
-  engine converts its FP8 and FP4 weights to its own layout and re-quantises nothing.
+- The checkpoint. `deepseekflash41` at `fb2764a5`: measurements from 2026-10-13 on use it, and
+  step 8's hashes are its. `deepseekflash41-1017` at `1bae0e10` is what production serves, and
+  its rank files are cut with the same tools. The engine converts either checkpoint's FP8 and
+  FP4 weights to its own layout and re-quantises nothing.
 
 **2. Build** in the image, for `sm_121a` (GB10 alone) with CUDA 13.0's `nvcc`. The
 [Dockerfile](Dockerfile) holds the toolchain the section "What the build and the
@@ -327,7 +362,7 @@ Eight runs through run4.sh, four to a ring job (4–5 minutes each), print their
 checkpoint's: `tf` c7605e0b6ba8d9d2; `k1`, `nol2pf`, `fp8` and `bf16` 7941647b162df1a8; `temp`
 02ef3e0858d7eb45; `ced16` 8790ee9388f4abd8; `ced28` de99bfce6ea96ba8; a build that gives them computes
 what this one does. Weight files elsewhere than the fleet file says: add `-- --weights '~/models/rank{rank}.dsw'`
-([golden/README.md](golden/README.md#checking-a-build) has the runs' arguments and the variant's hashes).
+([golden/README.md](golden/README.md#checking-a-build) has the runs' arguments and `deepseekflash41-uncensored`'s hashes).
 Then 17 checks that resumed sessions give what cold runs give, on an engine with its own spill directory:
 
 ```bash
@@ -376,7 +411,7 @@ The current figures are those of "Where it stands" above.
 | Research: model spec, tech report, prior recipes | done → [docs/findings.md](docs/findings.md) |
 | Baseline: the SGLang TP=4 kit as it served on the ring | measured → [DESIGN.md](DESIGN.md#baseline) |
 | Hardware microbenchmarks (bandwidth, block-scaled MMA, RDMA latency) | done → [docs/findings.md](docs/findings.md#hardware-measured-here) |
-| Golden-data reference (pure torch, layer streaming) | done → [golden/README.md](golden/README.md): prose (135 tokens, all positions) and an agentic transcript (28,489 tokens) in rank 0's /data/dsgb10/golden/; an accuracy collapse in the long one turned out to be the model's own behaviour (layer 1's Engram), seen with the variant's weights and, under `model.py`, with deepseek-ai's official weights too |
+| Golden-data reference (pure torch, layer streaming) | done → [golden/README.md](golden/README.md): prose (135 tokens, all positions) and an agentic transcript (28,489 tokens) in rank 0's /data/dsgb10/golden/; an accuracy collapse in the long one turned out to be the model's own behaviour (layer 1's Engram), seen with `deepseekflash41-uncensored`'s weights and, under `model.py`, with `deepseekflash41`'s weights too |
 | Per-rank weight files: partition, converter, loader, verifier | done → [docs/layout.md](docs/layout.md); format v2 (the kernels' tile layouts, compressor and mHC splits) verified byte for byte on all four boxes and read correctly by the kernels |
 | Front-end: BPE tokeniser, chat encoding, OpenAI server, rank-0 protocol | done against a mock engine → [docs/protocol.md](docs/protocol.md); tokeniser and encoding exact vs the reference, pi works unchanged |
 | Engram store: exact hashing, io_uring row store, cache, prefetch | done → [docs/engram.md](docs/engram.md); decode rows ready in < 0.5 ms worst case, prefill reads ≥ 6× faster than 10k tok/s needs |
@@ -468,10 +503,11 @@ header gives the commands) checks it end to end against `dsfront mock-engine`, w
   [docs/ring.md](docs/ring.md#the-ring) and addressed as its fleet file says (below), and rank 0 reaches
   ranks 1–3 by SSH without a password.
 
-**The weights.** Everything here was built and validated on dealignai's
-`DeepSeek-V4.1-Flash-UNCENSORED-FP8` at `d61c59ea` ([DESIGN](DESIGN.md#target)). The original,
-`deepseek-ai/DeepSeek-V4.1-Flash` at `fb2764a5`, has the same 96,085 tensors and gives the same conversion
-plan for every rank (`dsw_convert --plan`, 2026-10-13). Each box needs:
+**The weights.** The engine was built and validated on `deepseekflash41-uncensored` at
+`d61c59ea` ([DESIGN](DESIGN.md#target)). `deepseekflash41` at `fb2764a5` has the same 96,085
+tensors and gives the same conversion plan for every rank (`dsw_convert --plan`, 2026-10-13).
+Production serves `deepseekflash41-1017` at `1bae0e10`, whose rank files and Engram shards are
+cut with the same tools. Each box needs:
 
 - its rank's weight file, 72.4 GiB, made by `dsw_convert`, which needs the GPU
   ([docs/layout.md](docs/layout.md#tools));
