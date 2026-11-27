@@ -331,11 +331,11 @@ def handle(req):
             out.append({"rows": span.shape[0], "hash": int.from_bytes(h[:8], "little"), "grid": g, "ms": round(ms, 1),
                         "bytes": len(raw)})
             log(f"image {len(raw)} B -> {g[2]}x{g[3]} tokens ({span.shape[0]} rows) in {ms:.0f} ms")
-            if a.cache_mb > 0 and key not in _cache:
+            if a.cache_mb > 0 and key not in _cache and len(blob) <= (a.cache_mb << 20):
                 _cache[key] = {"rows": span.shape[0], "hash": int.from_bytes(h[:8], "little"), "grid": g,
                                "blob": blob}
                 _cache_bytes += len(blob)
-                while _cache_bytes > (a.cache_mb << 20) and len(_cache) > 1:
+                while _cache_bytes > (a.cache_mb << 20) and _cache:
                     _, evicted = _cache.popitem(last=False)
                     _cache_bytes -= len(evicted["blob"])
     return out, b"".join(blobs)
