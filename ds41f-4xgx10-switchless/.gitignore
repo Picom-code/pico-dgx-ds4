@@ -8,7 +8,11 @@ ref/inference/examples/
 micro/bw
 micro/mma
 micro/rdma_lat
-build/
+# The build's dependency cache is downloaded, so it is not committed. The
+# manifest and the two scripts beside it are source: they pin and fetch what the
+# cache holds, so they are committed.
+build/cache/
+build/__pycache__/
 build-*/
 target/
 .claude/
