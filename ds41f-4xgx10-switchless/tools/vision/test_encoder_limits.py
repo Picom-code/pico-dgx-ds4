@@ -22,8 +22,10 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def load_encoder(max_rows=100):
-    """vision_encoder imported against a stand-in checkpoint directory, with --max-rows MAX_ROWS."""
+def load_encoder(max_rows=100, cache_mb=0):
+    """vision_encoder imported against a stand-in checkpoint directory, with --max-rows MAX_ROWS and
+    --cache-mb CACHE_MB. The limit tests pass 0 (default): they count ViT calls and rows read, which a
+    cache would short-circuit, and the module keeps its cache across the tests of one class."""
     model = tempfile.mkdtemp(prefix="vision-test-model-")
     os.makedirs(os.path.join(model, "inference"))
     with open(os.path.join(model, "inference", "config.json"), "w") as f:
@@ -41,7 +43,8 @@ def load_encoder(max_rows=100):
     saved = {k: sys.modules.get(k) for k in ("image_processor", "vision", "vision_encoder")}
     sys.modules.update({"image_processor": ip, "vision": vision})
     sys.modules.pop("vision_encoder", None)
-    argv, sys.argv = sys.argv, ["vision_encoder.py", "--model", model, "--max-rows", str(max_rows)]
+    argv, sys.argv = sys.argv, ["vision_encoder.py", "--model", model, "--max-rows", str(max_rows),
+                                "--cache-mb", str(cache_mb)]
     sys.path.insert(0, HERE)
     try:
         import vision_encoder as enc
