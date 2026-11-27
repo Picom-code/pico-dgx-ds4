@@ -1,6 +1,8 @@
 # repo-wide; each configuration keeps its own .gitignore beside its files
 .claude/
-build/
+# A configuration's build/cache/ holds downloaded dependencies, so it is not
+# committed. The manifest and the scripts beside it are source and are committed.
+build/cache/
 build-*/
 target/
 __pycache__/

@@ -1,0 +1,135 @@
+# File manifest of build/cache/ - every file the offline build reads.
+#
+# This file is generated from the cache itself, so it states what the
+# cache holds rather than what it should hold. build/dependencies.txt
+# states the pin of each dependency and is the file the build is checked
+# against; this file adds the size of each file and the total, so a
+# partial copy of the cache is visible before a build starts.
+#
+# Columns: kind, filename, sha256, size in bytes.
+#
+# Regenerate with:
+#   cd build/cache && for f in *; do \
+#     printf '%s %s %s\n' "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")"; \
+#   done | sort
+
+# ---- counts ----
+count deb              57
+count crate            52
+count rust-toolchain   1
+count rustup-init      1
+count files            111
+count bytes            220652494
+
+# ---- files ----
+crate            atomic-waker-1.1.2.crate                                               1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0      12422
+crate            axum-0.8.9.crate                                                       31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90     180525
+crate            axum-core-0.5.6.crate                                                  08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1      26769
+crate            bytes-1.12.1.crate                                                     fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04      75667
+deb              ca-certificates_20260816ubuntu0.24.04.2_all.deb                        f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0     140064
+deb              cmake-data_3.28.3-1build7_all.deb                                      20a3b644211ce82f35c24f1f5052199adeb0ac159978a8740fd6c0959611557f    2154936
+deb              cmake_3.28.3-1build7_arm64.deb                                         0bf2a58f636ad286e7f4552e709dfd1209a4d70056548a6c0c4965d7067e95a5   10305022
+deb              curl_8.5.0-2ubuntu10.16_arm64.deb                                      b3f66040e895d5a2bb9eb3fca5d98766997348080e445c209a29b1819a9a7d60     221812
+crate            equivalent-1.0.2.crate                                                 877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f       7419
+crate            errno-0.3.14.crate                                                     39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb      12002
+crate            futures-core-0.3.34.crate                                              92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e      14692
+crate            futures-sink-0.3.34.crate                                              1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d       8107
+crate            futures-task-0.3.34.crate                                              cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd      11376
+crate            futures-util-0.3.34.crate                                              0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc     169782
+crate            hashbrown-0.17.1.crate                                                 ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a     155512
+crate            http-1.5.0.crate                                                       918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0     111161
+crate            http-body-1.1.0.crate                                                  ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c       7887
+crate            http-body-util-0.1.5.crate                                             23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c      18574
+crate            httparse-1.10.1.crate                                                  6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87      45190
+crate            httpdate-1.0.3.crate                                                   df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9      10639
+crate            hyper-1.12.0.crate                                                     2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c     172269
+crate            hyper-util-0.1.21.crate                                                ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff     126820
+deb              ibverbs-providers_50.0-2ubuntu0.2_arm64.deb                            39e91a145faaa332aad6837783d6b600b7e1b136fa805fb7fc824a87d21897ab     374742
+crate            indexmap-2.14.2.crate                                                  cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855     103014
+deb              iproute2_6.1.0-1ubuntu6.4_arm64.deb                                    5cc0bfac0a176309c10c6ef2796c550c6a0ecfc53b9f428b4a632b4f4a2ce8df    1125726
+deb              iputils-ping_20240117-1ubuntu0.1_arm64.deb                             c62751ced1480c92fcfef4ad6bc3834864b3b953bd6bdc10bc7460446473845a      44636
+crate            itoa-1.0.18.crate                                                      8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682      15935
+deb              libarchive13t64_3.7.2-2ubuntu0.9_arm64.deb                             957be45cc63f6c43e83be561c42bca9d41f11301376fa7b82279eca17935cc72     377834
+deb              libbpf1_1.3.0-2build2_arm64.deb                                        bd7e0d87cdf6363691abd7b4470b5e43dc8cb91b874f054f6efd9421a7a88099     167516
+deb              libbrotli1_1.1.0-2ubuntu0.1_arm64.deb                                  911411fb6fdfb4ab91dd4242f5a0a5e1f47b38e003a25c8dc7730238cb323e18     339950
+deb              libbsd0_0.12.1-1build1.1_arm64.deb                                     cdf9ff601244e64482584d9d9b98aa54a573c081ab5956227c737307196c1ce3      40970
+crate            libc-0.2.190.crate                                                     ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78     853678
+deb              libcap2-bin_2.66-5ubuntu2.4_arm64.deb                                  6c9cac86db2d4e0d7eebe8a79ceade3623ab91670a5a348a6efb7abed0abce06      33472
+deb              libcap2_2.66-5ubuntu2.4_arm64.deb                                      3c4459762b9ee61c773209bc45db1ca7cf34e1254cc047260d309a8db11b3490      30676
+deb              libcbor0.10_0.10.2-1.2ubuntu2_arm64.deb                                5350436244647ec206f27e040f71756eb95d44bf79759a54b11f63ea15f87e25      26022
+deb              libcurl4t64_8.5.0-2ubuntu10.16_arm64.deb                               41fa5964da7f422e0729d2355317254e3ee1a28eda9eba70423ed43f77cc7477     337276
+deb              libedit2_3.1-20230828-1build1_arm64.deb                                cf642fec16d86517e0e715520c3a7cdaee650e7ae8a4993f82d0e1e7a5883efb      97526
+deb              libelf1t64_0.190-1.1ubuntu0.2_arm64.deb                                10ea480f1dffd40caf87639a0685d5b6a99dbb1649d4f2326cc1c1b21a320a50      58636
+deb              libfido2-1_1.14.0-1build3_arm64.deb                                    3436c52f2f6b1fe5dbaf16b03c022b90a5ee94fffab4e6475d18b025411a4956      82486
+deb              libgssapi-krb5-2_1.20.1-6ubuntu2.12_arm64.deb                          5e44d0198cac575e4b21bc95a43a91194749ae5717d4934b64f6e3aa1695dd16     141732
+deb              libibverbs-dev_50.0-2ubuntu0.2_arm64.deb                               1880ccb4116c112ccc4e6893f1d53892c0d5c1b307384ad4158c470dbed126e3     695206
+deb              libibverbs1_50.0-2ubuntu0.2_arm64.deb                                  20b72b2c6b882ee4c155658be8a0a01d6edc2ee580eaeb330d9bb3ad643f386d      67506
+deb              libicu74_74.2-1ubuntu3.1_arm64.deb                                     48f93acf50dcf237a8d58ce366730a28438ce52d3f06d7a2a88b51261dd791f7   10806898
+deb              libjsoncpp25_1.9.5-6build1_arm64.deb                                   2ddcee633e150bd656b149bc687507bdc276080d91a2fe1f508898db20d130bc      78186
+deb              libk5crypto3_1.20.1-6ubuntu2.12_arm64.deb                              f2ef096f8df6923b140d20d480a34d1727c1afe85b735cec51e2a8b1900d85a8      85782
+deb              libkeyutils1_1.6.3-3build1_arm64.deb                                   d141e94ed3b32ea6540f2e927a83b3d42cd4378256a1aad60cda583ffdbd78af       9654
+deb              libkrb5-3_1.20.1-6ubuntu2.12_arm64.deb                                 606a14a1ae216d02c4e1bdb326547ed3f2742a035fbed3924a23e89125f1cfdc     349572
+deb              libkrb5support0_1.20.1-6ubuntu2.12_arm64.deb                           8baf4d50b3777b44d8d29124850893110dcabe33574e747d51dc17d48b01c478      36492
+deb              libmnl0_1.0.5-2build1_arm64.deb                                        9442f15a4bbc6148e527045adaf85c86ae3ffe159176d6a5f3b471b49150e470      12372
+deb              libnghttp2-14_1.59.0-1ubuntu0.4_arm64.deb                              ec812e0b82dfb315b140020f4c8434191a89cf42c49dbb82605d0892b6783b59      74758
+deb              libnl-3-200_3.7.0-0.3build1.1_arm64.deb                                be2e96607e4c6e745b9ef1ec11d8192f5603721a7a5a9989524ea3d7a7f6db16      57476
+deb              libnl-3-dev_3.7.0-0.3build1.1_arm64.deb                                27987ff9615ba55722c4958ad6109f12a1d3b945c17c2a7b4f006389b7f59ffc     104738
+deb              libnl-route-3-200_3.7.0-0.3build1.1_arm64.deb                          cce89a1737de041f03f47f71a7b177c3c22b4bc8085a39d84158ce56a8d07032     181950
+deb              libnl-route-3-dev_3.7.0-0.3build1.1_arm64.deb                          e69cfa66ed04f0d38a3f53632565e2845010632bec1b900c6dc65dcd061ebb13     224776
+deb              libnuma-dev_2.0.18-1ubuntu0.24.04.1_arm64.deb                          5093fce3230ca74e0098c4dbdc4a4591cc89dc12cca7b094d4e2d2b065095467      39570
+deb              libnuma1_2.0.18-1ubuntu0.24.04.1_arm64.deb                             fb1de2dbe2a22cb59753c2ec622575a408d1ade28a9b090acc4c59d247462eb4      23710
+deb              libpkgconf3_1.8.1-2build1_arm64.deb                                    f476cb81e1ecec6bf974f21181469cf5edcc749c4ead621469cdbf584dfd3be8      31226
+deb              libpsl5t64_0.21.2-1.1build1_arm64.deb                                  886d485c74567b855bcd19b6f353a769a08b58c111b2d8275a908a469c15d4bf      57436
+deb              libpython3-stdlib_3.12.3-0ubuntu2.1_arm64.deb                          b6bd0a5e6fa11f2bae6da48707abe6b8245412cbf34e376cb3b9af0968b7122a      10088
+deb              libpython3.12-minimal_3.12.3-1ubuntu0.17_arm64.deb                     11790e3fc5deb4867c7fb762aa5f4f710093501f62b60ef16dd427ea2495bcc6     835130
+deb              libpython3.12-stdlib_3.12.3-1ubuntu0.17_arm64.deb                      b9462bf2f55bfffaf304a597c7964354e0d49ab20eed028f55f7183f2210581e    2038562
+deb              librhash0_1.4.3-3build1_arm64.deb                                      5406df3423dc0ce53a4f6ff0b786a597c7b5ad3b8e3a51a04bec85d5fe1ab82f     126360
+deb              librtmp1_2.4%2b20151223.gitfa8646d.1-2build7_arm64.deb                 fb771b2743120d9d44ee9989fd485205680976f7bf89f2f1ac5df50238ea1db7      57804
+deb              libssh-4_0.10.6-2ubuntu0.6_arm64.deb                                   bacd0de7be7b3ae2a623be826b3b1cfd31bff603d2cc9fd09ae11af1b1694205     192794
+deb              libuv1t64_1.48.0-1.1build1_arm64.deb                                   28bd1e33e5ff44f1878e757c42951bfafd26e92a5865b72ad33622e1251f45c2      95346
+deb              libxml2_2.9.14%2bdfsg-1.3ubuntu3.10_arm64.deb                          a80d5bb7f41abae8cf3bd822672f732bd91eef8f2fabdadec3beab02acd1ca01     735876
+deb              libxtables12_1.8.10-3ubuntu2_arm64.deb                                 72cd6add0f8eaaa45f44dd5c0903df083ab3847091d0633b4e46e8f80443718a      35914
+crate            matchit-0.8.4.crate                                                    47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3      33986
+deb              media-types_10.1.0_all.deb                                             31bfb7eec55ab6d34a50ba995150e1498d4cb897714085d8025e330d3b529747      27474
+crate            memchr-2.8.3.crate                                                     cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98      99165
+crate            mime-0.3.17.crate                                                      6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a      15712
+crate            mio-1.2.4.crate                                                        1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee     110437
+deb              netbase_6.4_all.deb                                                    8cdbc9c3dca01e660759bf9d840f72e45ac72faf5d19ca1faecacaf6a60c1a87      13112
+deb              openssh-client_9.6p1-3ubuntu13.20_arm64.deb                            dd4d13da0e74697b4827073e1f2769ea7ca6031add96220111f2d1d955b06a0d     891040
+crate            percent-encoding-2.3.2.crate                                           9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220      11583
+crate            pin-project-lite-0.2.17.crate                                          a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd      31034
+deb              pkg-config_1.8.1-2build1_arm64.deb                                     460d166c529651438347548fc1b2731440ce52c2643f678ec993a29dce5a3647       7264
+deb              pkgconf-bin_1.8.1-2build1_arm64.deb                                    bcd0d24c48b8b73ed7ba20ffc21a3575d5d9bdd53c3cee5a8051b7bde5fbf638      20458
+deb              pkgconf_1.8.1-2build1_arm64.deb                                        818ac3b4ae09f3747098872c7d5a9e387118798155b0107bb1625c2ab675664b      16768
+crate            proc-macro2-1.0.107.crate                                              985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9      59588
+deb              python3-minimal_3.12.3-0ubuntu2.1_arm64.deb                            883f362e7ea23d3de5483c0b5c31774f75897cc46d34840371b5fe7a0cc3a83c      27444
+deb              python3.12-minimal_3.12.3-1ubuntu0.17_arm64.deb                        be39fa8380f1e65fc02701cdbc8652acd924d8576b4ba1bd772141040a22b15f    2253306
+deb              python3.12_3.12.3-1ubuntu0.17_arm64.deb                                4dcc676815989c3d32ef43f8b98d37ecfd60cff8a47022152120246f21903cf0     650732
+deb              python3_3.12.3-0ubuntu2.1_arm64.deb                                    ea792b91e0fc9e249b96b960d14e04a8b7107029988546e8dd3511b74a693a6c      23004
+crate            quote-1.0.47.crate                                                     1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001      31622
+rust-toolchain   rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz                           9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d  175976652
+rustup-init      rustup-init.sh                                                         d890e2fef6fa991b19cde2e608199bc1dca4e37f41f884edf8849ff693048de6      29915
+crate            serde-1.0.229.crate                                                    4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba      83669
+crate            serde_core-1.0.229.crate                                               67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48      63100
+crate            serde_derive-1.0.229.crate                                             e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348      59864
+crate            serde_json-1.0.153.crate                                               aa62079d232416ecf7b2f938d389e28bbcd3677bcdb67b42e2f29c2433552176     157730
+crate            serde_path_to_error-0.1.20.crate                                       10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457      18046
+crate            signal-hook-registry-1.4.8.crate                                       c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b      21668
+crate            slab-0.4.12.crate                                                      0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5      19080
+crate            smallvec-1.16.3.crate                                                  5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b      34825
+crate            socket2-0.6.5.crate                                                    c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4      60031
+crate            syn-3.0.7.crate                                                        d62a2e0561533f2ca2561d0cf27fd9fedb640a1bf2616ff5d5c80d99017faadc     313684
+crate            sync_wrapper-1.0.2.crate                                               0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263       6958
+crate            tokio-1.53.2.crate                                                     e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044     928280
+crate            tokio-macros-2.7.2.crate                                               78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e      16081
+crate            tokio-stream-0.1.19.crate                                              a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b      48088
+crate            tokio-util-0.7.20.crate                                                e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b     149783
+crate            tower-0.5.3.crate                                                      ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4     110488
+crate            tower-layer-0.3.3.crate                                                121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e       6180
+crate            tower-service-0.3.3.crate                                              8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3       6950
+deb              tzdata_2026f-0ubuntu0.24.04.1_all.deb                                  9e6592d18ebbe2ac04f931089bb1d01836fc9702eb2514e3ad4a65eac5b50ca3     283204
+crate            unicode-ident-1.0.26.crate                                             d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954      48425
+crate            wasi-0.11.1+wasi-snapshot-preview1.crate                               ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b      28477
+crate            windows-link-0.2.1.crate                                               f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5       6133
+crate            windows-sys-0.61.2.crate                                               ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc    2517186
+crate            zmij-1.0.23.crate                                                      29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b      28612
