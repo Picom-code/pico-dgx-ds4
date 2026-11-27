@@ -1,0 +1,36 @@
+# The line as a systemd unit: the Go supervisor starts at boot, after the network is up, and systemd
+# restarts it if it exits. The supervisor itself restarts the front-end and the engine, so this unit's
+# restart is the last resort, for a supervisor that died.
+#
+# Install, as the user that owns the line (not root):
+#   mkdir -p ~/.config/systemd/user
+#   cp dsgb10-runner.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsgb10-runner.service
+#   loginctl enable-linger "$USER"     # so that the unit starts at boot without a login
+#
+# The paths below are the ones the fleet file names (SERVICE_DIR, ~/dsgb10/service). Change them here
+# when the fleet file names others.
+[Unit]
+Description=dsgb10 line: the front-end and the four engine ranks under the Go supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dsgb10
+Environment=FLEET=%h/dsgb10/fleet.conf
+Environment=DSGB10_BIN=%h/dsgb10/bin/dsgb10_rank
+Environment=DSGB10_FRONT_BIN=%h/dsgb10/bin/dsfront
+ExecStartPre=%h/dsgb10/bin/dsgb10-runner-bootstart-go
+ExecStart=%h/dsgb10/bin/dsgb10-runner-server-go
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=180
+KillMode=mixed
+# A rank needs about 90 GiB, and an OOM can hang a box: the supervisor checks MemAvailable before it
+# starts the engine, and this unit must not be the process the kernel kills first.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=default.target
