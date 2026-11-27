@@ -1,9 +1,9 @@
 # Building and running the line
 
 This document states how to build this configuration's two binaries with no network, how to run the
-line from the build image, how to install the Go runner as a systemd unit, and how to run the runner's
-tests. Each step gives the command and the output to expect, so a reader can tell a success from a
-failure without reading the code.
+line from the build image, how to install the Go runner as a systemd unit, how to run the runner's
+tests, and how to read the line's streams, rates and context. Each step gives the command and the
+output to expect, so a reader can tell a success from a failure without reading the code.
 
 Every command below runs from `ds41f-4xgx10-switchless/` unless it says otherwise. The build host is
 `dgx1` (192.168.1.51, aarch64, Ubuntu 24.04) unless a step says otherwise.
@@ -187,10 +187,10 @@ the same reading as JSON, which is what the web GUI serves at `/state.json`.
 
 ```
 cd runner && go test ./...
-ok  	github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner	36.008s
+ok  	github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner	55.255s
 ```
 
-The 8 tests are integration tests. They run the real binaries against a stub front-end and a stub
+The 12 tests are integration tests. They run the real binaries against a stub front-end and a stub
 engine in a service directory of their own under the system temporary folder, so they touch no line
 and no ring:
 
@@ -201,6 +201,10 @@ and no ring:
 | `TestCLIReportsHealthRecovering` | the CLI reports 500 three times and then 200, as the front-end recovers |
 | `TestCLIJSON` | `--json` holds every field the web GUI shows |
 | `TestWebGUIServesTheSameReading` | the page and `/state.json` report the same line as the CLI |
+| `TestCLIReportsTheRates` | the CLI reports the 3 windows, and each rate matches the rate the stub serves |
+| `TestCLIJSONCarriesTheMetrics` | `--json` carries the counters and the 3 windows, each resting on at least 2 readings |
+| `TestWebGUIShowsTheRates` | the page and `/state.json` carry the streams, the context and the 3 windows |
+| `TestSweepRisesWithConcurrency` | the sweep sends its streams together, reports a rate that rises with the concurrency, and repeats at a longer prompt |
 | `TestSupervisorStartsAndStops` | the supervisor reaches `serving`, then stops both children on SIGINT |
 | `TestSupervisorRestartsTheEngine` | killing rank 0 makes the supervisor start it again and count the restart |
 | `TestBootStarterStartsTheSupervisor` | the boot starter starts a supervisor that then serves |
@@ -210,7 +214,57 @@ Unix socket path may hold at most 104 bytes on macOS, so the tests make their se
 the system temporary folder with a short name; a long test name would push the socket path past that
 limit and the stub engine's bind would fail.
 
-## 7. What to read next
+## 7. Read the streams, the rates and the context
+
+The front-end answers `/metrics` with the counters of the line. The CLI and the web GUI read them, and
+the sweep command drives them.
+
+```
+curl -s http://127.0.0.1:18893/metrics
+{"phase":"decoding","streams":3,"streams_encoding":0,"gate_in_flight":3,"gate_waiting":0,
+ "gate_passed":5,"gate_refused":0,"encode_tokens":1912,"decode_tokens":19129,
+ "context_tokens":9000,"max_context":262144,"engine_connected":true}
+```
+
+`streams` is how many streams are in progress now, and `streams_encoding` how many of them have not
+sent their first token yet. `phase` is `encoding` while any stream waits for its first token,
+`decoding` once one has sent a token, and `idle` when no stream is in flight. `context_tokens` is the
+tokens held by the streams in flight, and `max_context` the context window the engine was started
+with, so `context_tokens / max_context` is the line's context usage.
+
+The 3 counters `encode_tokens`, `decode_tokens` and `context_tokens` are monotonic since the server
+started, so a rate is the difference between 2 readings divided by the time between them, never one
+sample. The CLI and the web GUI report the rates over 0.1 s, 0.5 s and 1 s:
+
+```
+dsgb10-runner-server-cli-go
+  phase decoding, streams 3 (encoding 0), context 9000 of 262144 tokens (3.4%)
+     0.1 s: encode    107.4 tok/s, decode   1005.2 tok/s
+     0.5 s: encode    101.5 tok/s, decode   1001.5 tok/s
+     1.0 s: encode    100.6 tok/s, decode   1000.7 tok/s
+```
+
+A window that the readings do not cover yet prints `not covered yet` rather than a rate computed from
+one sample. The CLI samples for 1 s before it reports, because it starts with no readings.
+
+The sweep command answers where throughput stops rising. It sends 1, 2, 4, 8, 16 and 32 chat
+completions at the same time, reads the counters before and after each step, and repeats the whole
+sweep at a longer prompt:
+
+```
+dsgb10-runner-sweep-go --levels=1,2,4,8,16,32 --prompt-tokens=512,8192 --max-tokens=128
+prompt 512 tokens, answer up to 128 tokens
+  streams   ok  fail   wall s   encode tok/s   decode tok/s   total tok/s   per stream   peak ctx
+        1    1     0     2.61            196.2           49.0          245.2         49.0        640
+        2    2     0     2.58            397.1           99.2          496.3         49.6       1280
+```
+
+`per stream` is the decode rate divided by the number of streams: when it falls, the line is
+saturated. `peak context` is the largest context the line held during the step, sampled every 100 ms.
+The command exits 1 when a stream failed or the counters could not be read, so a sweep can gate a
+change.
+
+## 8. What to read next
 
 - `README.md` states what the configuration is and what it measures.
 - `docs/engine.md` states what the service does and how a development job borrows the ring.

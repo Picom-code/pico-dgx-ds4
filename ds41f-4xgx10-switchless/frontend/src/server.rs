@@ -80,6 +80,42 @@ pub struct App {
     sessions: Mutex<SessionTable>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
+    /// The counters the metrics endpoint reports: the tokens this server has sent to clients, split
+    /// into the tokens of a prompt (encode) and the tokens of an answer (decode), and the context each
+    /// stream in flight holds. They are read from the engine's own Done frame and Tokens frames, so a
+    /// rate computed from them is a rate of real work, not a sample.
+    pub metrics: Arc<Metrics>,
+}
+
+/// The counters of the line, shared by every request handler.
+///
+/// `encode_tokens` counts the prompt tokens of the requests that finished, and `decode_tokens` counts
+/// the answer tokens this server sent. `context_tokens` is the sum over the streams in flight of the
+/// tokens each holds (its prompt plus the answer so far), and `streams` is how many streams are in
+/// flight. A reader takes two readings a known time apart and divides the difference by the time, so
+/// the rate covers exactly the window between the readings.
+pub struct Metrics {
+    pub encode_tokens: AtomicU64,
+    pub decode_tokens: AtomicU64,
+    pub context_tokens: AtomicU64,
+    pub streams: AtomicU64,
+    /// The streams in flight that have not sent their first token yet: they are encoding their prompt.
+    pub encoding: AtomicU64,
+    /// The context window the engine was started with, from its Hello frame; 0 until it is known.
+    pub max_context: AtomicU64,
+}
+
+impl Metrics {
+    fn new() -> Arc<Metrics> {
+        Arc::new(Metrics {
+            encode_tokens: AtomicU64::new(0),
+            decode_tokens: AtomicU64::new(0),
+            context_tokens: AtomicU64::new(0),
+            streams: AtomicU64::new(0),
+            encoding: AtomicU64::new(0),
+            max_context: AtomicU64::new(0),
+        })
+    }
 }
 
 impl App {
@@ -87,7 +123,7 @@ impl App {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
         let image_rows = crate::vision::RowsInFlight::new(cfg.max_image_rows_in_flight);
-        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        Arc::new(App { cfg, tok, engine, gate, image_rows, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0), metrics: Metrics::new() })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -128,8 +164,53 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     let max_body = app.cfg.max_body_bytes;
-    let routes = Router::new().route("/health", get(health)).route("/v1/models", get(models)).route("/v1/chat/completions", post(chat));
+    let routes = Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/metrics", get(metrics));
     body_limit(routes, max_body).with_state(app)
+}
+
+/// The line's counters as one JSON object, for the runner and for a dashboard.
+///
+/// The counters are monotonic since the server started, so a reader that takes two readings computes
+/// the rate of each over the window between them. `streams` and `context_tokens` are gauges: they say
+/// what is in flight now. `phase` says what the line is doing now: `encoding` when a stream waits for
+/// its first token, `decoding` when a stream has sent one, `idle` when no stream is in flight.
+async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&app, &headers) {
+        return r;
+    }
+    let (in_flight, waiting, passed, refused) = app.gate.counts();
+    let encode = app.metrics.encode_tokens.load(Ordering::Relaxed);
+    let decode = app.metrics.decode_tokens.load(Ordering::Relaxed);
+    let context = app.metrics.context_tokens.load(Ordering::Relaxed);
+    let streams = app.metrics.streams.load(Ordering::Relaxed);
+    let max_context = app.metrics.max_context.load(Ordering::Relaxed);
+    let encoding = app.metrics.encoding.load(Ordering::Relaxed);
+    let phase = if streams == 0 {
+        "idle"
+    } else if encoding > 0 {
+        "encoding"
+    } else {
+        "decoding"
+    };
+    let body = json!({
+        "phase": phase,
+        "streams": streams,
+        "streams_encoding": encoding,
+        "gate_in_flight": in_flight,
+        "gate_waiting": waiting,
+        "gate_passed": passed,
+        "gate_refused": refused,
+        "encode_tokens": encode,
+        "decode_tokens": decode,
+        "context_tokens": context,
+        "max_context": max_context,
+        "engine_connected": app.engine.info().is_some(),
+    });
+    (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
 /// Bodies over `max` bytes are answered 413 before a handler runs.
@@ -669,6 +750,12 @@ struct Gen {
     done: bool,
     t0: Instant,
     first_token: Option<Instant>,
+    /// The prompt tokens this stream holds, counted in the line's context gauge when it starts.
+    prompt_len: u64,
+    /// The answer tokens this stream has already counted in the line's decode counter.
+    counted_out: u64,
+    /// Whether this stream is still counted in the line's stream and context gauges.
+    counted_in: bool,
 }
 
 impl Gen {
@@ -682,9 +769,18 @@ impl Gen {
             };
             match ev {
                 EngineEvent::Tokens(t) => {
-                    self.first_token.get_or_insert_with(Instant::now);
+                    if self.first_token.is_none() {
+                        // the first token ends this stream's encode phase: it is decoding from now on
+                        self.first_token = Some(Instant::now());
+                        self.app.metrics.encoding.fetch_sub(1, Ordering::Relaxed);
+                    }
                     for &id in &t.ids {
                         self.ids.push(id);
+                        // the answer grew by one token, so the line's context gauge and its decode
+                        // counter both grow by one
+                        self.app.metrics.context_tokens.fetch_add(1, Ordering::Relaxed);
+                        self.app.metrics.decode_tokens.fetch_add(1, Ordering::Relaxed);
+                        self.counted_out += 1;
                         if self.stopped.is_some() {
                             continue;
                         }
@@ -726,6 +822,14 @@ impl Gen {
                 }
                 EngineEvent::Done(d) => {
                     self.done = true;
+                    // the prompt is encoded once, however the request ends: count it here, and count
+                    // the answer tokens the engine sent but this server never passed on
+                    self.app.metrics.encode_tokens.fetch_add(d.prompt_tokens as u64, Ordering::Relaxed);
+                    let uncounted = (self.ids.len() as u64).saturating_sub(self.counted_out);
+                    if uncounted > 0 {
+                        self.app.metrics.decode_tokens.fetch_add(uncounted, Ordering::Relaxed);
+                        self.counted_out += uncounted;
+                    }
                     if d.reason == DoneReason::Error {
                         self.app.sessions.lock().unwrap().abandon(self.session_id);
                         self.app.engine.release(self.session_id);
@@ -798,6 +902,16 @@ impl Gen {
 
 impl Drop for Gen {
     fn drop(&mut self) {
+        // The stream leaves the line's gauges here, whether it finished or its client went away.
+        if self.counted_in {
+            self.counted_in = false;
+            let m = &self.app.metrics;
+            m.streams.fetch_sub(1, Ordering::Relaxed);
+            m.context_tokens.fetch_sub(self.prompt_len + self.ids.len() as u64, Ordering::Relaxed);
+            if self.first_token.is_none() {
+                m.encoding.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         if !self.done {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
@@ -812,6 +926,8 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
     };
+    // the context window the engine reports is the denominator of every context reading
+    app.metrics.max_context.store(info.max_context as u64, Ordering::Relaxed);
     if !p.images.is_empty() {
         return start_images(app, p, pass, info).await;
     }
@@ -884,6 +1000,11 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     };
     // where it starts (counts only); rank 0's "serve: req N restart:" line says what the engine found
     eprintln!("req {req_id} plan: {}", plan.describe(p.prompt.len()));
+    let prompt_len = plan.ids.len() as u64;
+    // the stream enters the line's gauges here, and leaves them in Drop
+    app.metrics.streams.fetch_add(1, Ordering::Relaxed);
+    app.metrics.encoding.fetch_add(1, Ordering::Relaxed);
+    app.metrics.context_tokens.fetch_add(prompt_len, Ordering::Relaxed);
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
@@ -904,6 +1025,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         done: false,
         t0: Instant::now(),
         first_token: None,
+        prompt_len,
+        counted_out: 0,
+        counted_in: true,
     })
 }
 
@@ -964,6 +1088,11 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         "req {req_id} images: {n_images} ({n_rows} rows), encoder {encoder_ms:.0} ms; prompt {} ids; session {session_id} (not kept)",
         ids.len()
     );
+    let prompt_len = ids.len() as u64;
+    // the stream enters the line's gauges here, and leaves them in Drop
+    app.metrics.streams.fetch_add(1, Ordering::Relaxed);
+    app.metrics.encoding.fetch_add(1, Ordering::Relaxed);
+    app.metrics.context_tokens.fetch_add(prompt_len, Ordering::Relaxed);
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
@@ -984,6 +1113,9 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         done: false,
         t0: Instant::now(),
         first_token: None,
+        prompt_len,
+        counted_out: 0,
+        counted_in: true,
     })
 }
 

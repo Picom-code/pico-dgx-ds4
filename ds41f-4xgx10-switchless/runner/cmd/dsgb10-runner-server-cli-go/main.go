@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/fleetconf"
 	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/linestate"
+	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/metrics"
 )
 
 func main() {
@@ -33,19 +35,52 @@ func main() {
 		os.Exit(2)
 	}
 	state := paths.Read()
+	// The rates need 2 readings a window apart, so the CLI samples for the longest window before it
+	// reports: a rate computed from 1 reading would be a guess.
+	tracker := metrics.NewTracker(paths.Addrs[0], paths.Port)
+	snapshot := sampleFor(tracker, metrics.Windows[len(metrics.Windows)-1])
 	if asJSON {
 		text, err := state.JSON()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "dsgb10-runner-server-cli-go: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(string(text))
+		fmt.Println(withMetrics(string(text), snapshot))
 		return
 	}
 	printState(state)
+	fmt.Printf("  %s\n", strings.ReplaceAll(snapshot.Line(), "\n", "\n  "))
 	if !state.HealthOK {
 		os.Exit(1)
 	}
+}
+
+// sampleFor polls the front-end every 100 ms for the window, so that every window has 2 readings a
+// window apart. It returns the last snapshot, which carries the rates over all 3 windows.
+func sampleFor(tracker *metrics.Tracker, window time.Duration) metrics.Snapshot {
+	deadline := time.Now().Add(window)
+	var snapshot metrics.Snapshot
+	for {
+		snapshot = tracker.Snapshot()
+		if time.Now().After(deadline) {
+			return snapshot
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// withMetrics adds the metrics object to the state's JSON, so that one object carries both.
+func withMetrics(stateJSON string, snapshot metrics.Snapshot) string {
+	var state map[string]any
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		return stateJSON
+	}
+	state["metrics"] = snapshot
+	text, err := json.Marshal(state)
+	if err != nil {
+		return stateJSON
+	}
+	return string(text)
 }
 
 // readPaths reads the fleet file and returns the files of the line's service directory.

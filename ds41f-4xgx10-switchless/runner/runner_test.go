@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -447,6 +448,320 @@ func TestSupervisorRestartsTheEngine(t *testing.T) {
 	}
 	if newPid == pid {
 		t.Errorf("rank 0 still runs as pid %d, so it did not restart", pid)
+	}
+}
+
+// stubMetrics is a front-end that answers /metrics with counters that rise at a known rate, so that a
+// test can check the rate the runner computes against the rate the stub serves.
+func newStubMetrics(t *testing.T, encodePerS float64, decodePerS float64, streams int, maxContext int) *httptest.Server {
+	t.Helper()
+	start := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/metrics" {
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		elapsed := time.Since(start).Seconds()
+		body := map[string]any{
+			"phase":            "decoding",
+			"streams":          streams,
+			"streams_encoding": 0,
+			"gate_in_flight":   streams,
+			"gate_waiting":     0,
+			"gate_passed":      0,
+			"gate_refused":     0,
+			"encode_tokens":    int64(elapsed * encodePerS),
+			"decode_tokens":    int64(elapsed * decodePerS),
+			"context_tokens":   9000,
+			"max_context":      maxContext,
+			"engine_connected": true,
+		}
+		text, _ := json.Marshal(body)
+		writer.Header().Set("content-type", "application/json")
+		writer.Write(text)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// portOf returns the port of a stub server's URL.
+func portOf(server *httptest.Server) string {
+	_, port, _ := strings.Cut(strings.TrimPrefix(server.URL, "http://"), ":")
+	return port
+}
+
+// TestCLIReportsTheRates proves the CLI reports the 3 windows, and that each rate matches the rate the
+// stub serves: a rate computed from 2 readings, not from 1 sample.
+func TestCLIReportsTheRates(t *testing.T) {
+	dir := newServiceDir(t)
+	dir.writeState(t, "serving", time.Now().Add(-60*time.Second), "engine up")
+	stub := newStubMetrics(t, 100, 1000, 3, 262144)
+	output, code := runCLI(t, dir, portOf(stub))
+	if code != 0 {
+		t.Fatalf("the CLI exited %d, want 0; output:\n%s", code, output)
+	}
+	for _, want := range []string{"phase decoding", "streams 3", "9000 of 262144 tokens", "0.1 s:", "0.5 s:", "1.0 s:"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("the CLI output does not hold %q; output:\n%s", want, output)
+		}
+	}
+	// the stub serves 100 encode tok/s and 1000 decode tok/s; a rate within 20% is the same rate
+	line := lineWith(output, "1.0 s:")
+	for _, want := range []struct {
+		name  string
+		value float64
+	}{
+		{"encode", 100},
+		{"decode", 1000},
+	} {
+		got := numberAfter(line, want.name)
+		if got < want.value*0.8 || got > want.value*1.2 {
+			t.Errorf("the 1 s %s rate is %.1f tok/s, want about %.0f; line: %s", want.name, got, want.value, line)
+		}
+	}
+}
+
+// TestCLIJSONCarriesTheMetrics proves --json carries the counters and the 3 windows.
+func TestCLIJSONCarriesTheMetrics(t *testing.T) {
+	dir := newServiceDir(t)
+	dir.writeState(t, "serving", time.Now().Add(-60*time.Second), "engine up")
+	stub := newStubMetrics(t, 100, 1000, 3, 262144)
+	output, code := runCLI(t, dir, portOf(stub), "--json")
+	if code != 0 {
+		t.Fatalf("the CLI exited %d, want 0; output:\n%s", code, output)
+	}
+	var state map[string]any
+	if err := json.Unmarshal([]byte(output), &state); err != nil {
+		t.Fatalf("--json is not JSON: %v\n%s", err, output)
+	}
+	metrics, ok := state["metrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("--json holds no metrics object; output:\n%s", output)
+	}
+	if metrics["phase"] != "decoding" {
+		t.Errorf("metrics phase is %v, want decoding", metrics["phase"])
+	}
+	if streams, _ := metrics["streams"].(float64); streams != 3 {
+		t.Errorf("metrics streams is %v, want 3", metrics["streams"])
+	}
+	rates, ok := metrics["rates"].([]any)
+	if !ok || len(rates) != 3 {
+		t.Fatalf("metrics rates holds %d windows, want 3", len(rates))
+	}
+	for index, want := range []float64{0.1, 0.5, 1} {
+		rate := rates[index].(map[string]any)
+		if window, _ := rate["window_s"].(float64); window != want {
+			t.Errorf("rate %d is over %.1f s, want %.1f s", index, window, want)
+		}
+		if samples, _ := rate["samples"].(float64); samples < 2 {
+			t.Errorf("rate %d rests on %v readings, want at least 2", index, rate["samples"])
+		}
+	}
+}
+
+// TestWebGUIShowsTheRates proves the page and /state.json carry the streams, the context and the rates.
+func TestWebGUIShowsTheRates(t *testing.T) {
+	dir := newServiceDir(t)
+	dir.writeState(t, "serving", time.Now().Add(-60*time.Second), "engine up")
+	stub := newStubMetrics(t, 100, 1000, 3, 262144)
+	binary := buildBinary(t, "dsgb10-runner-server-webgui-go")
+	listen := "127.0.0.1:" + freePort(t)
+	cmd := exec.Command(binary, "--listen="+listen)
+	cmd.Env = append(os.Environ(),
+		"FLEET="+dir.fleet,
+		"DSGB10_ADDR=127.0.0.1",
+		"DSGB10_PORT="+portOf(stub),
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cannot start the web GUI: %v", err)
+	}
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	})
+	waitForHTTP(t, "http://"+listen+"/state.json")
+	// the background poller needs a second of readings before the longest window is covered
+	time.Sleep(1200 * time.Millisecond)
+	response, err := http.Get("http://" + listen + "/state.json")
+	if err != nil {
+		t.Fatalf("cannot read /state.json: %v", err)
+	}
+	defer response.Body.Close()
+	var state map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&state); err != nil {
+		t.Fatalf("/state.json is not JSON: %v", err)
+	}
+	metrics, ok := state["metrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("/state.json holds no metrics object")
+	}
+	if streams, _ := metrics["streams"].(float64); streams != 3 {
+		t.Errorf("/state.json metrics streams is %v, want 3", metrics["streams"])
+	}
+	page, err := http.Get("http://" + listen + "/")
+	if err != nil {
+		t.Fatalf("cannot read the page: %v", err)
+	}
+	defer page.Body.Close()
+	body := make([]byte, 1<<20)
+	count, _ := page.Body.Read(body)
+	text := string(body[:count])
+	for _, want := range []string{"streams and rates", "phase", "decoding", "3 in progress", "9000 of 262144 tokens", "0.1 s", "0.5 s", "1.0 s", "tok/s"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the page does not hold %q", want)
+		}
+	}
+}
+
+// lineWith returns the first line of text that holds the marker.
+func lineWith(text string, marker string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	return ""
+}
+
+// numberAfter returns the first number that follows the word in the line, or 0 when there is none.
+func numberAfter(line string, word string) float64 {
+	index := strings.Index(line, word)
+	if index < 0 {
+		return 0
+	}
+	fields := strings.Fields(line[index+len(word):])
+	for _, field := range fields {
+		value, err := strconv.ParseFloat(strings.TrimRight(field, ","), 64)
+		if err == nil {
+			return value
+		}
+	}
+	return 0
+}
+
+// newStubLine is a front-end that answers chat completions and serves counters that rise with the work
+// it did, so that a sweep test can check the rates it computes against the work the stub performed.
+func newStubLine(t *testing.T) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	encode, decode, context, inFlight := int64(0), int64(0), int64(0), int64(0)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/metrics":
+			mu.Lock()
+			body := map[string]any{
+				"phase": "decoding", "streams": inFlight, "streams_encoding": 0,
+				"gate_in_flight": inFlight, "gate_waiting": 0, "gate_passed": 0, "gate_refused": 0,
+				"encode_tokens": encode, "decode_tokens": decode, "context_tokens": context,
+				"max_context": 262144, "engine_connected": true,
+			}
+			mu.Unlock()
+			text, _ := json.Marshal(body)
+			writer.Header().Set("content-type", "application/json")
+			writer.Write(text)
+		case "/v1/chat/completions":
+			var body struct {
+				Messages  []struct{ Content string } `json:"messages"`
+				MaxTokens int                        `json:"max_tokens"`
+			}
+			json.NewDecoder(request.Body).Decode(&body)
+			promptTokens := int64(len(body.Messages[0].Content) / 4)
+			mu.Lock()
+			inFlight++
+			encode += promptTokens
+			context += promptTokens
+			mu.Unlock()
+			// each stream decodes 10 tokens at 20 ms apart: 50 tokens a second per stream
+			for index := 0; index < body.MaxTokens; index++ {
+				time.Sleep(20 * time.Millisecond)
+				mu.Lock()
+				decode++
+				context++
+				mu.Unlock()
+			}
+			mu.Lock()
+			inFlight--
+			context -= promptTokens + int64(body.MaxTokens)
+			mu.Unlock()
+			answer, _ := json.Marshal(map[string]any{
+				"choices": []map[string]any{{"message": map[string]string{"content": "ok"}}},
+				"usage":   map[string]int{"completion_tokens": body.MaxTokens},
+			})
+			writer.Header().Set("content-type", "application/json")
+			writer.Write(answer)
+		default:
+			writer.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestSweepRisesWithConcurrency proves the sweep sends its streams at the same time and reports a
+// throughput that rises with the concurrency, and that it repeats the sweep at a longer prompt.
+func TestSweepRisesWithConcurrency(t *testing.T) {
+	stub := newStubLine(t)
+	binary := buildBinary(t, "dsgb10-runner-sweep-go")
+	cmd := exec.Command(binary,
+		"--base-url="+stub.URL,
+		"--levels=1,2,4",
+		"--prompt-tokens=64,256",
+		"--max-tokens=8",
+		"--json",
+	)
+	cmd.Env = append(os.Environ(), "DSGB10_SWEEP_SETTLE_S=0.3")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the sweep exited with %v; output:\n%s", err, output)
+	}
+	var report struct {
+		Runs []struct {
+			PromptTokens int `json:"prompt_tokens"`
+			Steps        []struct {
+				Streams      int     `json:"streams"`
+				OK           int     `json:"ok"`
+				Failed       int     `json:"failed"`
+				DecodeTokens int64   `json:"decode_tokens"`
+				DecodeTPS    float64 `json:"decode_tps"`
+				PeakContext  int64   `json:"peak_context"`
+			} `json:"steps"`
+			Best int `json:"best_streams"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(output, &report); err != nil {
+		t.Fatalf("the sweep's --json is not JSON: %v\n%s", err, output)
+	}
+	if len(report.Runs) != 2 {
+		t.Fatalf("the sweep ran %d prompt lengths, want 2", len(report.Runs))
+	}
+	if report.Runs[0].PromptTokens != 64 || report.Runs[1].PromptTokens != 256 {
+		t.Errorf("the sweep ran prompts %d and %d, want 64 and 256", report.Runs[0].PromptTokens, report.Runs[1].PromptTokens)
+	}
+	for _, run := range report.Runs {
+		if len(run.Steps) != 3 {
+			t.Fatalf("the run at %d tokens has %d steps, want 3", run.PromptTokens, len(run.Steps))
+		}
+		for _, step := range run.Steps {
+			if step.Failed != 0 || step.OK != step.Streams {
+				t.Errorf("the step at %d streams answered %d ok and %d failed, want all ok", step.Streams, step.OK, step.Failed)
+			}
+			if step.DecodeTokens == 0 {
+				t.Errorf("the step at %d streams counted no decode tokens", step.Streams)
+			}
+			if step.PeakContext == 0 {
+				t.Errorf("the step at %d streams saw no context", step.Streams)
+			}
+		}
+		// the stub decodes 50 tokens a second per stream, so 4 streams serve about 200 a second, and
+		// that is well above what 1 stream serves
+		first, last := run.Steps[0], run.Steps[len(run.Steps)-1]
+		if last.DecodeTPS <= first.DecodeTPS {
+			t.Errorf("the run at %d tokens serves %.1f tok/s at %d streams and %.1f at %d, want the rate to rise",
+				run.PromptTokens, first.DecodeTPS, first.Streams, last.DecodeTPS, last.Streams)
+		}
+		if run.Best != last.Streams {
+			t.Errorf("the run at %d tokens names %d streams as best, want %d", run.PromptTokens, run.Best, last.Streams)
+		}
 	}
 }
 

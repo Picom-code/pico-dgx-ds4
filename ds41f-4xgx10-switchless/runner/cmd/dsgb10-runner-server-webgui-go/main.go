@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/fleetconf"
 	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/linestate"
+	"github.com/Picom-code/pico-dgx-ds4/ds41f-4xgx10-switchless/runner/internal/metrics"
 )
 
 func main() {
@@ -37,10 +39,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "dsgb10-runner-server-webgui-go: %v\n", err)
 		os.Exit(2)
 	}
+	// The page is read at any moment, so the readings are taken in the background every 100 ms: a
+	// reader then sees a rate over a real window instead of a rate over the time since its own request.
+	tracker := metrics.NewTracker(paths.Addrs[0], paths.Port)
+	go func() {
+		for {
+			_, _ = tracker.Poll()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		state := paths.Read()
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(writer, renderPage(state))
+		fmt.Fprint(writer, renderPage(state, tracker.Snapshot()))
 	})
 	http.HandleFunc("/state.json", func(writer http.ResponseWriter, request *http.Request) {
 		state := paths.Read()
@@ -49,8 +60,19 @@ func main() {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		var object map[string]any
+		if err := json.Unmarshal(text, &object); err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		object["metrics"] = tracker.Snapshot()
+		merged, err := json.Marshal(object)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		writer.Header().Set("Content-Type", "application/json")
-		writer.Write(text)
+		writer.Write(merged)
 	})
 	fmt.Printf("dsgb10-runner-server-webgui-go: serving on http://%s/\n", listen)
 	if err := http.ListenAndServe(listen, nil); err != nil {
@@ -82,7 +104,7 @@ func readPaths() (linestate.Paths, error) {
 }
 
 // renderPage returns the page for one reading of the line's state. The page refreshes itself every 5 s.
-func renderPage(state linestate.State) string {
+func renderPage(state linestate.State, snapshot metrics.Snapshot) string {
 	verdict := "not serving"
 	colour := "#c0392b"
 	if state.HealthOK {
@@ -121,6 +143,22 @@ func renderPage(state linestate.State) string {
 	}
 	row("MemAvailable", fmt.Sprintf("%d GiB", state.MemAvailGiB))
 	row("read at", state.ReadAt.Format("15:04:05"))
+	builder.WriteString("</table>\n")
+	builder.WriteString("<h2>streams and rates</h2>\n<table>\n")
+	if snapshot.Err != "" {
+		row("metrics", snapshot.Err)
+	} else {
+		row("phase", snapshot.Phase)
+		row("streams", fmt.Sprintf("%d in progress, %d encoding", snapshot.Streams, snapshot.StreamsEnc))
+		row("context", fmt.Sprintf("%d of %d tokens (%.1f%%)", snapshot.ContextTokens, snapshot.MaxContext, snapshot.ContextPct))
+		for _, rate := range snapshot.Rates {
+			if rate.Samples == 0 {
+				row(fmt.Sprintf("%.1f s", rate.WindowS), "not covered yet")
+				continue
+			}
+			row(fmt.Sprintf("%.1f s", rate.WindowS), fmt.Sprintf("encode %.1f tok/s, decode %.1f tok/s", rate.EncodeTPS, rate.DecodeTPS))
+		}
+	}
 	builder.WriteString("</table>\n")
 	builder.WriteString(fmt.Sprintf("<h2>last %d lines of service.log</h2>\n<pre>", len(state.LogTail)))
 	for _, line := range state.LogTail {

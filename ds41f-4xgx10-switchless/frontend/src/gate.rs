@@ -181,6 +181,13 @@ impl Gate {
         self.st.lock().unwrap().held.is_some()
     }
 
+    /// The gate's counters, for the metrics endpoint: the requests in flight now, the requests waiting
+    /// now, and since the start the requests that passed and the requests answered 503.
+    pub fn counts(&self) -> (u32, u32, u64, u64) {
+        let s = self.st.lock().unwrap();
+        (s.in_flight, s.waiting, s.passed, s.refused)
+    }
+
     /// One admin command: `status`, `hold IDLE_S` or `release`; its one-line answer.
     pub fn command(&self, line: &str, connected: bool) -> String {
         let w: Vec<&str> = line.split_whitespace().collect();
