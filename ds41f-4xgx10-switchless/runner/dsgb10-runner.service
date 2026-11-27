@@ -25,7 +25,9 @@ Environment=DSGB10_FRONT_BIN=%h/dsgb10/bin/dsfront
 ExecStartPre=%h/dsgb10/bin/dsgb10-runner-bootstart-go
 ExecStart=%h/dsgb10/bin/dsgb10-runner-server-go
 Restart=on-failure
-RestartSec=30
+RestartSec=300
+StartLimitIntervalSec=7200
+StartLimitBurst=6
 TimeoutStopSec=180
 KillMode=mixed
 # A rank needs about 90 GiB, and an OOM can hang a box: the supervisor checks MemAvailable before it
