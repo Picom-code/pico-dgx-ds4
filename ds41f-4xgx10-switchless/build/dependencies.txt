@@ -1,0 +1,193 @@
+# dependencies.txt - every dependency of the ds41f-4xgx10-switchless build,
+# pinned by version and by sha256.
+#
+# This file is the single source of truth for what the build needs. The build
+# image is built with `docker build --network none`, so nothing here may be
+# resolved at build time: every byte the build reads comes from build/cache/,
+# and every file in build/cache/ is checked against a line of this file.
+#
+# Format: one record per line, `<kind> <name> <version> <sha256>`.
+# A line that starts with `#` is a comment. The counts are at the end.
+#
+# Read on 2026-11-27 from the box dgx1 (192.168.1.51, aarch64) and from the
+# repository's own frontend/Cargo.lock. Nothing here is from memory.
+
+# ---------------------------------------------------------------------------
+# 1. The base image, pinned by digest.
+#
+# `docker images --digests` on dgx1 printed this digest for the tag. The
+# registry mirror at 192.168.14.12:13090 returned 000 on 2026-11-26, so the
+# image is taken from the local cache of dgx1 and never pulled.
+# ---------------------------------------------------------------------------
+image nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04 13.0.3-cudnn-devel-ubuntu24.04 sha256:689c34b3fdc12303418e90828359fcdb3c7053bc8aa8d7681823186dde1fe572
+
+# ---------------------------------------------------------------------------
+# 2. The apt packages, pinned by name, version and .deb sha256.
+#
+# The 11 packages the Dockerfile names are marked `apt-direct`. The other 46
+# are their transitive dependencies; apt resolves them at install time, so
+# they are pinned too, or the offline install would fail on a missing file.
+#
+# `build-essential` is the 11th direct package and it has no .deb of its own:
+# it is a metapackage, and the base image already ships every package it
+# names. `dpkg -l gcc g++ make libc6-dev dpkg-dev` inside the base image on
+# dgx1 printed gcc 4:13.2.0-7ubuntu1, g++ 4:13.2.0-7ubuntu1, make 4.3-4.1build2,
+# libc6-dev 2.39-0ubuntu8.7 and dpkg-dev 1.22.6ubuntu6.5, all `ii`.
+# `gcc --version` printed 13.3.0, the version README.md names. The record
+# below pins those 5 packages by the version the image holds, and its sha256
+# field is `-` because no file is fetched.
+#
+# The sha256 of each .deb was read inside the base image on dgx1 with
+# `apt-get install --download-only` followed by `sha256sum *.deb`.
+# The repository is http://ports.ubuntu.com/ubuntu-ports/, suites
+# noble, noble-updates, noble-backports, noble-security.
+# ---------------------------------------------------------------------------
+
+# The 11 packages the Dockerfile names.
+apt-direct build-essential 12.10ubuntu1 -
+apt-direct cmake 3.28.3-1build7 0bf2a58f636ad286e7f4552e709dfd1209a4d70056548a6c0c4965d7067e95a5 http://ports.ubuntu.com/ubuntu-ports/pool/main/c/cmake/cmake_3.28.3-1build7_arm64.deb
+apt-direct libibverbs-dev 50.0-2ubuntu0.2 1880ccb4116c112ccc4e6893f1d53892c0d5c1b307384ad4158c470dbed126e3 http://ports.ubuntu.com/ubuntu-ports/pool/main/r/rdma-core/libibverbs-dev_50.0-2ubuntu0.2_arm64.deb
+apt-direct libnuma-dev 2.0.18-1ubuntu0.24.04.1 5093fce3230ca74e0098c4dbdc4a4591cc89dc12cca7b094d4e2d2b065095467 http://ports.ubuntu.com/ubuntu-ports/pool/main/n/numactl/libnuma-dev_2.0.18-1ubuntu0.24.04.1_arm64.deb
+apt-direct pkg-config 1.8.1-2build1 460d166c529651438347548fc1b2731440ce52c2643f678ec993a29dce5a3647 http://ports.ubuntu.com/ubuntu-ports/pool/main/p/pkgconf/pkg-config_1.8.1-2build1_arm64.deb
+apt-direct curl 8.5.0-2ubuntu10.16 b3f66040e895d5a2bb9eb3fca5d98766997348080e445c209a29b1819a9a7d60 http://ports.ubuntu.com/ubuntu-ports/pool/main/c/curl/curl_8.5.0-2ubuntu10.16_arm64.deb
+apt-direct ca-certificates 20260816ubuntu0.24.04.2 f9fbacd417b515450b831032cc39d18059e9874e67525679a43c16071dabf9a0 http://ports.ubuntu.com/ubuntu-ports/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.24.04.2_all.deb
+apt-direct python3 3.12.3-0ubuntu2.1 ea792b91e0fc9e249b96b960d14e04a8b7107029988546e8dd3511b74a693a6c http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3-defaults/python3_3.12.3-0ubuntu2.1_arm64.deb
+apt-direct openssh-client 1%3a9.6p1-3ubuntu13.20 dd4d13da0e74697b4827073e1f2769ea7ca6031add96220111f2d1d955b06a0d http://ports.ubuntu.com/ubuntu-ports/pool/main/o/openssh/openssh-client_9.6p1-3ubuntu13.20_arm64.deb
+apt-direct iproute2 6.1.0-1ubuntu6.4 5cc0bfac0a176309c10c6ef2796c550c6a0ecfc53b9f428b4a632b4f4a2ce8df http://ports.ubuntu.com/ubuntu-ports/pool/main/i/iproute2/iproute2_6.1.0-1ubuntu6.4_arm64.deb
+apt-direct iputils-ping 3%3a20240117-1ubuntu0.1 c62751ced1480c92fcfef4ad6bc3834864b3b953bd6bdc10bc7460446473845a http://ports.ubuntu.com/ubuntu-ports/pool/main/i/iputils/iputils-ping_20240117-1ubuntu0.1_arm64.deb
+
+# Their 46 transitive dependencies.
+apt-transitive cmake-data 3.28.3-1build7 20a3b644211ce82f35c24f1f5052199adeb0ac159978a8740fd6c0959611557f http://ports.ubuntu.com/ubuntu-ports/pool/main/c/cmake/cmake-data_3.28.3-1build7_all.deb
+apt-transitive ibverbs-providers 50.0-2ubuntu0.2 39e91a145faaa332aad6837783d6b600b7e1b136fa805fb7fc824a87d21897ab http://ports.ubuntu.com/ubuntu-ports/pool/main/r/rdma-core/ibverbs-providers_50.0-2ubuntu0.2_arm64.deb
+apt-transitive libarchive13t64 3.7.2-2ubuntu0.9 957be45cc63f6c43e83be561c42bca9d41f11301376fa7b82279eca17935cc72 http://ports.ubuntu.com/ubuntu-ports/pool/main/liba/libarchive/libarchive13t64_3.7.2-2ubuntu0.9_arm64.deb
+apt-transitive libbpf1 1%3a1.3.0-2build2 bd7e0d87cdf6363691abd7b4470b5e43dc8cb91b874f054f6efd9421a7a88099 http://ports.ubuntu.com/ubuntu-ports/pool/main/libb/libbpf/libbpf1_1.3.0-2build2_arm64.deb
+apt-transitive libbrotli1 1.1.0-2ubuntu0.1 911411fb6fdfb4ab91dd4242f5a0a5e1f47b38e003a25c8dc7730238cb323e18 http://ports.ubuntu.com/ubuntu-ports/pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_arm64.deb
+apt-transitive libbsd0 0.12.1-1build1.1 cdf9ff601244e64482584d9d9b98aa54a573c081ab5956227c737307196c1ce3 http://ports.ubuntu.com/ubuntu-ports/pool/main/libb/libbsd/libbsd0_0.12.1-1build1.1_arm64.deb
+apt-transitive libcap2 1%3a2.66-5ubuntu2.4 3c4459762b9ee61c773209bc45db1ca7cf34e1254cc047260d309a8db11b3490 http://ports.ubuntu.com/ubuntu-ports/pool/main/libc/libcap2/libcap2_2.66-5ubuntu2.4_arm64.deb
+apt-transitive libcap2-bin 1%3a2.66-5ubuntu2.4 6c9cac86db2d4e0d7eebe8a79ceade3623ab91670a5a348a6efb7abed0abce06 http://ports.ubuntu.com/ubuntu-ports/pool/main/libc/libcap2/libcap2-bin_2.66-5ubuntu2.4_arm64.deb
+apt-transitive libcbor0.10 0.10.2-1.2ubuntu2 5350436244647ec206f27e040f71756eb95d44bf79759a54b11f63ea15f87e25 http://ports.ubuntu.com/ubuntu-ports/pool/main/libc/libcbor/libcbor0.10_0.10.2-1.2ubuntu2_arm64.deb
+apt-transitive libcurl4t64 8.5.0-2ubuntu10.16 41fa5964da7f422e0729d2355317254e3ee1a28eda9eba70423ed43f77cc7477 http://ports.ubuntu.com/ubuntu-ports/pool/main/c/curl/libcurl4t64_8.5.0-2ubuntu10.16_arm64.deb
+apt-transitive libedit2 3.1-20230828-1build1 cf642fec16d86517e0e715520c3a7cdaee650e7ae8a4993f82d0e1e7a5883efb http://ports.ubuntu.com/ubuntu-ports/pool/main/libe/libedit/libedit2_3.1-20230828-1build1_arm64.deb
+apt-transitive libelf1t64 0.190-1.1ubuntu0.2 10ea480f1dffd40caf87639a0685d5b6a99dbb1649d4f2326cc1c1b21a320a50 http://ports.ubuntu.com/ubuntu-ports/pool/main/e/elfutils/libelf1t64_0.190-1.1ubuntu0.2_arm64.deb
+apt-transitive libfido2-1 1.14.0-1build3 3436c52f2f6b1fe5dbaf16b03c022b90a5ee94fffab4e6475d18b025411a4956 http://ports.ubuntu.com/ubuntu-ports/pool/main/libf/libfido2/libfido2-1_1.14.0-1build3_arm64.deb
+apt-transitive libgssapi-krb5-2 1.20.1-6ubuntu2.12 5e44d0198cac575e4b21bc95a43a91194749ae5717d4934b64f6e3aa1695dd16 http://ports.ubuntu.com/ubuntu-ports/pool/main/k/krb5/libgssapi-krb5-2_1.20.1-6ubuntu2.12_arm64.deb
+apt-transitive libibverbs1 50.0-2ubuntu0.2 20b72b2c6b882ee4c155658be8a0a01d6edc2ee580eaeb330d9bb3ad643f386d http://ports.ubuntu.com/ubuntu-ports/pool/main/r/rdma-core/libibverbs1_50.0-2ubuntu0.2_arm64.deb
+apt-transitive libicu74 74.2-1ubuntu3.1 48f93acf50dcf237a8d58ce366730a28438ce52d3f06d7a2a88b51261dd791f7 http://ports.ubuntu.com/ubuntu-ports/pool/main/i/icu/libicu74_74.2-1ubuntu3.1_arm64.deb
+apt-transitive libjsoncpp25 1.9.5-6build1 2ddcee633e150bd656b149bc687507bdc276080d91a2fe1f508898db20d130bc http://ports.ubuntu.com/ubuntu-ports/pool/main/libj/libjsoncpp/libjsoncpp25_1.9.5-6build1_arm64.deb
+apt-transitive libk5crypto3 1.20.1-6ubuntu2.12 f2ef096f8df6923b140d20d480a34d1727c1afe85b735cec51e2a8b1900d85a8 http://ports.ubuntu.com/ubuntu-ports/pool/main/k/krb5/libk5crypto3_1.20.1-6ubuntu2.12_arm64.deb
+apt-transitive libkeyutils1 1.6.3-3build1 d141e94ed3b32ea6540f2e927a83b3d42cd4378256a1aad60cda583ffdbd78af http://ports.ubuntu.com/ubuntu-ports/pool/main/k/keyutils/libkeyutils1_1.6.3-3build1_arm64.deb
+apt-transitive libkrb5-3 1.20.1-6ubuntu2.12 606a14a1ae216d02c4e1bdb326547ed3f2742a035fbed3924a23e89125f1cfdc http://ports.ubuntu.com/ubuntu-ports/pool/main/k/krb5/libkrb5-3_1.20.1-6ubuntu2.12_arm64.deb
+apt-transitive libkrb5support0 1.20.1-6ubuntu2.12 8baf4d50b3777b44d8d29124850893110dcabe33574e747d51dc17d48b01c478 http://ports.ubuntu.com/ubuntu-ports/pool/main/k/krb5/libkrb5support0_1.20.1-6ubuntu2.12_arm64.deb
+apt-transitive libmnl0 1.0.5-2build1 9442f15a4bbc6148e527045adaf85c86ae3ffe159176d6a5f3b471b49150e470 http://ports.ubuntu.com/ubuntu-ports/pool/main/libm/libmnl/libmnl0_1.0.5-2build1_arm64.deb
+apt-transitive libnghttp2-14 1.59.0-1ubuntu0.4 ec812e0b82dfb315b140020f4c8434191a89cf42c49dbb82605d0892b6783b59 http://ports.ubuntu.com/ubuntu-ports/pool/main/n/nghttp2/libnghttp2-14_1.59.0-1ubuntu0.4_arm64.deb
+apt-transitive libnl-3-200 3.7.0-0.3build1.1 be2e96607e4c6e745b9ef1ec11d8192f5603721a7a5a9989524ea3d7a7f6db16 http://ports.ubuntu.com/ubuntu-ports/pool/main/libn/libnl3/libnl-3-200_3.7.0-0.3build1.1_arm64.deb
+apt-transitive libnl-3-dev 3.7.0-0.3build1.1 27987ff9615ba55722c4958ad6109f12a1d3b945c17c2a7b4f006389b7f59ffc http://ports.ubuntu.com/ubuntu-ports/pool/main/libn/libnl3/libnl-3-dev_3.7.0-0.3build1.1_arm64.deb
+apt-transitive libnl-route-3-200 3.7.0-0.3build1.1 cce89a1737de041f03f47f71a7b177c3c22b4bc8085a39d84158ce56a8d07032 http://ports.ubuntu.com/ubuntu-ports/pool/main/libn/libnl3/libnl-route-3-200_3.7.0-0.3build1.1_arm64.deb
+apt-transitive libnl-route-3-dev 3.7.0-0.3build1.1 e69cfa66ed04f0d38a3f53632565e2845010632bec1b900c6dc65dcd061ebb13 http://ports.ubuntu.com/ubuntu-ports/pool/main/libn/libnl3/libnl-route-3-dev_3.7.0-0.3build1.1_arm64.deb
+apt-transitive libnuma1 2.0.18-1ubuntu0.24.04.1 fb1de2dbe2a22cb59753c2ec622575a408d1ade28a9b090acc4c59d247462eb4 http://ports.ubuntu.com/ubuntu-ports/pool/main/n/numactl/libnuma1_2.0.18-1ubuntu0.24.04.1_arm64.deb
+apt-transitive libpkgconf3 1.8.1-2build1 f476cb81e1ecec6bf974f21181469cf5edcc749c4ead621469cdbf584dfd3be8 http://ports.ubuntu.com/ubuntu-ports/pool/main/p/pkgconf/libpkgconf3_1.8.1-2build1_arm64.deb
+apt-transitive libpsl5t64 0.21.2-1.1build1 886d485c74567b855bcd19b6f353a769a08b58c111b2d8275a908a469c15d4bf http://ports.ubuntu.com/ubuntu-ports/pool/main/libp/libpsl/libpsl5t64_0.21.2-1.1build1_arm64.deb
+apt-transitive libpython3-stdlib 3.12.3-0ubuntu2.1 b6bd0a5e6fa11f2bae6da48707abe6b8245412cbf34e376cb3b9af0968b7122a http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3-defaults/libpython3-stdlib_3.12.3-0ubuntu2.1_arm64.deb
+apt-transitive libpython3.12-minimal 3.12.3-1ubuntu0.17 11790e3fc5deb4867c7fb762aa5f4f710093501f62b60ef16dd427ea2495bcc6 http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/libpython3.12-minimal_3.12.3-1ubuntu0.17_arm64.deb
+apt-transitive libpython3.12-stdlib 3.12.3-1ubuntu0.17 b9462bf2f55bfffaf304a597c7964354e0d49ab20eed028f55f7183f2210581e http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/libpython3.12-stdlib_3.12.3-1ubuntu0.17_arm64.deb
+apt-transitive librhash0 1.4.3-3build1 5406df3423dc0ce53a4f6ff0b786a597c7b5ad3b8e3a51a04bec85d5fe1ab82f http://ports.ubuntu.com/ubuntu-ports/pool/main/r/rhash/librhash0_1.4.3-3build1_arm64.deb
+apt-transitive librtmp1 2.4+20151223.gitfa8646d.1-2build7 fb771b2743120d9d44ee9989fd485205680976f7bf89f2f1ac5df50238ea1db7 http://ports.ubuntu.com/ubuntu-ports/pool/main/r/rtmpdump/librtmp1_2.4%2b20151223.gitfa8646d.1-2build7_arm64.deb
+apt-transitive libssh-4 0.10.6-2ubuntu0.6 bacd0de7be7b3ae2a623be826b3b1cfd31bff603d2cc9fd09ae11af1b1694205 http://ports.ubuntu.com/ubuntu-ports/pool/main/libs/libssh/libssh-4_0.10.6-2ubuntu0.6_arm64.deb
+apt-transitive libuv1t64 1.48.0-1.1build1 28bd1e33e5ff44f1878e757c42951bfafd26e92a5865b72ad33622e1251f45c2 http://ports.ubuntu.com/ubuntu-ports/pool/main/libu/libuv1/libuv1t64_1.48.0-1.1build1_arm64.deb
+apt-transitive libxml2 2.9.14+dfsg-1.3ubuntu3.10 a80d5bb7f41abae8cf3bd822672f732bd91eef8f2fabdadec3beab02acd1ca01 http://ports.ubuntu.com/ubuntu-ports/pool/main/libx/libxml2/libxml2_2.9.14%2bdfsg-1.3ubuntu3.10_arm64.deb
+apt-transitive libxtables12 1.8.10-3ubuntu2 72cd6add0f8eaaa45f44dd5c0903df083ab3847091d0633b4e46e8f80443718a http://ports.ubuntu.com/ubuntu-ports/pool/main/i/iptables/libxtables12_1.8.10-3ubuntu2_arm64.deb
+apt-transitive media-types 10.1.0 31bfb7eec55ab6d34a50ba995150e1498d4cb897714085d8025e330d3b529747 http://ports.ubuntu.com/ubuntu-ports/pool/main/m/media-types/media-types_10.1.0_all.deb
+apt-transitive netbase 6.4 8cdbc9c3dca01e660759bf9d840f72e45ac72faf5d19ca1faecacaf6a60c1a87 http://ports.ubuntu.com/ubuntu-ports/pool/main/n/netbase/netbase_6.4_all.deb
+apt-transitive pkgconf 1.8.1-2build1 818ac3b4ae09f3747098872c7d5a9e387118798155b0107bb1625c2ab675664b http://ports.ubuntu.com/ubuntu-ports/pool/main/p/pkgconf/pkgconf_1.8.1-2build1_arm64.deb
+apt-transitive pkgconf-bin 1.8.1-2build1 bcd0d24c48b8b73ed7ba20ffc21a3575d5d9bdd53c3cee5a8051b7bde5fbf638 http://ports.ubuntu.com/ubuntu-ports/pool/main/p/pkgconf/pkgconf-bin_1.8.1-2build1_arm64.deb
+apt-transitive python3-minimal 3.12.3-0ubuntu2.1 883f362e7ea23d3de5483c0b5c31774f75897cc46d34840371b5fe7a0cc3a83c http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3-defaults/python3-minimal_3.12.3-0ubuntu2.1_arm64.deb
+apt-transitive python3.12 3.12.3-1ubuntu0.17 4dcc676815989c3d32ef43f8b98d37ecfd60cff8a47022152120246f21903cf0 http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/python3.12_3.12.3-1ubuntu0.17_arm64.deb
+apt-transitive python3.12-minimal 3.12.3-1ubuntu0.17 be39fa8380f1e65fc02701cdbc8652acd924d8576b4ba1bd772141040a22b15f http://ports.ubuntu.com/ubuntu-ports/pool/main/p/python3.12/python3.12-minimal_3.12.3-1ubuntu0.17_arm64.deb
+apt-transitive tzdata 2026f-0ubuntu0.24.04.1 9e6592d18ebbe2ac04f931089bb1d01836fc9702eb2514e3ad4a65eac5b50ca3 http://ports.ubuntu.com/ubuntu-ports/pool/main/t/tzdata/tzdata_2026f-0ubuntu0.24.04.1_all.deb
+
+# ---------------------------------------------------------------------------
+# 3. The Rust toolchain, pinned by version and by tarball sha256.
+#
+# README.md names cargo 1.97.1. The tarball is the official release build for
+# aarch64-unknown-linux-gnu, and its sha256 is the one the release channel
+# file https://static.rust-lang.org/dist/channel-rust-1.97.1.toml publishes
+# for `pkg.rust.target.aarch64-unknown-linux-gnu.xz_hash`.
+#
+# The build installs this tarball with `rustup toolchain link`, so no network
+# is read at build time. The rustup-init script is pinned too, because the
+# fetch script uses it to place the toolchain on a host that has no rustup.
+# ---------------------------------------------------------------------------
+rustup-toolchain 1.97.1 aarch64-unknown-linux-gnu 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+rustup-init 1.29.0 sh.rustup.rs d890e2fef6fa991b19cde2e608199bc1dca4e37f41f884edf8849ff693048de6
+
+# ---------------------------------------------------------------------------
+# 4. The 53 crates of frontend/Cargo.lock, by name, version and checksum.
+#
+# 52 crates carry a `checksum` line in Cargo.lock. The 53rd is `dsfront`
+# itself, the local package the lock file describes; it has no checksum
+# because it is not downloaded. It is listed so the count is 53.
+# ---------------------------------------------------------------------------
+crate atomic-waker 1.1.2 1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0
+crate axum 0.8.9 31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90
+crate axum-core 0.5.6 08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1
+crate bytes 1.12.1 fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04
+crate equivalent 1.0.2 877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f
+crate errno 0.3.14 39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb
+crate futures-core 0.3.34 92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e
+crate futures-sink 0.3.34 1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d
+crate futures-task 0.3.34 cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd
+crate futures-util 0.3.34 0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc
+crate hashbrown 0.17.1 ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a
+crate http 1.5.0 918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0
+crate http-body 1.1.0 ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c
+crate http-body-util 0.1.5 23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c
+crate httparse 1.10.1 6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87
+crate httpdate 1.0.3 df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9
+crate hyper 1.12.0 2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c
+crate hyper-util 0.1.21 ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff
+crate indexmap 2.14.2 cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855
+crate itoa 1.0.18 8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682
+crate libc 0.2.190 ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78
+crate matchit 0.8.4 47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3
+crate memchr 2.8.3 cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98
+crate mime 0.3.17 6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a
+crate mio 1.2.4 1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee
+crate percent-encoding 2.3.2 9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220
+crate pin-project-lite 0.2.17 a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd
+crate proc-macro2 1.0.107 985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9
+crate quote 1.0.47 1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001
+crate serde 1.0.229 4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba
+crate serde_core 1.0.229 67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48
+crate serde_derive 1.0.229 e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348
+crate serde_json 1.0.153 aa62079d232416ecf7b2f938d389e28bbcd3677bcdb67b42e2f29c2433552176
+crate serde_path_to_error 0.1.20 10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457
+crate signal-hook-registry 1.4.8 c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b
+crate slab 0.4.12 0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5
+crate smallvec 1.16.3 5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b
+crate socket2 0.6.5 c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4
+crate syn 3.0.7 d62a2e0561533f2ca2561d0cf27fd9fedb640a1bf2616ff5d5c80d99017faadc
+crate sync_wrapper 1.0.2 0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263
+crate tokio 1.53.2 e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044
+crate tokio-macros 2.7.2 78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e
+crate tokio-stream 0.1.19 a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b
+crate tokio-util 0.7.20 e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b
+crate tower 0.5.3 ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4
+crate tower-layer 0.3.3 121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e
+crate tower-service 0.3.3 8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3
+crate unicode-ident 1.0.26 d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954
+crate wasi 0.11.1+wasi-snapshot-preview1 ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b
+crate windows-link 0.2.1 f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5
+crate windows-sys 0.61.2 ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc
+crate zmij 1.0.23 29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b
+crate dsfront 0.1.0 local-package
+
+# ---------------------------------------------------------------------------
+# 5. The counts. Each line states the number of records of one kind above.
+# ---------------------------------------------------------------------------
+count image 1
+count apt-direct 11
+count apt-transitive 47
+count apt 57
+count rustup-toolchain 1
+count rustup-init 1
+count crate 53
