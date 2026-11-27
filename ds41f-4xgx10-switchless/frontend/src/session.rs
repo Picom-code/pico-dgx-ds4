@@ -103,25 +103,39 @@ fn unix_now() -> u64 {
 
 const TABLE_MAGIC: &[u8; 8] = b"DSFT0002";
 
-/// The byte end of every id, and the whole length, with each image span charged once: `ids` spells
-/// `text` only with ONE placeholder per span, so a span's ids share the end byte of the placeholder
-/// they stand for. That keeps `ends` non-decreasing and keeps a cut from ever landing inside a span.
+/// The byte end of every id, and the whole length, with each image span charged once, at its FIRST
+/// id: `ids` spell `text` with ONE placeholder per span, so every row of a span records the
+/// placeholder's END. That keeps `ends` non-decreasing and makes a cut at the placeholder's start
+/// resolve to the id before the span. (Recording the start for the first `rows - 1` rows let a cut
+/// there resolve INSIDE the span: a follow-up that dropped the image copied part of its ids, with no
+/// span covering them.)
 fn ends_of(ids: &[u32], spans: &[(u32, u32, u64)], tok: &Tokenizer) -> (Vec<usize>, usize) {
     let mut ends = Vec::with_capacity(ids.len());
-    let (mut at, mut k) = (0usize, 0usize);
-    for (i, &id) in ids.iter().enumerate() {
+    let mut at = 0usize;
+    let (mut i, mut k) = (0usize, 0usize);
+    while i < ids.len() {
+        while let Some(&(start, _, _)) = spans.get(k) {
+            if (start as usize) < i {
+                k += 1; // a span already behind us
+            } else {
+                break;
+            }
+        }
         if let Some(&(start, rows, _)) = spans.get(k) {
-            if (i as u32) >= start && (i as u32) < start + rows {
-                if i as u32 + 1 == start + rows {
-                    at += tok.token_bytes(id).len();
-                    k += 1;
+            if start as usize == i {
+                at += tok.token_bytes(ids[i]).len(); // the placeholder is one text token
+                let rows = (rows as usize).min(ids.len() - i);
+                for _ in 0..rows {
+                    ends.push(at);
                 }
-                ends.push(at);
+                i += rows;
+                k += 1;
                 continue;
             }
         }
-        at += tok.token_bytes(id).len();
+        at += tok.token_bytes(ids[i]).len();
         ends.push(at);
+        i += 1;
     }
     (ends, at)
 }
@@ -746,6 +760,31 @@ mod tests {
         let (ids3, spans3) = with_images(&tok, &p3, &[5], &hashes);
         let (pl3, _) = t.plan_images(&p3, &tok, &spans3, &ids3);
         assert!(pl3.reused <= s0, "{} of the span {s0}..{s1}", pl3.reused);
+    }
+
+    /// A client can drop an image from its history (compaction, another provider path). The text then
+    /// shares everything up to the placeholder's START offset, and the cut there must stop before the
+    /// span: reusing `rows - 1` image ids would send image ids that no span covers.
+    #[test]
+    fn dropping_the_image_does_not_reuse_its_rows() {
+        let Ok(tok) = Tokenizer::from_file(TOKENIZER) else { return };
+        let mut t = SessionTable::new(8, 1 << 20);
+        let head = "<｜System｜>You answer about screenshots.<｜User｜>look:";
+        let p1 = format!("{head}{}<｜Assistant｜>", crate::encoding::IMAGE_PLACEHOLDER);
+        let (ids1, spans1) = with_images(&tok, &p1, &[5], &[7]);
+        let (plan, _) = t.plan_images(&p1, &tok, &spans1, &ids1);
+        t.finish_images(plan.session_id, &p1, &plan.ids, &spans1, &tok.encode("Red."), &tok);
+        let (start, rows, _) = spans1[0];
+        let (s0, s1) = (start as usize, (start + rows) as usize);
+        // the follow-up keeps the text up to the placeholder and goes on without it
+        let p2 = format!("{head}<｜Assistant｜>Red.");
+        let (plan2, _) = t.plan(&p2, &tok, 1);
+        assert!(plan2.reused <= s0, "a text follow-up reused {} ids, inside the span {s0}..{s1}", plan2.reused);
+        assert_eq!(plan2.ids, tok.encode(&p2), "the ids are a cold run's, with no image ids");
+        assert!(
+            !plan2.ids.iter().any(|&x| x == crate::vision::IMAGE_TOKEN_ID),
+            "no image id is left in the prompt"
+        );
     }
 
     /// The table's format changed (DSFT0002: a session carries its image spans). A file of the previous
